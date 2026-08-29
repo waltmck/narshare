@@ -684,6 +684,13 @@ pub async fn run_transfer(
     }
 
     loop {
+        // Reap finished workers. tokio's JoinSet retains every completed task's handle until it is
+        // joined; without this a long transfer accumulates one dead entry per chunk (hundreds of
+        // thousands for a large game), freed only when run_transfer returns. try_join_next removes
+        // only already-finished tasks — the results are `()` sent via the channel, so dropping
+        // them here is a no-op.
+        while workers.try_join_next().is_some() {}
+
         // Launch whatever the window and the per-peer budgets allow right now.
         loop {
             let gated = retry_gate.is_some_and(|g| Instant::now() < g);
