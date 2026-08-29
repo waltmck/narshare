@@ -16,8 +16,12 @@
 ##
 ## Scenarios: striped substitution across all three links at once; the ca_only gate; proxy
 ## restart recovery (NAR-by-hash discovery); per-link benchmarks (recorded in the test log);
-## the dedup+compression wire-savings assertion on the thin link; and a mid-transfer holder
-## kill with completion via the survivors.
+## the dedup+compression wire-savings assertion on the thin link; a CPU-bound holder
+## (CPUQuota=20% set live on the unit) where the closed-loop encoding controller must beat a
+## pinned-high-level control proxy; an IO-bound holder (IOReadBandwidthMax on the store's
+## backing disk — the store overlay is on-disk, not tmpfs, and content reads are O_DIRECT, so
+## the throttle genuinely bites); and a mid-transfer holder kill with completion via the
+## survivors.
 ##
 ## Absolute numbers from this suite are VM-relative (QEMU vlans top out well below 10 GbE);
 ## the M5.5 hardware run owns the absolute targets. min_bandwidth/roaming and the adaptive
@@ -68,10 +72,16 @@ let
   # An input-addressed (non-CA) path present in every VM's store, for the ca_only gate test.
   hello = pkgs.hello;
 
+  narsharePkg = self.packages.${pkgs.stdenv.hostPlatform.system}.narshare;
+
   common = {
     imports = [ self.nixosModules.narshare ];
     # Holders `nix-store --add` the fixture; the client realises it.
     virtualisation.writableStore = true;
+    # On the root disk, NOT tmpfs: the IO-bound scenario throttles /dev/vda, which only means
+    # anything if store reads actually reach the block layer (they do: content reads are
+    # O_DIRECT, so the page cache never hides them).
+    virtualisation.writableStoreUseTmpfs = false;
     virtualisation.cores = 2;
     virtualisation.memorySize = 1536;
     networking.firewall.enable = false;
@@ -129,6 +139,8 @@ in
       };
       # Only the proxy — a cache.nixos.org entry would stall every miss on a network-less VM.
       nix.settings.substituters = lib.mkForce [ "http://127.0.0.1:5051" ];
+      # The CPU/IO-bound scenarios run scratch proxies with per-scenario configs by hand.
+      environment.systemPackages = [ narsharePkg ];
     };
   };
 
@@ -206,7 +218,7 @@ in
         assert sha == nar_sha_hex, f"{tag}: NAR hash mismatch"
         results.append((tag, size, secs, speed / 1e6))
         print(f"[bench] {tag}: {size} bytes in {secs:.2f}s = {speed / 1e6:.2f} MB/s")
-        return speed
+        return secs, speed
 
     # --- live db visibility: paths added AFTER the daemons started must be served ---
     for _name, (_m, ip) in holders.items():
@@ -261,7 +273,7 @@ in
     proxy_reset()
     prime()
     rx0_thin = rx_bytes("eth2")
-    speed = timed_fetch("proxy via beta only (20 Mbit, 40 ms)", nar_url)
+    _, speed = timed_fetch("proxy via beta only (20 Mbit, 40 ms)", nar_url)
     wire = rx_bytes("eth2") - rx0_thin
     print(f"[bench] thin-link wire bytes: {wire} of {nar_size} NAR bytes")
     link_bps = 20e6 / 8
@@ -274,6 +286,84 @@ in
     proxy_reset()
     prime()
     timed_fetch("proxy via noisy only (150 Mbit, 25±10 ms, 1 % loss)", nar_url)
+
+    # --- bounded CPU / bounded IO on a holder: the adaptive machinery must respond ---
+    # Single-variable setup: scratch proxies on the client, each pinned to alpha ALONE, with
+    # small chunks so the level controller gets enough per-chunk observations. "pinned" requests
+    # zstd:19 unconditionally (alpha's max_zstd_level caps it at 12) — the control; "auto" is
+    # the closed-loop controller, started FRESH under throttle so it must adapt from its seed.
+    peers_up("alpha", "beta", "noisy")
+
+    def scratch_proxy(name, port, extra_peer_line):
+        lines = [
+            "[proxy]",
+            f'listen = "127.0.0.1:{port}"',
+            'chunk_max = "1MiB"',
+            "[[peers]]",
+            'name = "alpha"',
+            'url = "http://192.168.1.10:5050"',
+        ]
+        if extra_peer_line:
+            lines.append(extra_peer_line)
+        body = "\n".join(lines)
+        client.succeed(f"cat > /tmp/{name}.toml <<'NSHEOF'\n{body}\nNSHEOF")
+        # Pidfile, not pkill-by-pattern: a pattern like "narshare -c /tmp" also matches the
+        # invoking shell's own command line, and pkill would kill it (exit 143).
+        client.succeed(
+            f"narshare -c /tmp/{name}.toml >/tmp/{name}.log 2>&1 & echo $! > /tmp/{name}.pid"
+        )
+        client.wait_until_succeeds(f"curl -sf http://127.0.0.1:{port}/nix-cache-info >/dev/null")
+
+    def prime_on(port):
+        client.succeed(f"curl -sf http://127.0.0.1:{port}/{hash_part}.narinfo >/dev/null")
+        time.sleep(0.3)
+
+    # Warm alpha's seek-table and manifest caches (and take an unthrottled baseline) through
+    # the pinned proxy, so the throttled runs measure the throttle, not cold caches.
+    scratch_proxy("pinned", 5052, 'encoding = "zstd:19"')
+    prime_on(5052)
+    timed_fetch("alpha-only, unthrottled (baseline)", f"http://127.0.0.1:5052/nar/{nar32}.nar")
+
+    # CPU-bound holder: 20% of one core, applied LIVE to the running unit (its caches stay
+    # warm). The pinned control pays full price for high-level zstd; the closed loop must
+    # classify chunks as encode-bound, shed the level, and win with a clear margin.
+    alpha.succeed("systemctl set-property --runtime narshare.service CPUQuota=20%")
+    prime_on(5052)
+    _, pinned_speed = timed_fetch(
+        "alpha CPU-bound (20%), pinned zstd:19", f"http://127.0.0.1:5052/nar/{nar32}.nar"
+    )
+    scratch_proxy("auto", 5053, "")
+    prime_on(5053)
+    _, auto_speed = timed_fetch(
+        "alpha CPU-bound (20%), auto level", f"http://127.0.0.1:5053/nar/{nar32}.nar"
+    )
+    alpha.succeed("systemctl set-property --runtime narshare.service CPUQuota=")
+    assert auto_speed > pinned_speed * 1.3, (
+        f"the closed loop must shed the level on a CPU-bound holder: "
+        f"auto {auto_speed:.0f} B/s vs pinned {pinned_speed:.0f} B/s"
+    )
+
+    # IO-bound holder: 4 MB/s disk reads, applied live. Content reads are O_DIRECT — and the
+    # page cache is dropped besides, so even a buffered fallback (if overlayfs refused
+    # O_DIRECT) must cross the throttled block layer. The lower duration bound proves the
+    # throttle actually bit (dedup means only the ~20 MiB of distinct content is read; goodput
+    # may exceed the disk rate). The level controller should classify these read-bound and hold.
+    alpha.succeed(
+        "systemctl set-property --runtime narshare.service 'IOReadBandwidthMax=/dev/vda 4M'"
+    )
+    alpha.succeed("sync && echo 3 > /proc/sys/vm/drop_caches")
+    prime_on(5053)
+    io_secs, _ = timed_fetch(
+        "alpha IO-bound (4 MB/s disk), auto", f"http://127.0.0.1:5053/nar/{nar32}.nar"
+    )
+    alpha.succeed("systemctl set-property --runtime narshare.service 'IOReadBandwidthMax='")
+    assert io_secs > 3.0, (
+        f"disk throttle did not bite ({io_secs:.1f}s) — is the store overlay on tmpfs, "
+        f"or did O_DIRECT fall back to buffered?"
+    )
+    assert io_secs < 60, f"IO-bound transfer took {io_secs:.1f}s"
+
+    client.succeed("kill $(cat /tmp/pinned.pid /tmp/auto.pid) 2>/dev/null || true")
 
     # --- kill a holder mid-transfer: the stripe must finish via the survivors ---
     peers_up("alpha", "beta", "noisy")

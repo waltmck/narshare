@@ -65,7 +65,10 @@ The mesh suite boots four VMs — three holders behind heterogeneous links (unsh
 20 Mbit/40 ms, 150 Mbit/25±10 ms with 1 % loss, via `tc netem`) and one proxying client — and
 asserts the whole story end to end: a real `nix-store -r` of a CA path through the proxy with no
 trusted keys, striped across all three links at once; the `ca_only` gate; NAR-by-hash discovery
-after a proxy restart; dedup + wire compression beating the raw rate of the thin link; and a
-holder killed mid-transfer with byte-exact completion via the survivors. Per-link goodput numbers
-are printed in the test log (VM-relative; absolute 10 GbE targets are M5.5's, on real hardware).
+after a proxy restart; dedup + wire compression beating the raw rate of the thin link; a
+CPU-bound holder (live `CPUQuota=20%`) where the closed-loop encoding controller must beat a
+pinned-zstd:19 control proxy with margin; an IO-bound holder (live `IOReadBandwidthMax` on the
+store's backing disk — reads are O_DIRECT, so the throttle genuinely bites); and a holder killed
+mid-transfer with byte-exact completion via the survivors. Per-link goodput numbers are printed
+in the test log (VM-relative; absolute 10 GbE targets are M5.5's, on real hardware).
 Interactive: `nix build .#checks.<system>.mesh.driverInteractive && ./result/bin/nixos-test-driver`.

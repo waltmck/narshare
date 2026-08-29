@@ -132,7 +132,11 @@ that sets each:
   cellular they shrink toward 256 KiB. This keeps MW feedback arriving every ~2 s per stream at any
   link speed (16 MiB chunks on cellular would mean one observation per 4.5 *minutes* — the weights
   would never converge), and bounds retransmission waste when a flaky link drops a transfer
-  mid-chunk.
+  mid-chunk. (MTU is deliberately NOT an input anywhere: transport is TCP, so the kernel owns
+  segmentation and no app-level decision maps onto packet boundaries. The implicit assumption the
+  256 KiB floor makes is only that chunks stay orders of magnitude above the path MTU — ~190
+  packets even at wireguard's ~1400 — so per-packet overhead never couples to chunking. A static
+  MTU knob would become meaningful only if a UDP/QUIC transport ever existed.)
 * **Streams per peer** — the concurrency.rs governor, ceiling `per_peer_connections`. 10 GbE needs
   ~8 streams to fill; 8 competing flows on a 500 kbit link is bufferbloat and timeouts. The governor
   finds the knee for *this* link and follows it when it moves (roaming).
