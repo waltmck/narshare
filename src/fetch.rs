@@ -143,26 +143,36 @@ impl PeerLimit {
     }
 }
 
-/// Goodput-tiered wire compression for `encoding = "auto"`: (tier's upper rate bound in B/s,
-/// zstd level). Spend CPU where the link is thin. The decade thresholds are the PLAN's
-/// provisional ladder, to be measured properly in M5.5. This is the NETWORK half of adaptive
-/// encoding; the CPU half is the serve side's saturation degrade (serve.rs) — chunk frames are
-/// independent and self-describing, so the two adapt per chunk without any zstd-internal
-/// machinery (no zstd multithreading is ever used).
+/// The `encoding = "auto"` level controller: CLOSED-LOOP, per completed chunk. The chunk's
+/// service time decomposes into enc (the peer's encode-pool wait + encode, reported in a
+/// response header), read (the peer's disk time, likewise reported), our own decode, and
+/// transfer (the remainder: wire + RTT). The controller compares stages and steps the level:
+/// encode-dominated → shed CPU fast; peer-disk-dominated → hold (the level can neither help nor
+/// hurt); wire-dominated with encode slack → buy ratio with the idle CPU. Chunk frames are
+/// independent and self-describing, so a level switch between chunks is FREE — there is
+/// deliberately no hysteresis, and flapping near equilibrium is harmless. No zstd-internal
+/// machinery (--adapt, multithreading) is involved anywhere.
+const ENC_SEED: i32 = 3;
+const ENC_MAX: i32 = 19;
+/// Shedding CPU is urgent (an encode-bound chunk delays real bytes): step down faster…
+const ENC_STEP_DOWN: i32 = 2;
+/// …climb by 1 near the knee, and faster while compression has lots of slack.
+const ENC_STEP_UP: i32 = 1;
+const ENC_STEP_UP_FAST: i32 = 3;
+/// Climb while enc/transfer is below this; the knee sits where they are comparable.
+const ENC_CLIMB_BELOW: f64 = 0.5;
+/// "Lots of slack": enc/transfer below this takes the fast step.
+const ENC_SLACK: f64 = 0.1;
+/// Open-loop fallback for peers that predate the timing headers: goodput-tiered
+/// (tier's upper rate bound in B/s, zstd level) — spend CPU where the link is thin.
 const ENC_TIERS: &[(f64, i32)] = &[(4e6, 19), (4e7, 9), (4e8, 3), (f64::INFINITY, 1)];
-/// A tier switch requires clearing the boundary by this factor, so rate jitter around a
-/// threshold cannot flap the level chunk-to-chunk.
-const ENC_HYSTERESIS: f64 = 1.25;
-/// Tier before any goodput sample exists: level 3 — cheap enough for a fast link, a meaningful
-/// ratio for a slow one.
-const ENC_SEED_TIER: usize = 2;
 
 /// Per-peer network-adaptation state.
 struct PeerNet {
     /// Per-stream goodput EWMA, bytes/sec (0 = no sample yet).
     rate: f64,
-    /// Sticky index into ENC_TIERS; moves only when the rate clears a boundary with margin.
-    enc_tier: usize,
+    /// Current auto-encoding level (the closed-loop controller's state).
+    level: i32,
 }
 
 /// Everything the striped fetches share across transfers.
@@ -188,7 +198,7 @@ impl FetchCtx {
             pool: crate::pool::HostPool::new(n),
             limits: (0..n).map(|_| PeerLimit::new(cfg.per_peer_connections.max(1))).collect(),
             net: (0..n)
-                .map(|_| Mutex::new(PeerNet { rate: 0.0, enc_tier: ENC_SEED_TIER }))
+                .map(|_| Mutex::new(PeerNet { rate: 0.0, level: ENC_SEED }))
                 .collect(),
             encodings: peer_cfgs.iter().map(|p| p.encoding.clone()).collect(),
             stats: Stats::default(),
@@ -229,32 +239,48 @@ impl FetchCtx {
         ((r * CHUNK_TARGET_SECS) as u64).clamp(CHUNK_MIN, self.cfg_chunk_max)
     }
 
-    /// Wire encoding for a chunk from this peer: config override, or goodput-tiered with
-    /// hysteresis when "auto". A manual override pins what is REQUESTED; the serving peer still
-    /// caps it (max_zstd_level) and may degrade it under CPU saturation.
+    /// Wire encoding for a chunk from this peer: config override, or the closed-loop
+    /// controller's current level when "auto". A manual override pins what is REQUESTED; the
+    /// serving peer still caps it (max_zstd_level).
     fn zstd_level(&self, peer: usize) -> Option<i32> {
         match self.encodings.get(peer).map(String::as_str) {
             Some("none") => None,
             Some(enc) if enc.starts_with("zstd:") => enc[5..].parse().ok(),
-            _ => {
-                let mut net = self.net[peer].lock().unwrap();
-                if net.rate > 0.0 {
-                    let raw = ENC_TIERS.iter().position(|&(t, _)| net.rate < t).unwrap();
-                    if raw > net.enc_tier {
-                        // Link looks faster (cheaper level): clear the boundary with margin.
-                        if net.rate > ENC_TIERS[net.enc_tier].0 * ENC_HYSTERESIS {
-                            net.enc_tier = raw;
-                        }
-                    } else if raw < net.enc_tier
-                        && net.rate < ENC_TIERS[net.enc_tier - 1].0 / ENC_HYSTERESIS
-                    {
-                        // Link looks slower (spend more CPU): same margin, other side.
-                        net.enc_tier = raw;
-                    }
-                }
-                Some(ENC_TIERS[net.enc_tier].1)
-            }
+            _ => Some(self.net[peer].lock().unwrap().level),
         }
+    }
+
+    /// Fold one completed chunk into the auto-encoding controller (no-op for pinned encodings).
+    fn observe_encoding(&self, peer: usize, elapsed: Duration, c: &crate::peers::Chunk) {
+        match self.encodings.get(peer).map(String::as_str) {
+            Some("none") => return,
+            Some(enc) if enc.starts_with("zstd:") => return,
+            _ => {}
+        }
+        let mut net = self.net[peer].lock().unwrap();
+        if c.srv_read.is_zero() && c.srv_encode.is_zero() {
+            // Peer predates the timing headers: open-loop goodput ladder.
+            if net.rate > 0.0 {
+                net.level = ENC_TIERS.iter().find(|&&(t, _)| net.rate < t).unwrap().1;
+            }
+            return;
+        }
+        let enc = c.srv_encode.as_secs_f64();
+        let read = c.srv_read.as_secs_f64();
+        let decode = c.decode.as_secs_f64();
+        // Wire + RTT: whatever the peer's disk/CPU and our decode don't account for.
+        let transfer = (elapsed.as_secs_f64() - enc - read - decode).max(1e-4);
+        if enc > transfer {
+            // The peer's CPU (or its encode queue) is the bottleneck: shed load fast.
+            net.level = (net.level - ENC_STEP_DOWN).max(1);
+        } else if read > transfer {
+            // The peer's disk is the bottleneck: the level can neither help nor hurt. Hold.
+        } else if enc < transfer * ENC_CLIMB_BELOW && decode < transfer {
+            // The wire is the bottleneck and compression has slack: buy ratio with idle CPU.
+            let step = if enc < transfer * ENC_SLACK { ENC_STEP_UP_FAST } else { ENC_STEP_UP };
+            net.level = (net.level + step).min(ENC_MAX);
+        }
+        // Otherwise: near the knee — hold.
     }
 
     /// Per-chunk soft deadline: generous multiple of the expected duration, so one hung stream
@@ -397,7 +423,7 @@ struct Done {
     len: u64,
     peer: usize,
     elapsed: Duration,
-    result: anyhow::Result<(Bytes, u64 /* wire bytes */)>,
+    result: anyhow::Result<crate::peers::Chunk>,
 }
 
 /// RAII stream slot: released on drop, so a worker aborted mid-fetch (transfer abort, client
@@ -815,14 +841,15 @@ pub async fn run_transfer(
             done = done_rx.recv() => {
                 let Some(done) = done else { return };
                 match done.result {
-                    Ok((bytes, wire)) => {
+                    Ok(chunk) => {
                         ctx.pool.record_success(done.peer, done.len, done.elapsed);
                         ctx.record_rate(done.peer, done.len, done.elapsed);
+                        ctx.observe_encoding(done.peer, done.elapsed, &chunk);
                         ctx.limits[done.peer].observe(true, done.len);
                         remote_fetched += done.len;
                         ctx.stats.remote_bytes.fetch_add(done.len, Ordering::Relaxed);
-                        ctx.stats.wire_bytes.fetch_add(wire, Ordering::Relaxed);
-                        em.buffered.insert(done.off, bytes);
+                        ctx.stats.wire_bytes.fetch_add(chunk.wire, Ordering::Relaxed);
+                        em.buffered.insert(done.off, chunk.bytes);
                         origin.push((done.off, done.len, done.peer));
                         last_progress = Instant::now();
 
@@ -970,28 +997,48 @@ mod tests {
         assert_eq!(ctx_with("zstd:7").zstd_level(0), Some(7));
     }
 
+    fn chunk_timed(enc_ms: u64, read_ms: u64, decode_ms: u64) -> crate::peers::Chunk {
+        crate::peers::Chunk {
+            bytes: Bytes::new(),
+            wire: 0,
+            srv_read: Duration::from_millis(read_ms),
+            srv_encode: Duration::from_millis(enc_ms),
+            decode: Duration::from_millis(decode_ms),
+        }
+    }
+
     #[test]
-    fn auto_level_tiers_by_goodput_with_hysteresis() {
+    fn auto_level_follows_the_chunk_bottleneck() {
+        let ms = Duration::from_millis;
         let ctx = ctx_with("auto");
-        // No samples: the seed tier.
-        assert_eq!(ctx.zstd_level(0), Some(3));
-        // Slow link: highest level, once the rate undershoots the boundary with margin.
+        assert_eq!(ctx.zstd_level(0), Some(3), "seed level before any signal");
+
+        // Wire-bound with lots of encode slack: climb fast to the max.
+        for _ in 0..10 {
+            ctx.observe_encoding(0, ms(2000), &chunk_timed(50, 20, 10));
+        }
+        assert_eq!(ctx.zstd_level(0), Some(19));
+
+        // Near the knee (enc between half of and all of transfer): hold.
+        ctx.observe_encoding(0, ms(1000), &chunk_timed(400, 10, 5));
+        assert_eq!(ctx.zstd_level(0), Some(19));
+
+        // Encode-bound (the peer's CPU or its queue): shed fast, floor at 1.
+        for _ in 0..12 {
+            ctx.observe_encoding(0, ms(1000), &chunk_timed(700, 10, 5));
+        }
+        assert_eq!(ctx.zstd_level(0), Some(1));
+
+        // Peer-disk-bound: the level can neither help nor hurt — hold, even with encode slack.
+        ctx.observe_encoding(0, ms(1000), &chunk_timed(5, 800, 5));
+        assert_eq!(ctx.zstd_level(0), Some(1));
+
+        // A peer that predates the timing headers: fall back to the open-loop goodput ladder.
         ctx.set_rate(0, 1e6);
+        ctx.observe_encoding(0, ms(1000), &chunk_timed(0, 0, 0));
         assert_eq!(ctx.zstd_level(0), Some(19));
-        // Jitter back above the 4 MB/s boundary but inside the hysteresis band: no flap.
-        ctx.set_rate(0, 4.3e6);
-        assert_eq!(ctx.zstd_level(0), Some(19));
-        // Clearing the band moves the tier…
-        ctx.set_rate(0, 6e6);
-        assert_eq!(ctx.zstd_level(0), Some(9));
-        // …and jitter back below the boundary (but inside the band) does not move it back.
-        ctx.set_rate(0, 3.9e6);
-        assert_eq!(ctx.zstd_level(0), Some(9));
-        // A decisive drop does.
-        ctx.set_rate(0, 2e6);
-        assert_eq!(ctx.zstd_level(0), Some(19));
-        // A fast link lands at the cheapest level, skipping tiers in one step.
         ctx.set_rate(0, 1e9);
+        ctx.observe_encoding(0, ms(1000), &chunk_timed(0, 0, 0));
         assert_eq!(ctx.zstd_level(0), Some(1));
     }
 }

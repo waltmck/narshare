@@ -334,26 +334,16 @@ async fn get_nar(
         {
             if end - start <= MAX_ENCODED_SPAN {
                 let level = level.clamp(1, st.cfg.max_zstd_level.max(1));
-                // The CPU half of adaptive encoding. An instantly-available permit means the
-                // encode pool has headroom: spend the requested level. A full pool means
-                // compression, not the wire, is the bottleneck (one encode is mid-flight per
-                // core): wait for the slot but do HALF the requested level, so the queue drains
-                // instead of stacking 19s behind 19s. Frames are self-describing, so requesters
-                // decode whatever level was actually spent; the halving is per-chunk against the
-                // REQUESTED level, never compounded — pressure gone, the next chunk is back to
-                // full. This also breaks the requester-side feedback trap where a CPU-capped
-                // server reads as a thin link (low goodput → even higher requested level).
-                let (_permit, level) = match st.encode_sem.try_acquire() {
-                    Ok(p) => (p, level),
-                    Err(_) => {
-                        let p = st.encode_sem.acquire().await.expect("semaphore closed");
-                        let degraded = (level / 2).max(1);
-                        debug!("encode pool saturated: zstd level {level} → {degraded}");
-                        (p, degraded)
-                    }
-                };
+                // Bound aggregate buffered-encode memory and CPU. The WAIT for a permit is an
+                // honest CPU-pressure signal, so it is reported to the requester folded into the
+                // encode time: the requester's closed-loop level controller (fetch.rs,
+                // observe_encoding) steps down when queue+encode dominates a chunk's service
+                // time, which is what actually drains an overloaded pool.
+                let waited = std::time::Instant::now();
+                let _permit = st.encode_sem.acquire().await.expect("semaphore closed");
+                let wait = waited.elapsed();
                 return match encode_span(&st, &table, start, end, level).await {
-                    Ok(frame) => Response::builder()
+                    Ok((frame, read_d, enc_d)) => Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header(header::CONTENT_TYPE, "application/x-narshare-chunk")
                         .header(header::CONTENT_LENGTH, frame.len())
@@ -362,6 +352,11 @@ async fn get_nar(
                             format!("bytes {}-{}/{}", start, end - 1, size),
                         )
                         .header("x-narshare-encoding", "zstd")
+                        // Where this chunk's service time went, for the requester's bottleneck
+                        // classification: disk vs CPU (pool wait + encode). Wire time is what
+                        // remains of the requester's own elapsed measurement.
+                        .header("x-narshare-read-us", read_d.as_micros().to_string())
+                        .header("x-narshare-encode-us", (wait + enc_d).as_micros().to_string())
                         .body(Body::from(frame))
                         .unwrap(),
                     Err(e) => err500("chunk encode", e),
@@ -548,14 +543,17 @@ pub(crate) fn parse_range(header: Option<&str>, size: u64) -> RangeSpec {
     }
 }
 
-/// Materialize [start, end) into memory and compress it as one zstd frame.
+/// Materialize [start, end) into memory and compress it as one zstd frame. Returns the frame
+/// plus how long the two stages took (read from disk; encode, including blocking-pool queueing)
+/// — the serve side's half of the adaptive-encoding timing breakdown.
 async fn encode_span(
     st: &Arc<ServeState>,
     table: &Arc<SeekTable>,
     start: u64,
     end: u64,
     level: i32,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Duration, Duration)> {
+    let t0 = Instant::now();
     let mut raw = Vec::with_capacity((end - start) as usize);
     let mut i = table.first_seg(start);
     while let Some(slice) = table.seg_slice(i, start, end) {
@@ -575,11 +573,14 @@ async fn encode_span(
             }
         }
     }
-    tokio::task::spawn_blocking(move || {
+    let read_d = t0.elapsed();
+    let t1 = Instant::now();
+    let frame = tokio::task::spawn_blocking(move || {
         zstd::stream::encode_all(&raw[..], level).context("zstd encode")
     })
     .await
-    .expect("encode task panicked")
+    .expect("encode task panicked")?;
+    Ok((frame, read_d, t1.elapsed()))
 }
 
 #[cfg(test)]

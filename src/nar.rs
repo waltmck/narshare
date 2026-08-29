@@ -275,6 +275,158 @@ mod tests {
         }
     }
 
+    /// How much compression ratio do independent per-chunk frames give up versus one
+    /// continuous zstd context (and versus continuous + long-distance matching, the upper
+    /// bound of what cross-chunk context could buy)? Measured on a real store path; results
+    /// recorded in docs/perf.md. Run explicitly:
+    ///   NARSHARE_BENCH_STORE_PATH=/nix/store/...-hollow-knight-linux \
+    ///   NARSHARE_BENCH_LEVELS=1,3,9 [NARSHARE_BENCH_LIMIT=<bytes>] \
+    ///   cargo test --release -- --ignored bench_chunk_ratio --nocapture
+    #[test]
+    #[ignore]
+    fn bench_chunk_ratio() {
+        let Ok(root) = std::env::var("NARSHARE_BENCH_STORE_PATH") else {
+            eprintln!("set NARSHARE_BENCH_STORE_PATH to a store path");
+            return;
+        };
+        let levels: Vec<i32> = std::env::var("NARSHARE_BENCH_LEVELS")
+            .unwrap_or_else(|_| "1,3,9".into())
+            .split(',')
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
+        let limit: u64 = std::env::var("NARSHARE_BENCH_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u64::MAX);
+        let table = Arc::new(build(Path::new(&root)).unwrap());
+        let total = table.nar_size.min(limit);
+        println!("{root}: NAR {} bytes, measuring {} bytes", table.nar_size, total);
+
+        #[derive(Clone, Copy)]
+        enum Mode {
+            /// One zstd stream, one context — the hypothetical cross-chunk baseline.
+            Continuous,
+            /// Continuous + 128 MiB long-distance matching: what context could buy at most.
+            ContinuousLdm,
+            /// Independent frames of this size — exactly what the serve side does per chunk.
+            Chunked(u64),
+        }
+        let modes: [(&str, Mode); 6] = [
+            ("continuous", Mode::Continuous),
+            ("continuous+ldm", Mode::ContinuousLdm),
+            ("chunk-256KiB", Mode::Chunked(256 << 10)),
+            ("chunk-1MiB", Mode::Chunked(1 << 20)),
+            ("chunk-4MiB", Mode::Chunked(4 << 20)),
+            ("chunk-16MiB", Mode::Chunked(16 << 20)),
+        ];
+
+        /// Stream the NAR's first `total` bytes into `sink` (reads per thread; cache-hot after
+        /// the first pass).
+        fn stream(table: &SeekTable, total: u64, mut sink: impl FnMut(&[u8])) {
+            use std::os::unix::fs::FileExt;
+            let mut i = table.first_seg(0);
+            while let Some(s) = table.seg_slice(i, 0, total) {
+                i += 1;
+                match s {
+                    Slice::Lit(b) => sink(&b),
+                    Slice::File { path, off, len } => {
+                        let f = fs::File::open(path.as_path()).unwrap();
+                        let mut buf = vec![0u8; len.min(4 << 20) as usize];
+                        let (mut o, mut rem) = (off, len);
+                        while rem > 0 {
+                            let n = rem.min(4 << 20) as usize;
+                            f.read_exact_at(&mut buf[..n], o).unwrap();
+                            sink(&buf[..n]);
+                            o += n as u64;
+                            rem -= n as u64;
+                        }
+                    }
+                }
+            }
+        }
+
+        struct Counter(u64);
+        impl std::io::Write for Counter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0 += b.len() as u64;
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut handles = Vec::new();
+        for &level in &levels {
+            for &(name, mode) in &modes {
+                let table = table.clone();
+                handles.push(std::thread::spawn(move || {
+                    let t0 = std::time::Instant::now();
+                    let out = match mode {
+                        Mode::Continuous | Mode::ContinuousLdm => {
+                            let mut enc =
+                                zstd::stream::write::Encoder::new(Counter(0), level).unwrap();
+                            if matches!(mode, Mode::ContinuousLdm) {
+                                enc.long_distance_matching(true).unwrap();
+                                enc.window_log(27).unwrap();
+                            }
+                            use std::io::Write;
+                            stream(&table, total, |b| enc.write_all(b).unwrap());
+                            enc.finish().unwrap().0
+                        }
+                        Mode::Chunked(sz) => {
+                            let mut out = 0u64;
+                            let mut buf = Vec::with_capacity(sz as usize);
+                            stream(&table, total, |mut b| {
+                                while !b.is_empty() {
+                                    let room = sz as usize - buf.len();
+                                    let take = room.min(b.len());
+                                    buf.extend_from_slice(&b[..take]);
+                                    b = &b[take..];
+                                    if buf.len() == sz as usize {
+                                        out += zstd::stream::encode_all(&buf[..], level)
+                                            .unwrap()
+                                            .len() as u64;
+                                        buf.clear();
+                                    }
+                                }
+                            });
+                            if !buf.is_empty() {
+                                out += zstd::stream::encode_all(&buf[..], level).unwrap().len()
+                                    as u64;
+                            }
+                            out
+                        }
+                    };
+                    (level, name, out, t0.elapsed())
+                }));
+            }
+        }
+        let mut rows: Vec<(i32, &str, u64, std::time::Duration)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        rows.sort_by_key(|&(l, n, ..)| (l, n));
+        println!(
+            "{:>5} {:16} {:>12} {:>8} {:>14} {:>9}",
+            "level", "mode", "bytes", "ratio", "vs continuous", "enc MB/s"
+        );
+        for &(level, name, out, dur) in &rows {
+            let baseline = rows
+                .iter()
+                .find(|&&(l, n, ..)| l == level && n == "continuous")
+                .map(|&(_, _, o, _)| o)
+                .unwrap();
+            println!(
+                "{:>5} {:16} {:>12} {:>8.4} {:>+13.2}% {:>9.1}",
+                level,
+                name,
+                out,
+                out as f64 / total as f64,
+                (out as f64 / baseline as f64 - 1.0) * 100.0,
+                total as f64 / dur.as_secs_f64() / 1e6
+            );
+        }
+    }
+
     #[test]
     fn ranges_agree_with_full() {
         let dir = tempfile::tempdir().unwrap();

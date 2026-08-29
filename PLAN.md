@@ -136,22 +136,25 @@ that sets each:
 * **Streams per peer** — the concurrency.rs governor, ceiling `per_peer_connections`. 10 GbE needs
   ~8 streams to fill; 8 competing flows on a 500 kbit link is bufferbloat and timeouts. The governor
   finds the knee for *this* link and follows it when it moves (roaming).
-* **Compression level** — two independent halves, meeting at the chunk boundary. The *network*
-  half is requester-side: `encoding = "auto"` (default) picks the zstd level from the per-peer
-  goodput EWMA with hysteresis (a tier switch must clear the boundary by 25%, so rate jitter
-  cannot flap the level) — roughly `<4 MB/s → 19`, `<40 MB/s → 9`, `<400 MB/s → 3`, else `1`
-  (thresholds to be measured, not guessed, in the perf milestone). The *CPU* half is serve-side:
-  chunk frames are independent and self-describing, so the server may answer any level ≤
-  requested — when its core-sized encode pool is saturated (compression, not the wire, is the
-  bottleneck) it serves the chunk at half the requested level, draining the queue and breaking
-  the feedback trap where a CPU-capped server reads as a thin link to the requester. This is
-  zstd `--adapt`'s idea at chunk granularity with explicit signals; zstd's own `--adapt` (and its
-  poor interaction with multithreaded compression) is never involved, because narshare never uses
-  zstd's internal multithreading — every chunk is one single-threaded frame, and parallelism
-  comes from chunks in flight. On cellular, zstd-19 multiplies effective link capacity on game
-  data; on 10 GbE, zstd-1/none keeps compression off the critical path. Per-peer manual override
-  remains one line of config (it pins the *requested* level; the server cap and saturation
-  degrade still apply).
+* **Compression level** — `encoding = "auto"` (default) is a CLOSED-LOOP per-chunk controller.
+  The serving peer reports, in two response headers, where each chunk's service time went —
+  disk read, and encode-pool wait + encode — and the requester, which knows total elapsed, wire
+  bytes, and its own decode time, classifies the chunk's bottleneck and steps the level:
+  encode-dominated (the peer's CPU or its queue) → step down fast; peer-disk-dominated → hold
+  (the level can neither help nor hurt); wire-dominated with encode slack → step up, faster
+  while the slack is large. The knee settles where encode time is comparable to wire time —
+  with chunks pipelined across streams, that is where both stages stay busy. There is
+  deliberately NO hysteresis: chunk frames are independent and self-describing, so a level
+  switch between chunks is free, and flapping near equilibrium is harmless (hysteresis belongs
+  to controls with switching costs, like chunk size). Peers that predate the timing headers get
+  the open-loop goodput ladder (`<4 MB/s → 19`, `<40 → 9`, `<400 → 3`, else `1`) as a fallback.
+  This is zstd `--adapt`'s idea at chunk granularity with explicit signals; zstd's own `--adapt`
+  (and its poor interaction with multithreaded compression) is never involved, because narshare
+  never uses zstd's internal multithreading — every chunk is one single-threaded frame, and
+  parallelism comes from chunks in flight. On cellular, zstd-19 multiplies effective link
+  capacity on game data; on 10 GbE, zstd-1 keeps compression off the critical path. Per-peer
+  manual override remains one line of config (it pins the *requested* level; the server's
+  `max_zstd_level` cap still applies, and its pool wait still shows up honestly in the headers).
 * **Hedge deadline** — narinfo fan-out hedging uses a per-peer deadline derived from observed
   lookup latency (clamped p95 × factor), with `narinfo_timeout` as the *cap*. A fixed 1.5 s deadline
   is generous on LAN and flapping-prone at cellular RTTs. Crucially, **missing the hedge deadline is

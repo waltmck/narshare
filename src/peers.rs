@@ -132,6 +132,31 @@ impl Peer {
     }
 }
 
+/// One fetched chunk, with the timing breakdown that lets the requester classify the chunk's
+/// bottleneck (fetch.rs observe_encoding): where did the service time go — the peer's disk, the
+/// peer's CPU (queue + encode), the wire, or our own decode?
+pub struct Chunk {
+    /// Uncompressed NAR bytes.
+    pub bytes: Bytes,
+    /// Bytes as they traveled on the wire.
+    pub wire: u64,
+    /// Peer-reported disk-read time (zero when the peer predates the header).
+    pub srv_read: Duration,
+    /// Peer-reported encode-pool wait + encode time (zero when absent).
+    pub srv_encode: Duration,
+    /// Local decompression time (zero for raw bodies).
+    pub decode: Duration,
+}
+
+fn micros_header(resp: &reqwest::Response, name: &str) -> Duration {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_micros)
+        .unwrap_or_default()
+}
+
 /// One peer's answer to a narinfo lookup.
 pub enum Answer {
     Found(RemoteNarinfo),
@@ -326,8 +351,9 @@ impl Peers {
 
     /// Fetch one chunk [start, end) of a NAR from a specific peer, optionally zstd-framed on the
     /// wire (the narshare chunk-encoding extension: request `x-narshare-accept: zstd:<level>`,
-    /// response `x-narshare-encoding: zstd`). Returns the UNCOMPRESSED bytes plus the wire size.
-    /// Hard failures strike the breaker; the caller records pool/rate outcomes.
+    /// response `x-narshare-encoding: zstd`). Returns the UNCOMPRESSED bytes plus the timing
+    /// breakdown the adaptive-encoding controller consumes. Hard failures strike the breaker;
+    /// the caller records pool/rate outcomes.
     pub async fn fetch_range(
         &self,
         peer_idx: usize,
@@ -335,7 +361,7 @@ impl Peers {
         start: u64,
         end: u64,
         zstd_level: Option<i32>,
-    ) -> Result<(Bytes, u64)> {
+    ) -> Result<Chunk> {
         let peer = &self.list[peer_idx];
         let url = peer.base.join(nar_url).context("bad NAR url from peer")?;
         let mut req = self.client.get(url).header(
@@ -365,6 +391,8 @@ impl Peers {
             .headers()
             .get("x-narshare-encoding")
             .is_some_and(|v| v.as_bytes() == b"zstd");
+        let srv_read = micros_header(&resp, "x-narshare-read-us");
+        let srv_encode = micros_header(&resp, "x-narshare-encode-us");
         let want = (end - start) as usize;
         // Cap the WIRE body: raw must be exactly `want`; a compressed frame must be no larger than
         // `want + slack` (it should be smaller). This bounds the read before decompression.
@@ -379,13 +407,14 @@ impl Peers {
             }
         };
         let wire = body.len() as u64;
-        let bytes = if encoded {
+        let (bytes, decode) = if encoded {
             // Bound the DECOMPRESSED output to `want`: the decoder must stop before a small frame
             // can expand into an unbounded allocation. Read at most want+1 bytes; a frame that
             // produces more is rejected below by the exact-length check.
             let name = peer.name.clone();
-            let raw = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let (raw, decode) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Duration)> {
                 use std::io::Read;
+                let t0 = Instant::now();
                 let mut dec = zstd::stream::read::Decoder::new(&body[..])
                     .with_context(|| format!("peer {name}: bad zstd frame"))?;
                 let mut out = Vec::with_capacity(want);
@@ -393,13 +422,13 @@ impl Peers {
                     .take(want as u64 + 1)
                     .read_to_end(&mut out)
                     .with_context(|| format!("peer {name}: bad zstd frame"))?;
-                Ok(out)
+                Ok((out, t0.elapsed()))
             })
             .await
             .expect("decode task panicked")?;
-            Bytes::from(raw)
+            (Bytes::from(raw), decode)
         } else {
-            body
+            (body, Duration::ZERO)
         };
         if bytes.len() != want {
             bail!(
@@ -409,6 +438,6 @@ impl Peers {
                 want
             );
         }
-        Ok((bytes, wire))
+        Ok(Chunk { bytes, wire, srv_read, srv_encode, decode })
     }
 }

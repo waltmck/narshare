@@ -28,3 +28,39 @@ headroom from a single file at queue depth 64, before any striping.
 
 `backend = "auto"` (uring when available) stands as the default. Cold-NVMe and end-to-end
 numbers land here at M5.5.
+
+## Per-chunk framing: compression ratio given up vs one continuous context
+
+**Setup**: walt-laptop, Hollow Knight (`hollow-knight-linux`, 5.24 GB NAR — Unity assets: mixed
+compressible/incompressible, the propnix-representative case). Levels 1/3/9 over the full NAR;
+level 19 over the first 2 GiB (level-19 encode of the full NAR costs ~30 CPU-minutes per config).
+`continuous` = one zstd stream, one context (the hypothetical cross-chunk baseline);
+`continuous+ldm` = that plus 128 MiB long-distance matching (the upper bound of what cross-chunk
+context could ever buy); `chunk-N` = independent frames, exactly what the serve side emits.
+
+```
+NARSHARE_BENCH_STORE_PATH=<path> cargo test --release -- --ignored bench_chunk_ratio --nocapture
+```
+
+| level | continuous ratio | +ldm | chunk 16 MiB | chunk 4 MiB | chunk 1 MiB | chunk 256 KiB |
+|------:|-----------------:|-----:|-------------:|------------:|------------:|--------------:|
+| 1     | 0.2295 | −4.80% | +0.03% | +0.13% | +0.53% | +2.15% |
+| 3     | 0.2185 | −3.62% | +0.09% | +0.41% | +1.70% | +4.33% |
+| 9     | 0.2036 | −1.96% | +0.38% | +1.56% | +4.24% | +7.87% |
+| 19    | 0.1513 | −2.45% | +1.36% | +4.65% | +9.45% | +15.69% |
+
+(chunk columns: wire bytes relative to `continuous` at the same level; +X% = chunking costs X%
+more wire bytes.)
+
+**Interpretation.** The penalty grows as chunks shrink and levels rise — higher levels have
+bigger match windows, so cutting the stream discards more. At the operating points the adaptive
+chunk sizing actually produces, the cost is where you'd want it: on fast links (levels 1–3,
+chunks pinned at the 16 MiB cap) chunking is free (≤0.1%); on a ~4 MB/s link (level 19, ~8 MiB
+chunks) it costs a few percent. The bad corner is the ultra-thin link where chunks hit the
+256 KiB floor at level 19: **+16% wire bytes** — exactly where bytes are most precious. Effective
+ratio there is still 5.7× (vs 6.6× continuous). This is the price of the load-bearing property
+that chunks are independently schedulable across peers (striping, failover, per-segment retry all
+depend on it); chaining contexts across chunks would couple every chunk to one peer's stream.
+LDM shows cross-chunk context tops out at another 2–5% on this data — most redundancy is local.
+If the thin-link corner ever matters in practice, the lever is the chunk floor (bigger chunks on
+very slow links trade MW feedback cadence for ratio), not stream-context coupling.
