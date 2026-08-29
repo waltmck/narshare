@@ -1,0 +1,15 @@
+# Local smoke-test config: serve the real store read-only, and proxy through it via loopback
+# (in a real deployment, peers are OTHER hosts' serve listeners on the mesh).
+#   nix run .#narshare -- -c test.toml
+#   curl http://127.0.0.1:15050/nix-cache-info   # serve side
+#   curl http://127.0.0.1:15051/nix-cache-info   # proxy side
+
+[serve]
+listen = "127.0.0.1:15050"
+
+[proxy]
+listen = "127.0.0.1:15051"
+
+[[peers]]
+name = "self"
+url = "http://127.0.0.1:15050"

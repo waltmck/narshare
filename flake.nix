@@ -1,0 +1,43 @@
+{
+  description = "narshare — self-contained mesh Nix substituter: serve + dedup + striped NAR fetch";
+
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+
+  outputs = { self, nixpkgs }:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      eachSystem = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+    in
+    {
+      packages = eachSystem (pkgs: rec {
+        narshare = pkgs.rustPlatform.buildRustPackage {
+          pname = "narshare";
+          version = "0.1.0";
+          # Only the crate inputs: doc edits must not rebuild the package.
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ];
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+          # Differential tests exec `nix`/compare against the real store; they skip themselves
+          # when `nix` is absent, so the sandboxed check phase runs the pure tests only.
+          meta = {
+            description = "Self-contained mesh Nix substituter";
+            mainProgram = "narshare";
+          };
+        };
+        default = narshare;
+      });
+
+      devShells = eachSystem (pkgs: {
+        default = pkgs.mkShell {
+          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
+        };
+      });
+
+      nixosModules = rec {
+        narshare = import ./module.nix self;
+        default = narshare;
+      };
+    };
+}

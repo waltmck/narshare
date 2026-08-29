@@ -1,0 +1,55 @@
+# narshare
+
+A self-contained mesh Nix substituter: every host **serves** its `/nix/store` as a standard binary
+cache and **proxies** its local nix daemon's substitution through every peer — striping each NAR
+across all peers that hold it, deduplicating repeated segments within a transfer, compressing
+per-chunk on the wire, and adapting chunk sizes, stream counts, and compression levels to links
+from 500 kbit/s cellular to 10 GbE.
+
+Zero-trust by construction: peers are configured with **no signing keys**, so only
+content-addressed paths (FODs — fetched sources, game data) can be substituted from them, and the
+consuming nix verifies every hash on ingestion. The daemon is stateless: it reads `/nix/store` and
+Nix's database (both read-only) and writes nothing, ever.
+
+See [PLAN.md](PLAN.md) for the full design; `docs/perf.md` for measured numbers.
+
+## Run
+
+```console
+$ nix run .#narshare -- -c test.toml          # serve + proxy per the config
+$ nix run .#narshare -- check -c test.toml    # validate a config
+```
+
+Minimal real config (see `test.toml` and PLAN.md for all knobs — most things adapt at runtime and
+have no knob at all):
+
+```toml
+[serve]
+listen = "100.64.0.3:5050"      # mesh address; firewalling is the mesh's job
+
+[proxy]
+listen = "127.0.0.1:5051"       # what the local nix uses as a substituter
+
+[[peers]]
+name = "server"
+url = "http://100.64.0.2:5050"
+```
+
+Point nix at the proxy with no keys:
+
+```nix
+nix.settings.substituters = [ "http://127.0.0.1:5051" ];
+nix.settings.fallback = true;
+```
+
+or use the bundled NixOS module (`nixosModules.narshare`), which wires that up via
+`services.narshare.addToSubstituters`.
+
+## Status
+
+Milestones M0–M5 of PLAN.md are implemented and tested: serve side (seek-table NARs, ranges,
+io_uring + always-O_DIRECT reads, chunk-encoding, manifests), proxy side (hedged/coalesced/tiered
+lookup fan-out, circuit breakers, striped multi-peer fetch under multiplicative weights and a
+per-peer concurrency governor, per-segment blake3 verification with peer attribution,
+intra-transfer dedup, byte-progress stall + `min_bandwidth` roaming), restart recovery. Remaining:
+observability (M6), NixOS VM test (M7), and the two-extremes perf run (M5.5).
