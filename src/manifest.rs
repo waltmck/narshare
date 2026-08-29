@@ -6,7 +6,7 @@
 //! framing because it does not assert one. Segments are fixed `segment_bytes` splits *within*
 //! each regular file, so identical files hash to identical segment lists wherever they sit.
 //!
-//! Manifests are efficiency metadata, not trust: a lying manifest yields a stream that fails the
+//! Manifests are efficiency metadata, not trust: an incorrect manifest yields a stream that fails the
 //! final NarHash check like any other corruption.
 
 use crate::nixbase32;
@@ -113,7 +113,7 @@ pub struct Layout {
 /// Synthesize the NAR byte layout from a manifest — the same framing walk as nar.rs, driven by
 /// manifest metadata instead of the filesystem (kept textually in sync; the differential test
 /// pins byte equality).
-/// Bound on tree depth when synthesizing an untrusted peer manifest, so a deeply-nested Dir cannot
+/// Bound on tree depth when synthesizing a peer-supplied manifest, so a deeply-nested Dir cannot
 /// overflow the stack. Real store paths are nowhere near this.
 const MAX_DEPTH: u32 = 512;
 

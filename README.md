@@ -6,7 +6,7 @@ across all peers that hold it, deduplicating repeated segments within a transfer
 per-chunk on the wire, and adapting chunk sizes, stream counts, and compression levels to links
 from 500 kbit/s cellular to 10 GbE.
 
-Zero-trust by construction: peers are configured with **no signing keys**, so only
+Correct by construction: peers are configured with **no signing keys**, so only
 content-addressed paths (FODs — fetched sources, game data) can be substituted from them, and the
 consuming nix verifies every hash on ingestion. The daemon is stateless: it reads `/nix/store` and
 Nix's database (both read-only) and writes nothing, ever.

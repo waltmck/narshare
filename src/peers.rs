@@ -24,8 +24,8 @@ use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
 const DEADLINE_FLOOR: Duration = Duration::from_millis(100);
-/// Response-body ceilings: a single malicious peer must not be able to OOM the proxy. narinfos
-/// are ~1 KB; manifests are ~1.3 MB per 100 GB of content — both capped generously.
+/// Response-body ceilings: a peer's response must never make the proxy allocate without bound.
+/// narinfos are ~1 KB; manifests are ~1.3 MB per 100 GB of content — both capped generously.
 const NARINFO_CAP: usize = 1 << 20;
 const MANIFEST_CAP: usize = 256 << 20;
 /// Slack over the requested length allowed for a compressed chunk body (zstd's worst-case
@@ -33,7 +33,8 @@ const MANIFEST_CAP: usize = 256 << 20;
 const WIRE_SLACK: usize = 64 << 10;
 
 /// Read a response body with a hard cap, checking Content-Length first and bounding the stream.
-/// Neither reqwest nor HTTP bounds this by default, so an unbounded read is an OOM primitive.
+/// Neither reqwest nor HTTP bounds this by default, so without a cap a response of any size would
+/// be buffered in full.
 async fn read_capped(resp: reqwest::Response, cap: usize) -> Result<Bytes> {
     if let Some(len) = resp.content_length() {
         if len > cap as u64 {
@@ -120,7 +121,10 @@ impl Peer {
         h.strikes = h.strikes.saturating_add(1);
         if h.strikes >= threshold {
             h.open_until = Some(Instant::now() + cooldown);
-            warn!("peer {name}: breaker open for {cooldown:?} ({} strikes)", h.strikes);
+            warn!(
+                "peer {name}: breaker open for {cooldown:?} ({} strikes)",
+                h.strikes
+            );
         }
     }
 }
@@ -272,7 +276,10 @@ impl Peers {
         let peer = &self.list[peer_idx];
         let url = peer
             .base
-            .join(&format!("narshare/v1/manifest/{}", nixbase32::encode(nar_hash)))
+            .join(&format!(
+                "narshare/v1/manifest/{}",
+                nixbase32::encode(nar_hash)
+            ))
             .ok()?;
         let resp = tokio::time::timeout(self.cap, self.client.get(url).send()).await;
         match resp {
@@ -281,7 +288,10 @@ impl Peers {
                 match serde_json::from_slice::<Manifest>(&body) {
                     Ok(m) if m.version == crate::manifest::VERSION => Some(m),
                     Ok(m) => {
-                        debug!("peer {}: manifest version {} unsupported", peer.name, m.version);
+                        debug!(
+                            "peer {}: manifest version {} unsupported",
+                            peer.name, m.version
+                        );
                         None
                     }
                     Err(e) => {
@@ -315,10 +325,10 @@ impl Peers {
     ) -> Result<(Bytes, u64)> {
         let peer = &self.list[peer_idx];
         let url = peer.base.join(nar_url).context("bad NAR url from peer")?;
-        let mut req = self
-            .client
-            .get(url)
-            .header(reqwest::header::RANGE, format!("bytes={}-{}", start, end - 1));
+        let mut req = self.client.get(url).header(
+            reqwest::header::RANGE,
+            format!("bytes={}-{}", start, end - 1),
+        );
         if let Some(level) = zstd_level {
             req = req.header("x-narshare-accept", format!("zstd:{level}"));
         }
@@ -346,11 +356,14 @@ impl Peers {
         // Cap the WIRE body: raw must be exactly `want`; a compressed frame must be no larger than
         // `want + slack` (it should be smaller). This bounds the read before decompression.
         let wire_cap = if encoded { want + WIRE_SLACK } else { want };
-        let body = read_capped(resp, wire_cap).await.with_context(|| format!("peer {}", peer.name))?;
+        let body = read_capped(resp, wire_cap)
+            .await
+            .with_context(|| format!("peer {}", peer.name))?;
         let wire = body.len() as u64;
         let bytes = if encoded {
-            // Bound the DECOMPRESSED output to `want` — a small frame must not expand to gigabytes
-            // (decompression bomb). Read at most want+1 bytes; anything more is malicious.
+            // Bound the DECOMPRESSED output to `want`: the decoder must stop before a small frame
+            // can expand into an unbounded allocation. Read at most want+1 bytes; a frame that
+            // produces more is rejected below by the exact-length check.
             let name = peer.name.clone();
             let raw = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
                 use std::io::Read;
@@ -370,9 +383,13 @@ impl Peers {
             body
         };
         if bytes.len() != want {
-            bail!("peer {}: chunk length {} != requested {}", peer.name, bytes.len(), want);
+            bail!(
+                "peer {}: chunk length {} != requested {}",
+                peer.name,
+                bytes.len(),
+                want
+            );
         }
         Ok((bytes, wire))
     }
-
 }

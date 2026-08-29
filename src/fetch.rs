@@ -43,7 +43,7 @@ const ROAMING_EPOCH: Duration = Duration::from_secs(600);
 /// Transfers below this skip the manifest roundtrip — not worth it.
 const MANIFEST_MIN: u64 = 4 << 20;
 /// A segment failing verification is refetched at most this many times before the transfer
-/// aborts (a lying manifest or systematically corrupt peers).
+/// aborts (an incorrect manifest, or peers that persistently return the wrong bytes).
 const SEG_RETRIES: u32 = 3;
 
 #[derive(Default)]
@@ -291,12 +291,12 @@ fn manifest_plan(m: &Manifest, info: &RemoteNarinfo, budget: u64, window: u64) -
         anyhow::bail!("manifest NarSize {} != narinfo {}", layout.nar_size, info.nar_size);
     }
 
-    // Dedup plan over the segment occurrences, in NAR order. Two guards on the untrusted manifest:
+    // Dedup plan over the segment occurrences, in NAR order. Two guards on the peer-supplied manifest:
     //   * No span may exceed the fetch window, or it could never be fully buffered for
     //     verification and every transfer would stall out (data-path #2).
     //   * A given segment hash must have ONE length across all its occurrences, or replay would
     //     emit the wrong number of bytes and desync the stream past the NarHash gate (data-path
-    //     #1). Reject rather than fall back — a manifest this malformed is not trustworthy.
+    //     #1). Reject rather than fall back — a manifest this inconsistent cannot be relied on.
     let mut keys = Vec::new();
     let mut sizes = Vec::new();
     let mut len_of: HashMap<[u8; 32], u64> = HashMap::new();

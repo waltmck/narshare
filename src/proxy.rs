@@ -72,10 +72,11 @@ impl ProxyState {
         })
     }
 
-    /// Accept a peer as a holder of a path, enforcing the zero-trust and representation gates.
-    /// Returns false (and registers nothing) if the path is not usable. The stored source URL is
-    /// ALWAYS the canonical `nar/<narhash>.nar` relative to the peer's base — NEVER the peer's
-    /// advertised `URL:`, which via RFC-3986 resolution could point at an arbitrary host (SSRF).
+    /// Accept a peer as a holder of a path, enforcing the content-addressing and representation
+    /// gates. Returns false (and registers nothing) if the path is not usable. The stored source
+    /// URL is ALWAYS the canonical `nar/<narhash>.nar` relative to the peer's base — NEVER the
+    /// peer's advertised `URL:`, which via RFC-3986 resolution could resolve to an arbitrary host.
+    /// Deriving the URL from the content hash keeps the fetch target a pure function of the request.
     fn accept_holder(&self, info: &RemoteNarinfo, peer_idx: usize) -> bool {
         if self.cfg.ca_only && info.ca.is_none() {
             return false;
@@ -352,9 +353,10 @@ async fn fan_out(st: &Arc<ProxyState>, hash_part: &str) -> Option<RemoteNarinfo>
         }
 
         if let Some((idx, info)) = found {
-            // A peer must not redirect us to a different store path (nix would reject a mismatched
-            // StorePath anyway, but this keeps our own caches honest — see the negative-cache
-            // eviction below). Treat a mismatch as no usable answer and fall to the next tier.
+            // The answer must be for the path we asked about; a StorePath naming a different hash
+            // is not a usable answer (nix would reject a mismatched StorePath anyway, but this also
+            // keeps our own caches keyed correctly — see the negative-cache eviction below). Treat
+            // a mismatch as no usable answer and fall to the next tier.
             if hash_part_of(&info.store_path) != hash_part {
                 warn!(
                     "peer {} answered {hash_part} with unrelated path {}",
@@ -366,7 +368,7 @@ async fn fan_out(st: &Arc<ProxyState>, hash_part: &str) -> Option<RemoteNarinfo>
             } else {
                 // ca_only / non-"none" compression: refuse and negative-cache (all peers serve
                 // the same store paths, so this path is unusable meshwide).
-                debug!("refusing {} (zero-trust / representation gate)", info.store_path);
+                debug!("refusing {} (content-addressing / representation gate)", info.store_path);
                 st.negative.lock().unwrap().put(hash_part.to_owned(), Instant::now());
                 return None;
             }
@@ -1156,9 +1158,9 @@ mod tests {
 
     #[test]
     fn hash_part_of_never_panics_on_multibyte() {
-        // A peer-controlled store path with a multibyte char straddling byte 32 must not panic.
-        let evil = format!("/nix/store/{}\u{e9}rest", "a".repeat(31)); // 31 ascii + 2-byte char
-        let _ = super::hash_part_of(&evil); // must return without panicking
+        // A peer-supplied store path with a multibyte char straddling byte 32 must not panic.
+        let odd = format!("/nix/store/{}\u{e9}rest", "a".repeat(31)); // 31 ascii + 2-byte char
+        let _ = super::hash_part_of(&odd); // must return without panicking
         assert_eq!(
             super::hash_part_of("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-name"),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1166,21 +1168,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn zstd_bomb_and_oversized_chunk_fail_cleanly() {
+    async fn oversized_decode_output_is_rejected() {
         use axum::routing::any;
-        // A hostile peer: valid narinfo, but every chunk is a tiny zstd frame that decompresses
-        // to far more than requested. The bounded decoder must reject it (not OOM), the chunk
-        // must fail, and the transfer must abort promptly rather than hang.
+        // A peer returns a valid narinfo, but every chunk is a small zstd frame that decompresses
+        // to far more than the requested length. The length-bounded decoder must reject it without
+        // allocating the full output, so the chunk fails and the transfer ends promptly.
         let nar32 = crate::nixbase32::encode(&[42u8; 32]);
         let narinfo_text = format!(
-            "StorePath: /nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-bomb\nURL: nar/{nar32}.nar\n\
+            "StorePath: /nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-oversized\nURL: nar/{nar32}.nar\n\
              Compression: none\nNarHash: sha256:{nar32}\nNarSize: 1048576\nReferences: \n\
              CA: fixed:r:sha256:x\n"
         );
         // A ~4 MiB run of zeros compresses to a few KB; decompressing bounded to want+1 stops early.
-        let bomb = zstd::stream::encode_all(&vec![0u8; 4 << 20][..], 3).unwrap();
-        let bomb = std::sync::Arc::new(bomb);
-        let hostile = Router::new()
+        let frame = zstd::stream::encode_all(&vec![0u8; 4 << 20][..], 3).unwrap();
+        let frame = std::sync::Arc::new(frame);
+        let peer = Router::new()
             .route(
                 "/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii.narinfo",
                 get(move || {
@@ -1191,9 +1193,10 @@ mod tests {
             .route(
                 "/nar/{f}",
                 any(move |hdrs: HeaderMap| {
-                    let bomb = bomb.clone();
+                    let frame = frame.clone();
                     async move {
-                        // Honor the requested range span in Content-Range, but the body is a bomb.
+                        // Honor the requested range span in Content-Range, but the body
+                        // decompresses well beyond the requested length.
                         let range = hdrs
                             .get(header::RANGE)
                             .and_then(|v| v.to_str().ok())
@@ -1205,14 +1208,14 @@ mod tests {
                             .header(header::CONTENT_TYPE, "application/x-narshare-chunk")
                             .header("x-narshare-encoding", "zstd")
                             .header(header::CONTENT_RANGE, format!("bytes {range}/1048576"))
-                            .body(Body::from(bomb.to_vec()))
+                            .body(Body::from(frame.to_vec()))
                             .unwrap()
                     }
                 }),
             );
-        let hostile_url = spawn_router(hostile).await;
+        let peer_url = spawn_router(peer).await;
         let (proxy_url, _) = spawn_proxy(
-            &[("hostile", &hostile_url)],
+            &[("over", &peer_url)],
             "chunk_max = \"256KiB\"\nstall_timeout = \"1s\"",
         )
         .await;
@@ -1225,7 +1228,10 @@ mod tests {
         assert_eq!(ni.status(), 200);
         let started = Instant::now();
         let resp = client.get(format!("{proxy_url}/nar/{nar32}.nar")).send().await.unwrap();
-        assert!(resp.bytes().await.is_err(), "a bomb chunk must not yield a successful body");
-        assert!(started.elapsed() < std::time::Duration::from_secs(8), "must abort promptly");
+        assert!(
+            resp.bytes().await.is_err(),
+            "an over-expanding chunk must not yield a successful body"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(8), "must end promptly");
     }
 }

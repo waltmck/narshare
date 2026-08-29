@@ -38,9 +38,10 @@ pub fn format_narinfo(info: &PathInfo, store_dir: &str) -> String {
 }
 
 /// A peer's narinfo, as parsed by the proxy. The advertised `URL:` is deliberately NOT retained:
-/// narshare always fetches the canonical `nar/<narhash>.nar` relative to the peer base, so a peer
-/// cannot redirect the fetch to an arbitrary host (SSRF). FileHash/FileSize are likewise dropped —
-/// the proxy reconstructs an uncompressed NAR and the client recomputes them.
+/// narshare always fetches the canonical `nar/<narhash>.nar` relative to the peer base, so the
+/// fetch target is a pure function of the requested content hash rather than any peer-supplied
+/// string. FileHash/FileSize are likewise dropped — the proxy reconstructs an uncompressed NAR and
+/// the client recomputes them.
 #[derive(Debug, Clone)]
 pub struct RemoteNarinfo {
     pub store_path: String,
@@ -194,20 +195,21 @@ mod tests {
 }
 
 #[cfg(test)]
-mod security_tests {
+mod parse_invariants {
     use super::*;
 
     #[test]
-    fn advertised_url_is_dropped_not_trusted() {
-        // A peer's URL pointing at an internal host must NOT be retained anywhere — the struct
-        // has no url field, and the fetch path builds nar/<narhash>.nar from nar_hash only.
+    fn advertised_url_is_not_retained() {
+        // The advertised URL must not be retained anywhere — the struct has no url field, and the
+        // fetch path derives nar/<narhash>.nar from nar_hash alone. Whatever URL a peer sends, the
+        // fetch target depends only on the requested content hash.
         let text = "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x\n\
                     URL: http://169.254.169.254/latest/meta-data/\n\
                     Compression: none\n\
                     NarHash: sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73\n\
                     NarSize: 10\nReferences: \nCA: fixed:r:sha256:x\n";
         let info = parse_narinfo(text).unwrap();
-        // The only NAR locator downstream is nar/<narhash>.nar; the SSRF field no longer exists.
+        // The only NAR locator downstream is nar/<narhash>.nar; the URL field is not stored.
         assert_eq!(info.nar_size, 10);
         assert_eq!(nixbase32::encode(&info.nar_hash).len(), 52);
         // Missing URL still rejected (protocol conformance kept).
