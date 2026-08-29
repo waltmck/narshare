@@ -51,5 +51,21 @@ Milestones M0–M5 of PLAN.md are implemented and tested: serve side (seek-table
 io_uring + always-O_DIRECT reads, chunk-encoding, manifests), proxy side (hedged/coalesced/tiered
 lookup fan-out, circuit breakers, striped multi-peer fetch under multiplicative weights and a
 per-peer concurrency governor, per-segment blake3 verification with peer attribution,
-intra-transfer dedup, byte-progress stall + `min_bandwidth` roaming), restart recovery. Remaining:
-observability (M6), NixOS VM test (M7), and the two-extremes perf run (M5.5).
+intra-transfer dedup, byte-progress stall + `min_bandwidth` roaming), restart recovery, and the
+M7 mesh VM suite (below). Remaining: observability (M6) and the two-extremes perf run (M5.5).
+
+## Testing
+
+```console
+$ nix develop -c cargo test              # unit + differential tests (~2 s)
+$ nix build .#checks.x86_64-linux.mesh   # the mesh VM suite (needs KVM; aarch64-linux too)
+```
+
+The mesh suite boots four VMs — three holders behind heterogeneous links (unshaped virtio,
+20 Mbit/40 ms, 150 Mbit/25±10 ms with 1 % loss, via `tc netem`) and one proxying client — and
+asserts the whole story end to end: a real `nix-store -r` of a CA path through the proxy with no
+trusted keys, striped across all three links at once; the `ca_only` gate; NAR-by-hash discovery
+after a proxy restart; dedup + wire compression beating the raw rate of the thin link; and a
+holder killed mid-transfer with byte-exact completion via the survivors. Per-link goodput numbers
+are printed in the test log (VM-relative; absolute 10 GbE targets are M5.5's, on real hardware).
+Interactive: `nix build .#checks.<system>.mesh.driverInteractive && ./result/bin/nixos-test-driver`.

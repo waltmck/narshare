@@ -39,5 +39,12 @@
         narshare = import ./module.nix self;
         default = narshare;
       };
+
+      checks = eachSystem (pkgs: {
+        # Unit + differential tests run in the package's checkPhase; this is the mesh VM
+        # suite: four nodes over shaped links (fast / 20 Mbit / lossy), substituting from
+        # each other through the proxy with no trusted keys. Needs KVM.
+        mesh = pkgs.testers.runNixOSTest (import ./tests/mesh.nix { inherit self; });
+      });
     };
 }
