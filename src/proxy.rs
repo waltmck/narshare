@@ -55,6 +55,9 @@ pub struct ProxyState {
 #[derive(Clone)]
 pub(crate) struct HolderSet {
     pub(crate) info: RemoteNarinfo,
+    /// True when `info` was synthesized by discover_nar from HEAD probes (placeholder StorePath,
+    /// no CA). Replaced by the first real narinfo that agrees on the size.
+    synthetic: bool,
     /// (peer index, that peer's NAR url), in discovery order.
     pub(crate) sources: Vec<(usize, String)>,
 }
@@ -73,26 +76,50 @@ impl ProxyState {
     }
 
     /// Accept a peer as a holder of a path, enforcing the content-addressing and representation
-    /// gates. Returns false (and registers nothing) if the path is not usable. The stored source
-    /// URL is ALWAYS the canonical `nar/<narhash>.nar` relative to the peer's base — NEVER the
-    /// peer's advertised `URL:`, which via RFC-3986 resolution could resolve to an arbitrary host.
-    /// Deriving the URL from the content hash keeps the fetch target a pure function of the request.
-    fn accept_holder(&self, info: &RemoteNarinfo, peer_idx: usize) -> bool {
+    /// gates. Returns the CANONICAL narinfo for the hash — the one the stored holder set (and
+    /// thus every NAR transfer) is sized against — so a client can never be told a NarSize or
+    /// StorePath that disagrees with the set the fetch will use; None means refused, nothing
+    /// registered. The stored source URL is ALWAYS the canonical `nar/<narhash>.nar` relative to
+    /// the peer's base — NEVER the peer's advertised `URL:`, which via RFC-3986 resolution could
+    /// resolve to an arbitrary host. Deriving the URL from the content hash keeps the fetch
+    /// target a pure function of the request.
+    fn accept_holder(&self, info: &RemoteNarinfo, peer_idx: usize) -> Option<RemoteNarinfo> {
         if self.cfg.ca_only && info.ca.is_none() {
-            return false;
+            return None;
         }
         if info.compression != "none" {
             warn!(
                 "peer {} serves {} with Compression: {} — unsupported",
                 self.peers.list[peer_idx].name, info.store_path, info.compression
             );
-            return false;
+            return None;
         }
         let nar_url = format!("nar/{}.nar", nixbase32::encode(&info.nar_hash));
         let mut holders = self.holders.lock().unwrap();
         match holders.get_mut(&info.nar_hash) {
             Some(set) => {
-                if set.info.nar_size != info.nar_size {
+                if set.synthetic {
+                    if set.info.nar_size != info.nar_size {
+                        // A real narinfo outranks a HEAD-probed placeholder; the old sources
+                        // answered for a different size, so they don't carry over.
+                        warn!(
+                            "peer {}: narinfo for {} (NarSize {}) supersedes a rediscovered set \
+                             of {} bytes; rebuilding",
+                            self.peers.list[peer_idx].name,
+                            info.store_path,
+                            info.nar_size,
+                            set.info.nar_size
+                        );
+                        *set = HolderSet {
+                            info: info.clone(),
+                            synthetic: false,
+                            sources: vec![(peer_idx, nar_url)],
+                        };
+                        return Some(info.clone());
+                    }
+                    set.info = info.clone();
+                    set.synthetic = false;
+                } else if set.info.nar_size != info.nar_size {
                     warn!(
                         "peer {} disagrees about {} (NarSize {} vs {}); keeping first",
                         self.peers.list[peer_idx].name,
@@ -100,20 +127,27 @@ impl ProxyState {
                         info.nar_size,
                         set.info.nar_size
                     );
-                    return true; // the path is servable via the first holder
+                    // Servable via the existing holders: answer with THEIR info, not the
+                    // outlier's — the outlier is not added as a source.
+                    return Some(set.info.clone());
                 }
                 if !set.sources.iter().any(|(i, _)| *i == peer_idx) {
                     set.sources.push((peer_idx, nar_url));
                 }
+                Some(set.info.clone())
             }
             None => {
                 holders.put(
                     info.nar_hash,
-                    HolderSet { info: info.clone(), sources: vec![(peer_idx, nar_url)] },
+                    HolderSet {
+                        info: info.clone(),
+                        synthetic: false,
+                        sources: vec![(peer_idx, nar_url)],
+                    },
                 );
+                Some(info.clone())
             }
         }
-        true
     }
 }
 
@@ -157,7 +191,7 @@ async fn discover_nar(st: &Arc<ProxyState>, nar_hash: [u8; 32]) -> Option<Holder
         deriver: None,
         ca: None,
     };
-    let set = HolderSet { info, sources };
+    let set = HolderSet { info, synthetic: true, sources };
     st.holders.lock().unwrap().put(nar_hash, set.clone());
     Some(set)
 }
@@ -344,7 +378,9 @@ async fn fan_out(st: &Arc<ProxyState>, hash_part: &str) -> Option<RemoteNarinfo>
             tokio::spawn(async move {
                 while let Some((idx, ans)) = rx.recv().await {
                     if let Answer::Found(info) = ans {
-                        if hash_part_of(&info.store_path) == hp && st.accept_holder(&info, idx) {
+                        if hash_part_of(&info.store_path) == hp
+                            && st.accept_holder(&info, idx).is_some()
+                        {
                             st.negative.lock().unwrap().pop(&hp);
                         }
                     }
@@ -362,9 +398,9 @@ async fn fan_out(st: &Arc<ProxyState>, hash_part: &str) -> Option<RemoteNarinfo>
                     "peer {} answered {hash_part} with unrelated path {}",
                     st.peers.list[idx].name, info.store_path
                 );
-            } else if st.accept_holder(&info, idx) {
+            } else if let Some(canonical) = st.accept_holder(&info, idx) {
                 st.negative.lock().unwrap().pop(hash_part);
-                return Some(info);
+                return Some(canonical);
             } else {
                 // ca_only / non-"none" compression: refuse and negative-cache (all peers serve
                 // the same store paths, so this path is unusable meshwide).
@@ -480,15 +516,15 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    /// A serve state over a store with one big compressible CA path (~3MB of repeats), returning
-    /// (router-factory data) so several independent serve listeners can share it.
-    fn big_store(dir: &Path) -> (Arc<StoreDb>, ServeCfg, u64, [u8; 32]) {
+    /// A serve state over a store with one big compressible CA path, returning (router-factory
+    /// data) so several independent serve listeners can share it.
+    fn sized_store(dir: &Path, hash_part: &str, bytes: usize) -> (Arc<StoreDb>, ServeCfg, u64, [u8; 32]) {
         let store = dir.join("bigstore");
-        let path = store.join("gggggggggggggggggggggggggggggggg-big-1.0");
+        let path = store.join(format!("{hash_part}-big-1.0"));
         std::fs::create_dir_all(&path).unwrap();
         // Compressible but not trivial: repeated 4KiB pattern.
         let pattern: Vec<u8> = (0..4096u32).flat_map(|i| (i % 251) .to_le_bytes()).collect();
-        let blob: Vec<u8> = pattern.iter().cycle().take(3 << 20).copied().collect();
+        let blob: Vec<u8> = pattern.iter().cycle().take(bytes).copied().collect();
         std::fs::write(path.join("blob"), &blob).unwrap();
         let table = nar::build(&path).unwrap();
         let nar_hash = nar_hash_of(&path);
@@ -496,7 +532,7 @@ mod tests {
         let db_path = crate::db::tests::fake_db(
             dir,
             &[(
-                &format!("{store_dir}/gggggggggggggggggggggggggggggggg-big-1.0"),
+                &format!("{store_dir}/{hash_part}-big-1.0"),
                 nar_hash,
                 table.nar_size,
                 Some("fixed:r:sha256:dummy"),
@@ -509,6 +545,11 @@ mod tests {
         .unwrap();
         let db = Arc::new(StoreDb::open(&db_path, &store_dir).unwrap());
         (db, scfg, table.nar_size, nar_hash)
+    }
+
+    /// ~3MB: below MANIFEST_MIN, so transfers use plain striping (the M4 shape).
+    fn big_store(dir: &Path) -> (Arc<StoreDb>, ServeCfg, u64, [u8; 32]) {
+        sized_store(dir, "gggggggggggggggggggggggggggggggg", 3 << 20)
     }
 
     fn serve_router_for(db: Arc<StoreDb>, scfg: &ServeCfg) -> Router {
@@ -1233,5 +1274,225 @@ mod tests {
             "an over-expanding chunk must not yield a successful body"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(8), "must end promptly");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transfer_degrades_when_the_manifest_endpoint_hangs() {
+        // acquire_manifest runs BEFORE the transfer's stall watchdog exists: a peer that sends
+        // manifest headers and then dribbles nothing must cost at most the narinfo cap, after
+        // which the transfer proceeds as plain striping.
+        let dir = tempfile::tempdir().unwrap();
+        let (db, scfg, nar_size, nar_hash) =
+            sized_store(dir.path(), "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk", 6 << 20);
+        let hang = Router::new()
+            .route(
+                "/narshare/v1/manifest/{h}",
+                get(|| async {
+                    let (tx, rx) = mpsc::channel::<std::io::Result<bytes::Bytes>>(1);
+                    tx.send(Ok(bytes::Bytes::from_static(b"{"))).await.unwrap();
+                    std::mem::forget(tx); // headers sent; the body never completes
+                    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+                        .into_response()
+                }),
+            )
+            .fallback_service(serve_router_for(db.clone(), &scfg));
+        let peer_url = spawn_router(hang).await;
+        let (proxy_url, _) = spawn_proxy(
+            &[("hangman", &peer_url)],
+            "narinfo_timeout = \"500ms\"\nchunk_max = \"1MiB\"",
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let ni = client
+            .get(format!("{proxy_url}/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk.narinfo"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ni.status(), 200);
+        let nar32 = crate::nixbase32::encode(&nar_hash);
+        let started = Instant::now();
+        let body = client
+            .get(format!("{proxy_url}/nar/{nar32}.nar"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(body.len() as u64, nar_size, "must degrade to plain striping and finish");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "a hung manifest body must not stall the transfer: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn narinfo_after_nar_rediscovery_serves_the_real_info() {
+        // Restart recovery creates a placeholder holder set (no StorePath/CA). A later narinfo
+        // lookup must serve the peer's REAL narinfo, never the placeholder.
+        let dir = tempfile::tempdir().unwrap();
+        let (serve_url, _nar_size, nar_hash) = spawn_fake_serve(dir.path()).await;
+        let (proxy_url, _) = spawn_proxy(&[("test", &serve_url)], "").await;
+        let client = reqwest::Client::new();
+        let nar32 = crate::nixbase32::encode(&nar_hash);
+        // NAR first: a fresh proxy discovers holders by hash (synthetic set).
+        let resp = client.get(format!("{proxy_url}/nar/{nar32}.nar")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = resp.bytes().await.unwrap();
+        // Then the narinfo: the real one must be adopted and served.
+        let ni = client
+            .get(format!("{proxy_url}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ni.status(), 200);
+        let text = ni.text().await.unwrap();
+        assert!(text.contains("CA: fixed:r:sha256:dummy"), "real narinfo expected, got:\n{text}");
+        assert!(!text.contains("<rediscovered"), "placeholder leaked to the client:\n{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nar_size_disagreement_answers_with_the_first_holders_info() {
+        // Once a holder set exists, a peer claiming a different NarSize for the same narhash must
+        // not change what clients are told: the narinfo served must match the set transfers use.
+        let nar32 = crate::nixbase32::encode(&[7u8; 32]);
+        let mk = |size: u64| {
+            format!(
+                "StorePath: /nix/store/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-z\nURL: nar/{nar32}.nar\n\
+                 Compression: none\nNarHash: sha256:{nar32}\nNarSize: {size}\nReferences: \n\
+                 CA: fixed:r:sha256:dummy\n"
+            )
+        };
+        let peer = |text: String, on: Arc<std::sync::atomic::AtomicBool>| {
+            Router::new().route(
+                "/{f}",
+                get(move |UrlPath(f): UrlPath<String>| {
+                    let text = text.clone();
+                    let on = on.clone();
+                    async move {
+                        if f == "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj.narinfo"
+                            && on.load(Ordering::SeqCst)
+                        {
+                            ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], text).into_response()
+                        } else {
+                            StatusCode::NOT_FOUND.into_response()
+                        }
+                    }
+                }),
+            )
+        };
+        let a_on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let b_on = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let url_a = spawn_router(peer(mk(1000), a_on.clone())).await;
+        let url_b = spawn_router(peer(mk(2000), b_on.clone())).await;
+        let (proxy_url, _) =
+            spawn_proxy(&[("a", &url_a), ("b", &url_b)], "negative_ttl = \"1ms\"").await;
+        let client = reqwest::Client::new();
+
+        let first = client
+            .get(format!("{proxy_url}/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj.narinfo"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), 200);
+        assert!(first.text().await.unwrap().contains("NarSize: 1000"));
+
+        a_on.store(false, Ordering::SeqCst);
+        b_on.store(true, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = client
+            .get(format!("{proxy_url}/jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj.narinfo"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 200);
+        let text = second.text().await.unwrap();
+        assert!(
+            text.contains("NarSize: 1000"),
+            "must answer with the first holder's info, got:\n{text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unmanifestable_path_404s_manifest_but_serves_the_nar() {
+        // NARs allow non-UTF-8 names and symlink targets; JSON manifests don't. Such a path must
+        // 404 its manifest (cached, so repeats don't re-read the tree) while the NAR serves
+        // normally. A non-UTF-8 symlink TARGET is used because it is link content, not a
+        // directory entry — filesystems with utf8only reject the latter.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("weird");
+        let path = store.join("mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-weird-1.0");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("plain"), b"payload").unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let bad_target = std::ffi::OsStr::from_bytes(b"t\xff");
+        if std::os::unix::fs::symlink(bad_target, path.join("link")).is_err() {
+            eprintln!("skipping: filesystem refuses non-UTF-8 symlink targets");
+            return;
+        }
+        let table = nar::build(&path).unwrap();
+        let nar_hash = nar_hash_of(&path);
+        let store_dir = store.to_str().unwrap().to_owned();
+        let db_path = crate::db::tests::fake_db(
+            dir.path(),
+            &[(
+                &format!("{store_dir}/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-weird-1.0"),
+                nar_hash,
+                table.nar_size,
+                Some("fixed:r:sha256:dummy"),
+            )],
+        );
+        let scfg: ServeCfg = toml::from_str(&format!(
+            "listen = \"127.0.0.1:0\"\nstore_dir = {store_dir:?}\ndb_path = {:?}",
+            db_path.to_str().unwrap()
+        ))
+        .unwrap();
+        let db = Arc::new(StoreDb::open(&db_path, &store_dir).unwrap());
+        let url = spawn_router(serve::router(serve::ServeState::new(
+            db,
+            SegmentReader::for_tests(),
+            scfg,
+        )))
+        .await;
+        let client = reqwest::Client::new();
+        let nar32 = crate::nixbase32::encode(&nar_hash);
+        for _ in 0..2 {
+            // The second hit exercises the cached-failure path.
+            let m = client
+                .get(format!("{url}/narshare/v1/manifest/{nar32}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(m.status(), 404, "non-UTF-8 names cannot be manifested");
+        }
+        let nar = client.get(format!("{url}/nar/{nar32}.nar")).send().await.unwrap();
+        assert_eq!(nar.status(), 200);
+        assert_eq!(nar.bytes().await.unwrap().len() as u64, table.nar_size);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_manifest_requests_coalesce_on_one_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let (serve_url, _, nar_hash) = spawn_fake_serve(dir.path()).await;
+        let nar32 = crate::nixbase32::encode(&nar_hash);
+        let client = reqwest::Client::new();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let c = client.clone();
+            let u = format!("{serve_url}/narshare/v1/manifest/{nar32}");
+            set.spawn(async move { c.get(u).send().await.unwrap().bytes().await.unwrap() });
+        }
+        let mut bodies = Vec::new();
+        while let Some(b) = set.join_next().await {
+            bodies.push(b.unwrap());
+        }
+        assert_eq!(bodies.len(), 8);
+        assert!(
+            bodies.windows(2).all(|w| w[0] == w[1]),
+            "every waiter must be served the same manifest"
+        );
+        let m: crate::manifest::Manifest = serde_json::from_slice(&bodies[0]).unwrap();
+        assert!(crate::manifest::synth_layout(&m).is_ok());
     }
 }

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
-const DEADLINE_FLOOR: Duration = Duration::from_millis(100);
+pub(crate) const DEADLINE_FLOOR: Duration = Duration::from_millis(100);
 /// Response-body ceilings: a peer's response must never make the proxy allocate without bound.
 /// narinfos are ~1 KB; manifests are ~1.3 MB per 100 GB of content — both capped generously.
 const NARINFO_CAP: usize = 1 << 20;
@@ -86,7 +86,10 @@ impl Peer {
         if h.samples == 0 {
             return cap;
         }
-        Duration::from_millis((h.srtt + 4.0 * h.rttvar) as u64).clamp(DEADLINE_FLOOR, cap)
+        // cap ≥ floor is enforced by config validation; max() keeps a hand-built cap from
+        // panicking the clamp.
+        Duration::from_millis((h.srtt + 4.0 * h.rttvar) as u64)
+            .clamp(DEADLINE_FLOOR, cap.max(DEADLINE_FLOOR))
     }
 
     /// Breaker gate. An elapsed cooldown lets requests through again (probing); a failed probe
@@ -169,47 +172,53 @@ impl Peers {
     }
 
     /// Look up one narinfo on one peer, recording health. Runs to the cap regardless of hedge
-    /// deadlines — the caller decides how long to *wait*, not how long we *try*.
+    /// deadlines — the caller decides how long to *wait*, not how long we *try*. The cap bounds
+    /// the WHOLE exchange, body included: a peer that returns headers and then dribbles the body
+    /// forever must not pin the lookup task (and its drainer) past the cap.
     pub async fn lookup(&self, idx: usize, hash_part: &str) -> Answer {
         let peer = &self.list[idx];
         let Ok(url) = peer.base.join(&format!("{hash_part}.narinfo")) else {
             return Answer::Unknown;
         };
         let started = Instant::now();
-        let resp = tokio::time::timeout(self.cap, self.client.get(url).send()).await;
-        match resp {
-            Ok(Ok(r)) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-                peer.record_ok(started.elapsed());
-                Answer::NotFound
-            }
-            Ok(Ok(r)) if r.status().is_success() => match read_capped(r, NARINFO_CAP).await {
-                Ok(body) => match parse_narinfo(&String::from_utf8_lossy(&body)) {
-                    Ok(info) => {
-                        peer.record_ok(started.elapsed());
-                        Answer::Found(info)
-                    }
+        let exchange = async {
+            match self.client.get(url).send().await {
+                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                    peer.record_ok(started.elapsed());
+                    Answer::NotFound
+                }
+                Ok(r) if r.status().is_success() => match read_capped(r, NARINFO_CAP).await {
+                    Ok(body) => match parse_narinfo(&String::from_utf8_lossy(&body)) {
+                        Ok(info) => {
+                            peer.record_ok(started.elapsed());
+                            Answer::Found(info)
+                        }
+                        Err(e) => {
+                            warn!("peer {}: unparseable narinfo: {e:#}", peer.name);
+                            self.strike(idx);
+                            Answer::Unknown
+                        }
+                    },
                     Err(e) => {
-                        warn!("peer {}: unparseable narinfo: {e:#}", peer.name);
+                        debug!("peer {}: narinfo body error: {e:#}", peer.name);
                         self.strike(idx);
                         Answer::Unknown
                     }
                 },
-                Err(e) => {
-                    debug!("peer {}: narinfo body error: {e:#}", peer.name);
+                Ok(r) => {
+                    debug!("peer {}: narinfo HTTP {}", peer.name, r.status());
                     self.strike(idx);
                     Answer::Unknown
                 }
-            },
-            Ok(Ok(r)) => {
-                debug!("peer {}: narinfo HTTP {}", peer.name, r.status());
-                self.strike(idx);
-                Answer::Unknown
+                Err(e) => {
+                    debug!("peer {}: narinfo error: {e}", peer.name);
+                    self.strike(idx);
+                    Answer::Unknown
+                }
             }
-            Ok(Err(e)) => {
-                debug!("peer {}: narinfo error: {e}", peer.name);
-                self.strike(idx);
-                Answer::Unknown
-            }
+        };
+        match tokio::time::timeout(self.cap, exchange).await {
+            Ok(answer) => answer,
             Err(_) => {
                 // Cap timeout: "late", not "failed" — no strike, no sample.
                 debug!("peer {}: narinfo exceeded cap", peer.name);
@@ -281,34 +290,38 @@ impl Peers {
                 nixbase32::encode(nar_hash)
             ))
             .ok()?;
-        let resp = tokio::time::timeout(self.cap, self.client.get(url).send()).await;
-        match resp {
-            Ok(Ok(r)) if r.status().is_success() => {
-                let body = read_capped(r, MANIFEST_CAP).await.ok()?;
-                match serde_json::from_slice::<Manifest>(&body) {
-                    Ok(m) if m.version == crate::manifest::VERSION => Some(m),
-                    Ok(m) => {
-                        debug!(
-                            "peer {}: manifest version {} unsupported",
-                            peer.name, m.version
-                        );
-                        None
-                    }
-                    Err(e) => {
-                        debug!("peer {}: bad manifest: {e}", peer.name);
-                        None
+        // The cap bounds the WHOLE exchange, body included: this runs BEFORE a transfer's stall
+        // watchdog exists, so a peer dribbling a manifest body forever must cost at most the cap
+        // — plain striping is always available as the degradation.
+        let exchange = async {
+            match self.client.get(url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    let body = read_capped(r, MANIFEST_CAP).await.ok()?;
+                    match serde_json::from_slice::<Manifest>(&body) {
+                        Ok(m) if m.version == crate::manifest::VERSION => Some(m),
+                        Ok(m) => {
+                            debug!(
+                                "peer {}: manifest version {} unsupported",
+                                peer.name, m.version
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            debug!("peer {}: bad manifest: {e}", peer.name);
+                            None
+                        }
                     }
                 }
-            }
-            Ok(Ok(_)) => None, // 404/5xx: absence, not a strike.
-            Ok(Err(e)) => {
-                if e.is_connect() {
-                    self.strike(peer_idx);
+                Ok(_) => None, // 404/5xx: absence, not a strike.
+                Err(e) => {
+                    if e.is_connect() {
+                        self.strike(peer_idx);
+                    }
+                    None
                 }
-                None
             }
-            Err(_) => None,
-        }
+        };
+        tokio::time::timeout(self.cap, exchange).await.ok().flatten()
     }
 
     /// Fetch one chunk [start, end) of a NAR from a specific peer, optionally zstd-framed on the
@@ -356,9 +369,15 @@ impl Peers {
         // Cap the WIRE body: raw must be exactly `want`; a compressed frame must be no larger than
         // `want + slack` (it should be smaller). This bounds the read before decompression.
         let wire_cap = if encoded { want + WIRE_SLACK } else { want };
-        let body = read_capped(resp, wire_cap)
-            .await
-            .with_context(|| format!("peer {}", peer.name))?;
+        let body = match read_capped(resp, wire_cap).await {
+            Ok(b) => b,
+            Err(e) => {
+                // A body that dies mid-read (reset) or overruns its cap is a hard failure,
+                // the same class as a refused connect.
+                self.strike(peer_idx);
+                return Err(e).with_context(|| format!("peer {}", peer.name));
+            }
+        };
         let wire = body.len() as u64;
         let bytes = if encoded {
             // Bound the DECOMPRESSED output to `want`: the decoder must stop before a small frame

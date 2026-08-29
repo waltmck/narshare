@@ -226,7 +226,12 @@ impl UringPool {
 
 impl Drop for UringPool {
     fn drop(&mut self) {
-        // The sender half in `tx` closes when self drops; wake the thread so it notices.
+        // Disconnect the request channel BEFORE waking: the ring thread only learns of shutdown
+        // by seeing Disconnected while draining, and it only drains on an eventfd wakeup. Waking
+        // first would race field-drop order — the thread could drain Empty, re-arm, and then
+        // sleep forever with nobody left to write the eventfd.
+        let (dummy, _) = std_mpsc::channel();
+        drop(std::mem::replace(&mut self.tx, dummy));
         self.wake();
     }
 }

@@ -61,7 +61,13 @@ async fn run(cfg: config::Config) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        // systemd stops units with SIGTERM; Ctrl-C covers interactive runs.
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
         info!("shutting down");
         let _ = shutdown_tx.send(());
     });

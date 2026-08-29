@@ -401,7 +401,7 @@ struct Emitter {
     nar_hash: [u8; 32],
     hasher: Sha256,
     buffered: BTreeMap<u64, Bytes>,
-    held: HashMap<usize, (Vec<Bytes>, usize)>,
+    held: HashMap<usize, (Bytes, usize)>,
     retries: HashMap<u64, u32>,
 }
 
@@ -429,7 +429,7 @@ impl Emitter {
                 SpanExec::Replay { unique, len } => {
                     let unique = *unique;
                     let len = *len;
-                    let (slices, remaining) = {
+                    let (bytes, remaining) = {
                         let Some(entry) = self.held.get_mut(&unique) else {
                             return Ok(Pump::Abort("replay before retention (plan bug)".into()));
                         };
@@ -440,19 +440,17 @@ impl Emitter {
                     // emitting them would desync emit_pos from the layout and slip past the final
                     // NarHash gate. manifest_plan already rejects same-hash/different-length
                     // manifests, so this can only fire on an internal bug.
-                    let held_len: u64 = slices.iter().map(|b| b.len() as u64).sum();
-                    if held_len != len {
+                    if bytes.len() as u64 != len {
                         return Ok(Pump::Abort(format!(
-                            "replay length {held_len} != span length {len}"
+                            "replay length {} != span length {len}",
+                            bytes.len()
                         )));
                     }
                     if remaining == 0 {
                         self.held.remove(&unique);
                     }
-                    for b in slices {
-                        stats.replayed_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
-                        self.emit(out, b).await?;
-                    }
+                    stats.replayed_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    self.emit(out, bytes).await?;
                     self.span_i += 1;
                 }
                 SpanExec::Fetch { len, verify: None, .. } => {
@@ -491,7 +489,15 @@ impl Emitter {
                         return Ok(Pump::Refetch(off, len));
                     }
                     if let Some((unique, retain_for)) = retain {
-                        self.held.insert(unique, (slices.clone(), retain_for));
+                        // Copy retained bytes OUT of the wire chunks: a Bytes slice would pin its
+                        // whole source chunk's allocation for the retention lifetime, letting real
+                        // memory exceed dedup_budget_bytes by up to chunk_size/segment_size. One
+                        // memcpy per RETAINED segment only.
+                        let mut owned = Vec::with_capacity(len as usize);
+                        for b in &slices {
+                            owned.extend_from_slice(b);
+                        }
+                        self.held.insert(unique, (Bytes::from(owned), retain_for));
                     }
                     for b in slices {
                         self.emit(out, b).await?;
@@ -792,7 +798,9 @@ pub async fn run_transfer(
                             Ok(Pump::Finished) => return,
                             Ok(Pump::NeedData) => {}
                             Ok(Pump::Refetch(off, len)) => {
-                                // Blame every peer whose bytes overlapped the bad segment.
+                                // Blame every peer whose bytes overlapped the bad segment, then
+                                // drop those attributions: the refetch gets fresh origin entries,
+                                // so a second failure blames only the replacement's supplier.
                                 for &(o, l, p) in &origin {
                                     if o < off + len && o + l > off {
                                         warn!(
@@ -802,6 +810,7 @@ pub async fn run_transfer(
                                         ctx.pool.record_failure(p);
                                     }
                                 }
+                                origin.retain(|&(o, l, _)| !(o < off + len && o + l > off));
                                 ctx.stats.requeues.fetch_add(1, Ordering::Relaxed);
                                 requeue.push(Reverse((off, len)));
                                 retry_gate = Some(Instant::now() + Duration::from_millis(100));

@@ -158,13 +158,15 @@ nix falls back per its own `fallback` setting.
 Roaming far from the mesh, a CDN reachable at local-link speed can beat peers reached through a
 long thin path — but narshare cannot measure origin speed (for a credentialed FOD it cannot even
 reach origin; only the builder can), so whether to forfeit is **host policy**: `min_bandwidth`,
-default off. When set, a transfer whose EWMA aggregate goodput is still below the floor after
-`min_bandwidth_grace` aborts mid-stream; nix records a transfer failure and, per `fallback`, runs
+default off. When set, a transfer whose aggregate network goodput (bytes actually fetched from
+peers over elapsed time — locally synthesized framing and replayed duplicates don't count) is
+still below the floor after `min_bandwidth_grace` aborts mid-stream; nix records a transfer failure and, per `fallback`, runs
 the FOD builder, which fetches from origin. The grace period doubles as a small-transfer
 exemption: anything smaller than `min_bandwidth × min_bandwidth_grace` finishes before the rule can
 fire, so only transfers big enough for the decision to matter are ever forfeited.
 
-A fired abort establishes a **roaming epoch** (~10 min, invalidated on default-route change): while
+A fired abort establishes a **roaming epoch** (~10 min; a fixed duration — route-change
+invalidation was considered and dropped as not worth watching netlink): while
 it lasts, the proxy 404s narinfo lookups for paths larger than `min_bandwidth ×
 min_bandwidth_grace` — exactly the ones that would abort anyway — so subsequent big FODs go
 straight to the builder without repeating the discovery; smaller paths keep substituting.
@@ -207,6 +209,8 @@ The design gets depth from **many independent segment reads in flight**, not fro
 * **Backpressure is bounded at every stage**: read-pool semaphore, per-response in-flight chunk
   caps, `window_bytes` on ordered emission, governor-set stream counts. No stage buffers
   unboundedly; a slow consumer propagates back to fewer reads in flight, not memory growth.
+  (Proxy-side bounds — `window_bytes`, `dedup_budget_bytes` — are per *transfer*; the aggregate
+  multiplier is nix's own substitution parallelism, which is the intended cap.)
 * Out of scope: TCP tuning (window sizes, BBR) is host configuration; zero-copy `sendfile`/`splice`
   doesn't apply once bytes are transformed.
 
@@ -367,7 +371,10 @@ src/
   proxy.rs       proxy listener: bounded/coalesced fan-out, negative cache, handoff to fetch.rs
 ```
 
-Deps: `tokio`, `axum` (or bare `hyper`), `reqwest` (rustls), `rusqlite`, `zstd`, `blake3`, `sha2`,
+Deps: `tokio`, `axum` (or bare `hyper`), `reqwest` (plain HTTP only — no TLS is compiled in;
+peers live inside the mesh, whose transport is the mesh's own encryption, and integrity comes
+from content addressing; https peer URLs are rejected at config validation), `rusqlite`, `zstd`,
+`blake3`, `sha2`,
 `clap` (derive), `serde`, `toml`, `tracing`/`tracing-subscriber`, `anyhow`, `humantime-serde`,
 `byte-unit`. narshare owns no database: `rusqlite` exists solely to read Nix's own db read-only,
 and narshare has no on-disk artifacts at all. (snix's

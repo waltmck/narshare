@@ -23,9 +23,11 @@ use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
 use lru::LruCache;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info_span, warn};
 
@@ -42,14 +44,30 @@ const TABLE_ENTRIES: usize = 4096;
 /// Concurrent buffered chunk-encode jobs. Each pins up to MAX_ENCODED_SPAN of memory plus a zstd
 /// job, and the serve listener is mesh-exposed — bound the aggregate.
 const ENCODE_CONCURRENCY: usize = 8;
+/// Concurrent manifest builds. Each is a whole-tree hashing read (minutes for a game tree); two
+/// permits let a small burst overlap without a fleet of peers saturating the disk.
+const MANIFEST_BUILD_CONCURRENCY: usize = 2;
+/// A narhash that resolved to nothing is not re-probed for this long. The hash column is
+/// unindexed, so every miss is a full ValidPaths scan — and restart-recovery probes for a NAR we
+/// never held fan in from every peer.
+const NAR_NEGATIVE_TTL: Duration = Duration::from_secs(10);
+const NAR_NEGATIVE_ENTRIES: usize = 4096;
 
 pub struct ServeState {
     db: Arc<StoreDb>,
     reader: SegmentReader,
     cfg: ServeCfg,
     nars: Mutex<NarCache>,
-    /// narhash → rendered manifest JSON. Manifests are KB–MB; entry count is a fine unit.
-    manifests: Mutex<LruCache<[u8; 32], Arc<String>>>,
+    /// narhash → rendered manifest JSON; None = known unmanifestable (e.g. non-UTF-8 names).
+    /// Manifests are KB–MB; entry count is a fine unit.
+    manifests: Mutex<LruCache<[u8; 32], Option<Bytes>>>,
+    /// narhash → in-flight manifest build. Waiters watch for the sender to drop, then re-read
+    /// the manifests cache; the build itself is a detached task (see spawn_manifest_build).
+    building: Mutex<HashMap<[u8; 32], watch::Receiver<()>>>,
+    /// Bounds concurrent manifest builds.
+    manifest_sem: Arc<tokio::sync::Semaphore>,
+    /// narhash → when a lookup found nothing (valid for NAR_NEGATIVE_TTL).
+    nar_negative: Mutex<LruCache<[u8; 32], Instant>>,
     /// Bounds concurrent buffered chunk-encode jobs (m4).
     encode_sem: tokio::sync::Semaphore,
 }
@@ -60,15 +78,35 @@ struct NarCache {
 }
 
 impl NarCache {
+    /// Insert an entry, absorbing whatever the entry cap displaces into the byte accounting —
+    /// a silent capacity eviction that carried a built table would otherwise leave its bytes
+    /// counted forever.
+    fn insert(&mut self, hash: [u8; 32], entry: Arc<NarEntry>) {
+        if let Some((_, displaced)) = self.lru.push(hash, entry) {
+            self.forget(&displaced);
+        }
+    }
+
+    fn forget(&mut self, evicted: &Arc<NarEntry>) {
+        if let Some(t) = evicted.table.get() {
+            self.table_bytes = self.table_bytes.saturating_sub(t.approx_bytes());
+        }
+    }
+
     /// Account a freshly built table and evict least-recently-used entries until within budget.
-    /// The just-used entry is MRU, so it survives even if it alone exceeds the budget.
-    fn account(&mut self, built: u64) {
+    /// Counted ONLY while `entry` is still the resident entry for `hash`: a table whose entry
+    /// was evicted (or replaced) mid-build can never be subtracted back out, so counting it
+    /// would inflate table_bytes forever and shrink the effective budget. The just-used entry
+    /// is MRU, so it survives even if it alone exceeds the budget.
+    fn account(&mut self, hash: &[u8; 32], entry: &Arc<NarEntry>, built: u64) {
+        match self.lru.peek(hash) {
+            Some(resident) if Arc::ptr_eq(resident, entry) => {}
+            _ => return,
+        }
         self.table_bytes += built;
         while self.table_bytes > TABLE_BUDGET && self.lru.len() > 1 {
             let Some((_, evicted)) = self.lru.pop_lru() else { break };
-            if let Some(t) = evicted.table.get() {
-                self.table_bytes = self.table_bytes.saturating_sub(t.approx_bytes());
-            }
+            self.forget(&evicted);
         }
     }
 }
@@ -89,6 +127,11 @@ impl ServeState {
                 table_bytes: 0,
             }),
             manifests: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
+            building: Mutex::new(HashMap::new()),
+            manifest_sem: Arc::new(tokio::sync::Semaphore::new(MANIFEST_BUILD_CONCURRENCY)),
+            nar_negative: Mutex::new(LruCache::new(
+                NonZeroUsize::new(NAR_NEGATIVE_ENTRIES).unwrap(),
+            )),
             encode_sem: tokio::sync::Semaphore::new(ENCODE_CONCURRENCY),
         })
     }
@@ -103,44 +146,100 @@ pub fn router(state: Arc<ServeState>) -> Router {
         .with_state(state)
 }
 
-/// The segment manifest for a narhash: computed on first request (one hashing read of the path
-/// through a blocking task), cached in memory for the life of the process.
+/// The segment manifest for a narhash: computed on first request, cached in memory for the life
+/// of the process. Builds are single-flighted per narhash, bounded by MANIFEST_BUILD_CONCURRENCY,
+/// and DETACHED from any one request: a huge tree hashes for minutes while requesters time out
+/// and disconnect (axum cancels their handlers) — the result must land in the cache anyway so a
+/// later transfer finds it, instead of every retry restarting the read from scratch.
 async fn get_manifest(State(st): State<Arc<ServeState>>, UrlPath(hash): UrlPath<String>) -> Response {
     let Some(nar_hash) = nixbase32::decode(&hash, 32).map(|v| <[u8; 32]>::try_from(v).unwrap())
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if let Some(json) = st.manifests.lock().unwrap().get(&nar_hash).cloned() {
-        return ([(header::CONTENT_TYPE, "application/json")], json.to_string()).into_response();
+    let respond = |cached: Option<Bytes>| -> Response {
+        match cached {
+            Some(json) => {
+                ([(header::CONTENT_TYPE, "application/json")], json).into_response()
+            }
+            // A path that cannot be manifested (e.g. a non-UTF-8 filename, which NARs allow and
+            // the NAR walk serves fine) is an ABSENCE of a manifest, not a server fault: answer
+            // 404 so the consumer degrades to plain striping instead of striking a healthy peer.
+            // The NAR itself still serves normally.
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    };
+    if let Some(cached) = st.manifests.lock().unwrap().get(&nar_hash).cloned() {
+        return respond(cached);
     }
     let entry = match nar_entry(&st, nar_hash).await {
         Ok(Some(e)) => e,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return err500("manifest lookup", e),
     };
-    let root = std::path::PathBuf::from(&entry.info.path);
-    let (nh, ns, sb) = (entry.info.nar_hash, entry.info.nar_size, st.cfg.segment_bytes.0);
-    let built = tokio::task::spawn_blocking(move || {
-        manifest::build_manifest(&root, &nh, ns, sb)
-            .and_then(|m| serde_json::to_string(&m).map_err(Into::into))
-    })
-    .await
-    .unwrap();
-    match built {
-        Ok(json) => {
-            let json = Arc::new(json);
-            st.manifests.lock().unwrap().put(nar_hash, json.clone());
-            ([(header::CONTENT_TYPE, "application/json")], json.to_string()).into_response()
+    loop {
+        if let Some(cached) = st.manifests.lock().unwrap().get(&nar_hash).cloned() {
+            return respond(cached);
         }
-        // A path that cannot be manifested (e.g. a non-UTF-8 filename, which NARs allow and the
-        // NAR walk serves fine) is an ABSENCE of a manifest, not a server fault: answer 404 so the
-        // consumer degrades to plain striping instead of striking a healthy peer. The NAR itself
-        // still serves normally.
-        Err(e) => {
-            debug!("no manifest for {}: {e:#}", entry.info.path);
-            StatusCode::NOT_FOUND.into_response()
+        // Join the in-flight build for this narhash, or become the one that starts it.
+        let waiter = {
+            let mut building = st.building.lock().unwrap();
+            match building.get(&nar_hash) {
+                Some(rx) => Some(rx.clone()),
+                None => {
+                    let (tx, rx) = watch::channel(());
+                    building.insert(nar_hash, rx);
+                    spawn_manifest_build(&st, nar_hash, &entry, tx);
+                    None
+                }
+            }
+        };
+        if let Some(mut rx) = waiter {
+            // The build task drops its sender after writing the cache; the closed channel
+            // (changed() returning Err) is the completion signal, not an error.
+            let _ = rx.changed().await;
         }
+        // Loop: re-read the cache — either our build finished or the one we joined did.
     }
+}
+
+/// Start one detached, semaphore-bounded manifest build; publishes its outcome (including
+/// failure, so unmanifestable paths are not re-read per request) to the manifests cache, then
+/// removes the building entry and drops `tx` to wake every waiter.
+fn spawn_manifest_build(
+    st: &Arc<ServeState>,
+    nar_hash: [u8; 32],
+    entry: &Arc<NarEntry>,
+    tx: watch::Sender<()>,
+) {
+    let st = st.clone();
+    let root = std::path::PathBuf::from(&entry.info.path);
+    let path = entry.info.path.clone();
+    let (nh, ns, sb) = (entry.info.nar_hash, entry.info.nar_size, st.cfg.segment_bytes.0);
+    tokio::spawn(async move {
+        let _permit =
+            st.manifest_sem.clone().acquire_owned().await.expect("semaphore closed");
+        let built = match tokio::task::spawn_blocking(move || {
+            manifest::build_manifest(&root, &nh, ns, sb)
+                .and_then(|m| serde_json::to_vec(&m).map_err(Into::into))
+        })
+        .await
+        {
+            Ok(r) => r,
+            // A panic must still run the cleanup below, or waiters would spin on a dead entry.
+            Err(join_err) => Err(anyhow::anyhow!("manifest build panicked: {join_err}")),
+        };
+        let outcome = match built {
+            Ok(json) => Some(Bytes::from(json)),
+            Err(e) => {
+                debug!("no manifest for {path}: {e:#}");
+                None
+            }
+        };
+        // Publish before waking waiters — the cache read is their next step.
+        st.manifests.lock().unwrap().put(nar_hash, outcome);
+        st.building.lock().unwrap().remove(&nar_hash);
+        drop(tx);
+    });
 }
 
 fn err500(context: &str, e: anyhow::Error) -> Response {
@@ -195,7 +294,7 @@ async fn get_nar(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return err500("nar lookup", e),
     };
-    let table = match seek_table(&st, &entry).await {
+    let table = match seek_table(&st, nar_hash, &entry).await {
         Ok(t) => t,
         Err(e) => return err500("seek table", e),
     };
@@ -276,24 +375,43 @@ async fn get_nar(
     resp.body(Body::from_stream(ReceiverStream::new(rx))).unwrap()
 }
 
-/// Resolve narhash → PathInfo, LRU-cached (the hash column is unindexed in the Nix db).
+/// Resolve narhash → PathInfo, LRU-cached both ways (the hash column is unindexed in the Nix db,
+/// so a miss is a full ValidPaths scan: recent misses are cached for NAR_NEGATIVE_TTL).
 async fn nar_entry(st: &Arc<ServeState>, nar_hash: [u8; 32]) -> Result<Option<Arc<NarEntry>>> {
     if let Some(e) = st.nars.lock().unwrap().lru.get(&nar_hash) {
         return Ok(Some(e.clone()));
     }
+    if let Some(at) = st.nar_negative.lock().unwrap().get(&nar_hash) {
+        if at.elapsed() < NAR_NEGATIVE_TTL {
+            return Ok(None);
+        }
+    }
     let db = st.db.clone();
     let info = tokio::task::spawn_blocking(move || db.by_nar_hash(&nar_hash)).await.unwrap()?;
-    Ok(info.map(|info| {
-        let entry = Arc::new(NarEntry { info, table: tokio::sync::OnceCell::new() });
-        st.nars.lock().unwrap().lru.put(nar_hash, entry.clone());
-        entry
-    }))
+    let Some(info) = info else {
+        st.nar_negative.lock().unwrap().put(nar_hash, Instant::now());
+        return Ok(None);
+    };
+    st.nar_negative.lock().unwrap().pop(&nar_hash);
+    let mut cache = st.nars.lock().unwrap();
+    // Re-check under the lock: a concurrent request may have inserted while we scanned. Sharing
+    // the resident entry means sharing its OnceCell — one table build, one accounting.
+    if let Some(e) = cache.lru.get(&nar_hash) {
+        return Ok(Some(e.clone()));
+    }
+    let entry = Arc::new(NarEntry { info, table: tokio::sync::OnceCell::new() });
+    cache.insert(nar_hash, entry.clone());
+    Ok(Some(entry))
 }
 
 /// Build (once per entry) the seek table, and check it against the db's NarSize — a mismatch means
 /// the store content does not correspond to the registered NAR (corruption / mutation): answer 500,
 /// never serve garbage.
-async fn seek_table(st: &Arc<ServeState>, entry: &Arc<NarEntry>) -> Result<Arc<SeekTable>> {
+async fn seek_table(
+    st: &Arc<ServeState>,
+    nar_hash: [u8; 32],
+    entry: &Arc<NarEntry>,
+) -> Result<Arc<SeekTable>> {
     entry
         .table
         .get_or_try_init(|| async {
@@ -311,7 +429,7 @@ async fn seek_table(st: &Arc<ServeState>, entry: &Arc<NarEntry>) -> Result<Arc<S
                 );
             }
             let table = Arc::new(table);
-            st.nars.lock().unwrap().account(table.approx_bytes());
+            st.nars.lock().unwrap().account(&nar_hash, entry, table.approx_bytes());
             Ok(table)
         })
         .await

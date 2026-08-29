@@ -219,6 +219,19 @@ fn validate(cfg: &Config) -> Result<()> {
             bail!("serve.segment_bytes must be at least 4096 (got {})", s.segment_bytes.0);
         }
     }
+    if let Some(p) = &cfg.proxy {
+        // The adaptive hedge deadline clamps to [DEADLINE_FLOOR, narinfo_timeout]; a cap below
+        // the floor would make that clamp panic at the first recorded RTT sample.
+        if p.narinfo_timeout < crate::peers::DEADLINE_FLOOR {
+            bail!(
+                "proxy.narinfo_timeout must be at least {:?} (it caps the adaptive hedge deadline)",
+                crate::peers::DEADLINE_FLOOR
+            );
+        }
+        if p.breaker_failures == 0 {
+            bail!("proxy.breaker_failures must be at least 1");
+        }
+    }
     for p in &cfg.peers {
         if !(p.encoding == "auto"
             || p.encoding == "none"
@@ -228,8 +241,16 @@ fn validate(cfg: &Config) -> Result<()> {
         {
             bail!("peer {:?}: invalid encoding {:?} (auto | none | zstd:<1..=22>)", p.name, p.encoding);
         }
-        if !(p.url.starts_with("http://") || p.url.starts_with("https://")) {
-            bail!("peer {:?}: url must be http(s)://", p.name);
+        if !p.url.starts_with("http://") {
+            if p.url.starts_with("https://") {
+                bail!(
+                    "peer {:?}: https urls are unsupported (narshare is built without TLS; \
+                     peers are reached over the mesh, which owns transport privacy, and \
+                     integrity comes from content addressing)",
+                    p.name
+                );
+            }
+            bail!("peer {:?}: url must be http://", p.name);
         }
     }
     Ok(())
@@ -273,6 +294,29 @@ mod tests {
         assert_eq!(parse_bytes("1.5KiB"), Some(1536));
         assert_eq!(parse_bytes("2GiB"), Some(2 << 30));
         assert_eq!(parse_bytes("5MB"), None);
+    }
+
+    #[test]
+    fn rejects_degenerate_proxy_knobs() {
+        let mk = |extra: &str| {
+            format!(
+                "[proxy]\nlisten = \"127.0.0.1:1\"\n{extra}\n\
+                 [[peers]]\nname = \"a\"\nurl = \"http://x:1\"\n"
+            )
+        };
+        let cfg: Config = toml::from_str(&mk("")).unwrap();
+        validate(&cfg).unwrap();
+        // A hedge cap below the deadline floor would panic Duration::clamp at runtime.
+        let cfg: Config = toml::from_str(&mk("narinfo_timeout = \"50ms\"")).unwrap();
+        assert!(validate(&cfg).is_err());
+        let cfg: Config = toml::from_str(&mk("breaker_failures = 0")).unwrap();
+        assert!(validate(&cfg).is_err());
+        // https accepted at parse time would only fail at request time: no TLS is built in.
+        let cfg: Config = toml::from_str(
+            "[proxy]\nlisten = \"127.0.0.1:1\"\n[[peers]]\nname = \"a\"\nurl = \"https://x:1\"\n",
+        )
+        .unwrap();
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
