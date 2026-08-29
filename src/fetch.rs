@@ -143,12 +143,33 @@ impl PeerLimit {
     }
 }
 
+/// Goodput-tiered wire compression for `encoding = "auto"`: (tier's upper rate bound in B/s,
+/// zstd level). Spend CPU where the link is thin. The decade thresholds are the PLAN's
+/// provisional ladder, to be measured properly in M5.5. This is the NETWORK half of adaptive
+/// encoding; the CPU half is the serve side's saturation degrade (serve.rs) — chunk frames are
+/// independent and self-describing, so the two adapt per chunk without any zstd-internal
+/// machinery (no zstd multithreading is ever used).
+const ENC_TIERS: &[(f64, i32)] = &[(4e6, 19), (4e7, 9), (4e8, 3), (f64::INFINITY, 1)];
+/// A tier switch requires clearing the boundary by this factor, so rate jitter around a
+/// threshold cannot flap the level chunk-to-chunk.
+const ENC_HYSTERESIS: f64 = 1.25;
+/// Tier before any goodput sample exists: level 3 — cheap enough for a fast link, a meaningful
+/// ratio for a slow one.
+const ENC_SEED_TIER: usize = 2;
+
+/// Per-peer network-adaptation state.
+struct PeerNet {
+    /// Per-stream goodput EWMA, bytes/sec (0 = no sample yet).
+    rate: f64,
+    /// Sticky index into ENC_TIERS; moves only when the rate clears a boundary with margin.
+    enc_tier: usize,
+}
+
 /// Everything the striped fetches share across transfers.
 pub struct FetchCtx {
     pub pool: crate::pool::HostPool,
     limits: Vec<PeerLimit>,
-    /// Per-peer goodput EWMA, bytes/sec (0 = no sample yet).
-    rate: Vec<Mutex<f64>>,
+    net: Vec<Mutex<PeerNet>>,
     encodings: Vec<String>,
     pub stats: Stats,
     roaming_until: Mutex<Option<Instant>>,
@@ -166,7 +187,9 @@ impl FetchCtx {
         Self {
             pool: crate::pool::HostPool::new(n),
             limits: (0..n).map(|_| PeerLimit::new(cfg.per_peer_connections.max(1))).collect(),
-            rate: (0..n).map(|_| Mutex::new(0.0)).collect(),
+            net: (0..n)
+                .map(|_| Mutex::new(PeerNet { rate: 0.0, enc_tier: ENC_SEED_TIER }))
+                .collect(),
             encodings: peer_cfgs.iter().map(|p| p.encoding.clone()).collect(),
             stats: Stats::default(),
             roaming_until: Mutex::new(None),
@@ -180,7 +203,12 @@ impl FetchCtx {
     }
 
     fn rate_of(&self, peer: usize) -> f64 {
-        *self.rate[peer].lock().unwrap()
+        self.net[peer].lock().unwrap().rate
+    }
+
+    #[cfg(test)]
+    fn set_rate(&self, peer: usize, r: f64) {
+        self.net[peer].lock().unwrap().rate = r;
     }
 
     fn record_rate(&self, peer: usize, bytes: u64, elapsed: Duration) {
@@ -189,8 +217,8 @@ impl FetchCtx {
             return;
         }
         let r = bytes as f64 / secs;
-        let mut cur = self.rate[peer].lock().unwrap();
-        *cur = if *cur == 0.0 { r } else { 0.7 * *cur + 0.3 * r };
+        let mut net = self.net[peer].lock().unwrap();
+        net.rate = if net.rate == 0.0 { r } else { 0.7 * net.rate + 0.3 * r };
     }
 
     fn chunk_size(&self, peer: usize) -> u64 {
@@ -201,25 +229,30 @@ impl FetchCtx {
         ((r * CHUNK_TARGET_SECS) as u64).clamp(CHUNK_MIN, self.cfg_chunk_max)
     }
 
-    /// Wire encoding for a chunk from this peer: config override, or goodput-tiered when "auto".
+    /// Wire encoding for a chunk from this peer: config override, or goodput-tiered with
+    /// hysteresis when "auto". A manual override pins what is REQUESTED; the serving peer still
+    /// caps it (max_zstd_level) and may degrade it under CPU saturation.
     fn zstd_level(&self, peer: usize) -> Option<i32> {
         match self.encodings.get(peer).map(String::as_str) {
             Some("none") => None,
             Some(enc) if enc.starts_with("zstd:") => enc[5..].parse().ok(),
             _ => {
-                // auto: spend CPU where the link is thin.
-                let r = self.rate_of(peer);
-                Some(if r == 0.0 {
-                    3
-                } else if r < 4e6 {
-                    19
-                } else if r < 4e7 {
-                    9
-                } else if r < 4e8 {
-                    3
-                } else {
-                    1
-                })
+                let mut net = self.net[peer].lock().unwrap();
+                if net.rate > 0.0 {
+                    let raw = ENC_TIERS.iter().position(|&(t, _)| net.rate < t).unwrap();
+                    if raw > net.enc_tier {
+                        // Link looks faster (cheaper level): clear the boundary with margin.
+                        if net.rate > ENC_TIERS[net.enc_tier].0 * ENC_HYSTERESIS {
+                            net.enc_tier = raw;
+                        }
+                    } else if raw < net.enc_tier
+                        && net.rate < ENC_TIERS[net.enc_tier - 1].0 / ENC_HYSTERESIS
+                    {
+                        // Link looks slower (spend more CPU): same margin, other side.
+                        net.enc_tier = raw;
+                    }
+                }
+                Some(ENC_TIERS[net.enc_tier].1)
             }
         }
     }
@@ -918,5 +951,47 @@ mod tests {
         let p = fallback_plan(100, 500);
         assert_eq!(p.ranges, vec![(100, 400)]);
         assert_eq!(p.spans.len(), 1);
+    }
+
+    fn ctx_with(encoding: &str) -> FetchCtx {
+        let pcfg: ProxyCfg = toml::from_str("listen = \"127.0.0.1:1\"").unwrap();
+        let peers = vec![PeerCfg {
+            name: "a".into(),
+            url: "http://x:1".into(),
+            tier: 1,
+            encoding: encoding.into(),
+        }];
+        FetchCtx::new(&peers, &pcfg)
+    }
+
+    #[test]
+    fn manual_encodings_are_pinned() {
+        assert_eq!(ctx_with("none").zstd_level(0), None);
+        assert_eq!(ctx_with("zstd:7").zstd_level(0), Some(7));
+    }
+
+    #[test]
+    fn auto_level_tiers_by_goodput_with_hysteresis() {
+        let ctx = ctx_with("auto");
+        // No samples: the seed tier.
+        assert_eq!(ctx.zstd_level(0), Some(3));
+        // Slow link: highest level, once the rate undershoots the boundary with margin.
+        ctx.set_rate(0, 1e6);
+        assert_eq!(ctx.zstd_level(0), Some(19));
+        // Jitter back above the 4 MB/s boundary but inside the hysteresis band: no flap.
+        ctx.set_rate(0, 4.3e6);
+        assert_eq!(ctx.zstd_level(0), Some(19));
+        // Clearing the band moves the tier…
+        ctx.set_rate(0, 6e6);
+        assert_eq!(ctx.zstd_level(0), Some(9));
+        // …and jitter back below the boundary (but inside the band) does not move it back.
+        ctx.set_rate(0, 3.9e6);
+        assert_eq!(ctx.zstd_level(0), Some(9));
+        // A decisive drop does.
+        ctx.set_rate(0, 2e6);
+        assert_eq!(ctx.zstd_level(0), Some(19));
+        // A fast link lands at the cheapest level, skipping tiers in one step.
+        ctx.set_rate(0, 1e9);
+        assert_eq!(ctx.zstd_level(0), Some(1));
     }
 }

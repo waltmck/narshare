@@ -41,9 +41,14 @@ const MAX_ENCODED_SPAN: u64 = 64 << 20;
 const TABLE_BUDGET: u64 = 256 * 1024 * 1024;
 /// Entry cap is a backstop only; the byte budget is the real limit.
 const TABLE_ENTRIES: usize = 4096;
-/// Concurrent buffered chunk-encode jobs. Each pins up to MAX_ENCODED_SPAN of memory plus a zstd
-/// job, and the serve listener is mesh-exposed — bound the aggregate.
-const ENCODE_CONCURRENCY: usize = 8;
+/// Concurrent buffered chunk-encode jobs — the serve side's CPU budget for wire compression,
+/// sized to the machine. Each job pins up to MAX_ENCODED_SPAN of memory plus one single-threaded
+/// zstd encode, and the serve listener is mesh-exposed — bound the aggregate. A FULL pool doubles
+/// as the "compression, not the wire, is the bottleneck" signal for the adaptive encoding's CPU
+/// half (see get_nar).
+fn encode_permits() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(2, 8)
+}
 /// Concurrent manifest builds. Each is a whole-tree hashing read (minutes for a game tree); two
 /// permits let a small burst overlap without a fleet of peers saturating the disk.
 const MANIFEST_BUILD_CONCURRENCY: usize = 2;
@@ -132,7 +137,7 @@ impl ServeState {
             nar_negative: Mutex::new(LruCache::new(
                 NonZeroUsize::new(NAR_NEGATIVE_ENTRIES).unwrap(),
             )),
-            encode_sem: tokio::sync::Semaphore::new(ENCODE_CONCURRENCY),
+            encode_sem: tokio::sync::Semaphore::new(encode_permits()),
         })
     }
 }
@@ -329,8 +334,24 @@ async fn get_nar(
         {
             if end - start <= MAX_ENCODED_SPAN {
                 let level = level.clamp(1, st.cfg.max_zstd_level.max(1));
-                // Bound aggregate buffered-encode memory (m4).
-                let _permit = st.encode_sem.acquire().await.expect("semaphore closed");
+                // The CPU half of adaptive encoding. An instantly-available permit means the
+                // encode pool has headroom: spend the requested level. A full pool means
+                // compression, not the wire, is the bottleneck (one encode is mid-flight per
+                // core): wait for the slot but do HALF the requested level, so the queue drains
+                // instead of stacking 19s behind 19s. Frames are self-describing, so requesters
+                // decode whatever level was actually spent; the halving is per-chunk against the
+                // REQUESTED level, never compounded — pressure gone, the next chunk is back to
+                // full. This also breaks the requester-side feedback trap where a CPU-capped
+                // server reads as a thin link (low goodput → even higher requested level).
+                let (_permit, level) = match st.encode_sem.try_acquire() {
+                    Ok(p) => (p, level),
+                    Err(_) => {
+                        let p = st.encode_sem.acquire().await.expect("semaphore closed");
+                        let degraded = (level / 2).max(1);
+                        debug!("encode pool saturated: zstd level {level} → {degraded}");
+                        (p, degraded)
+                    }
+                };
                 return match encode_span(&st, &table, start, end, level).await {
                     Ok(frame) => Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
