@@ -837,7 +837,10 @@ mod tests {
         let client = spawn_client(
             "c",
             &[("a", &node.url)],
-            "chunk_max = \"256KiB\"\nmin_bandwidth = \"1GiB\"\nmin_bandwidth_grace = \"1ms\"",
+            // The floor must be unreachable even by a RELEASE build on loopback (measured
+            // 1.1–1.3 GB/s on fast hardware — 1GiB was a boundary flake), and a zero grace
+            // makes the first completed chunk trip it deterministically.
+            "chunk_max = \"256KiB\"\nmin_bandwidth = \"1TiB\"\nmin_bandwidth_grace = \"0s\"",
             TrustedKeys::none(),
         )
         .await;
@@ -921,30 +924,48 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn relay_stall_watchdog_aborts() {
-        // A "holder" (seeded straight into the client index) whose NAR stream hangs.
+        // The case the watchdog legitimately OWNS: bytes flowed, then the only holder died and
+        // stays dead (here: instant 5xx, so failures clear immediately and nothing is left
+        // legally in flight). Patience from the last byte, then a clean mid-stream abort.
         let nar32 = crate::nixbase32::encode(&[7u8; 32]);
-        let hang = Router::new().route(
+        let served = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let served2 = served.clone();
+        let die = Router::new().route(
             "/nar/{f}",
-            get(|| async {
-                let (tx, rx) = mpsc::channel::<std::io::Result<bytes::Bytes>>(1);
-                tx.send(Ok(bytes::Bytes::from(vec![0u8; 1024]))).await.unwrap();
-                std::mem::forget(tx);
-                Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
-                    .into_response()
+            get(move |headers: HeaderMap| {
+                let served = served2.clone();
+                async move {
+                    // First request: one valid 256 KiB chunk. Everything after: 500.
+                    if served.fetch_add(1, Ordering::SeqCst) > 0 {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    let len = headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|r| {
+                            let (a, b) = r.strip_prefix("bytes=")?.split_once('-')?;
+                            Some(b.parse::<u64>().ok()? - a.parse::<u64>().ok()? + 1)
+                        })
+                        .unwrap_or(0) as usize;
+                    Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .body(Body::from(vec![0u8; len]))
+                        .unwrap()
+                }
             }),
         );
-        let hang_url = spawn_router(hang).await;
+        let die_url = spawn_router(die).await;
         let client = spawn_client(
             "c",
-            &[("hang", &hang_url)],
-            "stall_timeout = \"300ms\"",
+            &[("die", &die_url)],
+            "stall_timeout = \"300ms\"\nchunk_max = \"256KiB\"",
             TrustedKeys::none(),
         )
         .await;
         client
             .index
             .apply_snapshot(
-                "hang",
+                "die",
                 1,
                 1,
                 &[proto::Narinfo {
@@ -963,7 +984,70 @@ mod tests {
         let resp =
             http.get(format!("{}/nar/{nar32}.nar", client.url)).send().await.unwrap();
         assert!(resp.bytes().await.is_err(), "stalled relay should abort the body");
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the watchdog, not a 20 s chunk deadline, must own this abort"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inflight_request_subordinates_the_stall_watchdog() {
+        // Patience is subordinate to liveness BY CONSTRUCTION: a request that sits silent for
+        // longer than stall_timeout but is still within its own per-peer deadline must not be
+        // killed by the watchdog — the transfer completes when the response finally lands.
+        // (Regression: the two clocks used to free-run and race; with stall_timeout below the
+        // chunk deadline the watchdog aborted transfers whose only fault was a slow first
+        // byte, e.g. a loaded holder's encode-pool wait.)
+        const SIZE: usize = 100_000;
+        use sha2::{Digest, Sha256};
+        let nar_hash: [u8; 32] = Sha256::digest(vec![0x55u8; SIZE]).into();
+        let slow_start = Router::new().route(
+            "/nar/{f}",
+            get(|| async {
+                // Four stall periods of pure silence before any byte moves.
+                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .body(Body::from(vec![0x55u8; SIZE]))
+                    .unwrap()
+            }),
+        );
+        let url = spawn_router(slow_start).await;
+        let client = spawn_client(
+            "c",
+            &[("slow", &url)],
+            "stall_timeout = \"300ms\"",
+            TrustedKeys::none(),
+        )
+        .await;
+        client
+            .index
+            .apply_snapshot(
+                "slow",
+                1,
+                1,
+                &[proto::Narinfo {
+                    store_path: "/nix/store/ffffffffffffffffffffffffffffffff-y".into(),
+                    nar_hash: nar_hash.to_vec(),
+                    nar_size: SIZE as u64,
+                    references: vec![],
+                    ca: "fixed:r:sha256:dummy".into(),
+                    sigs: vec![],
+                }],
+            )
+            .unwrap();
+
+        let http = reqwest::Client::new();
+        let nar32 = crate::nixbase32::encode(&nar_hash);
+        let body = http
+            .get(format!("{}/nar/{nar32}.nar", client.url))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .expect("a silent-but-in-deadline wait must not be stalled out");
+        assert_eq!(body.len(), SIZE);
     }
 
     #[tokio::test(flavor = "multi_thread")]

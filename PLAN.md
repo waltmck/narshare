@@ -390,16 +390,24 @@ persistently corrupt peer therefore degrades paths it holds until removed from c
   404-with-log (a 500 makes nix retry with backoff). Roaming epochs 404 oversized paths. The one
   deliberate residual: all holders dying MID-transfer costs that one transfer up to
   `stall_timeout` — the 200 is already committed.
-* Transfer give-up: byte-progress stall (`stall_timeout`, default 60 s — generous enough to ride
-  out cellular radio handoffs; liveness is wire BYTES as they arrive, so a chunk that takes
-  longer than the timeout on a slow-but-alive link never false-fires), a consecutive-failure
-  streak (bytes prove the link is alive, but a peer can stream bytes that never become completed
-  chunks — 30 chunk failures with no completion anywhere aborts, and any completion resets it),
-  plus the optional `min_bandwidth` floor with its roaming epoch. Chunk deadlines are 8× the
-  expected duration (clamped 10–300 s) — and a fixed 20 s for a peer with no rate sample, below
-  the default stall timeout, so a black hole holding the emission frontier is evicted (and
-  struck) long before the watchdog would kill a transfer the other holders could finish.
-  Oversized requeues are re-carved at the current chunk size. Everything else is nix's own
+* Transfer give-up — three mechanisms answering three different questions, composed rather than
+  racing:
+  - *Per-peer chunk deadlines* are the liveness detectors ("is THIS request dead?"): 8× the
+    expected duration (clamped 10–300 s), a fixed 20 s for a peer with no rate sample; expiry
+    requeues the chunk and strikes the breaker. Oversized requeues are re-carved at the current
+    chunk size.
+  - *The stall watchdog* is patience policy, not liveness ("how long may a 200-committed
+    response deliver nothing before nix gets the reins back?"): `stall_timeout` (default 60 s —
+    generous enough to ride out cellular radio handoffs) of zero wire bytes. It is SUBORDINATE
+    to the deadlines by construction: it may only fire once no request is still within its own
+    per-peer deadline, so a legally in-flight chunk can never be raced by it, whatever the
+    configured constants. It exists because per-peer detectors never terminate anything — a
+    dead peer's breaker cycles probe/strike forever, and something transfer-level must
+    eventually call it.
+  - *The failure streak* catches illusory progress no wall clock can (bytes flow but chunks
+    never complete — garbage frames, wrong lengths): 30 consecutive chunk failures with no
+    completion anywhere aborts; any completion resets it.
+  Plus the optional `min_bandwidth` floor with its roaming epoch. Everything else is nix's own
   `fallback` behavior.
 * Index staleness: a holder that GC'd seconds ago still appears until its events sync — the
   transfer fails over to other holders or aborts cleanly (the GC-race semantics). A fresh add

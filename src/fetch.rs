@@ -756,6 +756,13 @@ pub async fn run_transfer(
     let mut last_progress = Instant::now();
     let mut failure_streak = 0u32;
     let mut retry_gate: Option<Instant> = None;
+    // Per-peer deadline of every request currently in flight, keyed by chunk offset (in-flight
+    // chunks cover disjoint ranges, so offsets are unique). The stall watchdog is SUBORDINATE
+    // to these: patience may only fire once no request is still within its own deadline, so
+    // the two clocks compose instead of racing (the old failure mode: a legally in-flight
+    // chunk starved the window past stall_timeout and the watchdog killed a transfer the
+    // other holders could have finished).
+    let mut inflight: HashMap<u64, Instant> = HashMap::new();
     // Bytes actually pulled from the network for THIS transfer (excludes local lits and replays),
     // so the min_bandwidth floor measures real link goodput, not synthesized/replayed bytes.
     let mut remote_fetched: u64 = 0;
@@ -848,6 +855,7 @@ pub async fn run_transfer(
             let stc = st.clone();
             let level = ctx.zstd_level(peer);
             let deadline = ctx.chunk_deadline(peer, len);
+            inflight.insert(off, Instant::now() + deadline);
             let prog = progress.clone();
             workers.spawn(async move {
                 let started = Instant::now();
@@ -875,6 +883,13 @@ pub async fn run_transfer(
         }
 
         let mut wake = last_progress + ctx.cfg_stall;
+        // Subordination: never schedule the stall verdict before the latest in-flight deadline
+        // — a hung request belongs to its own detector (deadline → requeue → strike), and the
+        // watchdog's question ("has the WHOLE transfer gone silent past patience?") is only
+        // well-posed once nothing is legally in flight.
+        if let Some(&d) = inflight.values().max() {
+            wake = wake.max(d);
+        }
         if let Some(g) = retry_gate {
             if !requeue.is_empty() {
                 wake = wake.min(g);
@@ -895,6 +910,7 @@ pub async fn run_transfer(
         tokio::select! {
             done = done_rx.recv() => {
                 let Some(done) = done else { return };
+                inflight.remove(&done.off);
                 match done.result {
                     Ok(chunk) => {
                         // Sub-CHUNK_MIN chunks (whole small NARs, range tails) are latency-
@@ -998,10 +1014,16 @@ pub async fn run_transfer(
                 // Liveness = wire BYTES, not chunk completions: sample the counter before
                 // judging (a slow chunk mid-flight keeps ticking it).
                 let seen = progress.load(Ordering::Relaxed);
+                let now = Instant::now();
                 if seen != last_seen_bytes {
                     last_seen_bytes = seen;
-                    last_progress = Instant::now();
-                } else if last_progress.elapsed() >= ctx.cfg_stall {
+                    last_progress = now;
+                } else if last_progress.elapsed() >= ctx.cfg_stall
+                    && !inflight.values().any(|&d| d > now)
+                {
+                    // Silent past patience AND nothing legally in flight (an early wake from
+                    // the retry gate or repoll can land here first — the in-flight guard,
+                    // not the schedule, is authoritative).
                     warn!(
                         "transfer of {} stalled ({:?} without progress)",
                         info.store_path, ctx.cfg_stall
