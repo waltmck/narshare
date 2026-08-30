@@ -284,7 +284,7 @@ impl FetchCtx {
     }
 
     #[cfg(test)]
-    fn set_rate(&self, peer: usize, r: f64) {
+    pub fn set_rate(&self, peer: usize, r: f64) {
         self.net[peer].lock().unwrap().rate = r;
     }
 
@@ -1157,32 +1157,27 @@ pub async fn run_transfer(
     }
 }
 
-/// One weighted draw from the MW pool CONDITIONED on capacity: the support is exactly the
-/// available holders with a free stream slot, weights renormalized over that set (pick_among's
-/// restriction). This is the distribution the old rejection-sampling loop (four draws, then a
-/// weight-blind index-biased linear fallback) only approximated — computed directly it needs
-/// no fallback, and it is work-conserving by construction: None means no holder has capacity
-/// at all. Note the deliberate policy this makes visible: when only a slow peer has free
-/// slots, it gets the chunk with probability 1 — the saturation behavior is a work-conservation
-/// choice, not a sampling artifact (see docs/regret.md for the measured cost at extreme skew).
-///
-/// The acquire can lose a race with a concurrent transfer taking the last slot between the
-/// capacity scan and try_acquire; retrying the (cheap) scan settles it, and a lost race means
-/// someone else made progress, so the bounded retry cannot strand capacity.
+/// One weighted draw over the available holders — the weights ARE the routing distribution
+/// ("this peer's share of the work"), deliberately NOT conditioned on capacity. If the drawn
+/// peer has no free stream slot, nothing launches this attempt: the loop parks and a wake
+/// (slot release, completion, breaker repoll) retries with a fresh draw. Waiting for a busy
+/// healthy peer costs one wake interval (milliseconds mid-transfer); handing its chunk to
+/// whoever happens to be idle instead — the old work-conserving overflow — is how a
+/// floor-weight straggler ended up owning every transfer's completion tail (a constant
+/// ~slots×2 s tax per transfer, measured 16× at 64:1 skew; docs/regret.md). At asymptotic
+/// weights a very slow peer now receives only its floor share of DECISIONS (~W_MIN), which
+/// is exactly the periodic re-discovery ping, and since chunks are time-normalized its byte
+/// share is W_MIN·R_slow/R_fast — noise. The trade accepted with eyes open: a hung-but-
+/// breaker-closed peer can idle the transfer for up to one chunk deadline before its strikes
+/// open the breaker and the draws exclude it — bounded by the deadline machinery, and far
+/// rarer than the skewed-capacity steady state.
 ///
 /// The returned Slot releases the stream budget on drop, however the worker ends.
 fn try_pick(st: &Arc<crate::proxy::ProxyState>, avail: &[usize]) -> Option<(usize, Slot)> {
     let ctx = &st.fetch;
-    for _ in 0..3 {
-        let with_capacity: Vec<usize> = avail
-            .iter()
-            .copied()
-            .filter(|&p| ctx.limits[p].has_idle_capacity())
-            .collect();
-        let p = ctx.pool.pick_among(&with_capacity)?;
-        if ctx.limits[p].try_acquire() {
-            return Some((p, Slot { st: st.clone(), peer: p }));
-        }
+    let p = ctx.pool.pick_among(avail)?;
+    if ctx.limits[p].try_acquire() {
+        return Some((p, Slot { st: st.clone(), peer: p }));
     }
     None
 }

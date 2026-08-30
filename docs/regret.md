@@ -49,36 +49,43 @@ successes finish the job — recovery does NOT wait on 1/W_MIN sampling luck.
 
 ## S3 — striped transfers (completion-time regret, where it actually hurts)
 
-One 32 MiB NAR striped across both peers; oracles are "fast peer alone" and "capacity sum":
+One 32 MiB NAR striped across both peers; oracles are "fast peer alone" and "capacity sum".
 
-| skew | achieved | single-best | capacity-sum | slow byte share | time regret |
-|---|---|---|---|---|---|
-| 4:1 (32/8 MB/s) | 29.3 MB/s | 32 | 40 | 25.0% | +0.10 s |
-| 64:1 (64/1 MB/s) | **4.0 MB/s** | 64 | 65 | 25.0% | **+7.96 s** |
+**History — the work-conserving era.** Selection originally overflowed onto any peer with a
+free stream slot whenever the weighted draw landed on a busy one. That made the slow peer's
+share an *in-flight-time* share, decoupled from both its weight and its capacity: it held its
+~2 slots continuously, each chunk engineered to take ~2 s regardless of peer speed, delivery
+in-order, assignment irrevocable (deadlines fire at 8× expected — never, for a correctly-rated
+peer). Net: a constant **≈ slots × 2 s completion tax per transfer**, independent of skew and
+of the weights being correct — measured 4.0 MB/s vs 64 single-best at 64:1 (16×), and the same
+signature on the VM's shaped links.
 
-Reading: this is where the real regret lives, and it is not a weights problem. The MW share of
-the slow peer is tiny, but selection is **work-conserving** — `try_pick` samples the weights
-*conditioned on free stream capacity*, so whenever the fast peer's slots are momentarily full
-(mid-transfer: always), the conditional support collapses to the slow peer and it gets the
-chunk with probability 1. The slow peer therefore holds its ~2 slots continuously (25% byte
-share at BOTH skews — an in-flight-time share, decoupled from capacity share), and because
-delivery to nix is in-order, its 2-second chunks repeatedly gate the emission frontier. At 4:1
-that costs ~nothing (+0.10 s); at 64:1 the transfer completes **16× slower than ignoring the
-slow peer entirely**. The VM suite's shaped-topology numbers show the same signature (striping
-across the 20 Mbit peer vs the fast peer alone). This is a POLICY cost, not a mechanism bug:
-work conservation itself is what feeds the straggler.
+**Current policy — weights ARE the routing distribution.** `try_pick` makes one weighted draw
+over the available holders, NOT conditioned on capacity: if the drawn peer is busy, nothing
+launches this attempt (park; a wake retries). A floor-weight peer now receives only ~`W_MIN`
+of *decisions* — the periodic re-discovery ping — and since chunks are time-normalized its
+byte share is `W_MIN · R_slow/R_fast` ≈ noise. Measured (cold = uniform weights, reported but
+unasserted; warm = asymptotic weights installed, median of 5 fetches):
 
-## Verdict and the open fix
+| skew | cold | warm median | % of single-best | slow byte share |
+|---|---|---|---|---|
+| 4:1 (32/8 MB/s) | 12.5 MB/s | 29.4 MB/s | **92%** | 18.8% (incl. cold) |
+| 64:1 (64/1 MB/s) | 2.7 MB/s | 54.1 MB/s | **85%** | 8.2% (incl. cold) |
+
+The warm walls at 64:1 — [0.60, 0.62, **4.07**, 0.64, 0.62] s — show the design contract
+exactly: most fetches ride the fast peer; ~`W_MIN`-per-decision, one fetch in a handful hands
+the slow peer a single ~2 s chunk (the ping itself, with its frontier stall). The residual gap
+to 100% in the medians is chunk-granularity/pipeline overhead on a 2–3-chunk transfer, not
+slow-peer bytes. What was given up, deliberately: capacity aggregation no longer chases the
+sum (4:1 achieves 92% of single-best, not 125%), and a hung-but-breaker-closed peer can idle a
+transfer for up to one chunk deadline before its strikes open the breaker — bounded by the
+deadline machinery.
+
+## Verdict
 
 - Decision-level: near-floor regret, linear at ~0.10/decision under 64:1 — acceptable and
-  intentional (the slope is the exploration+tracking budget).
+  intentional (the slope is the exploration+tracking budget; tune η/W_MIN/SHARE next).
 - Tracking: majority flip ≤ 25 decisions — the design goal, confirmed.
-- Completion-time under extreme skew: **measured deficiency**. Candidate mitigations, in rough
-  order of appeal: (a) *tail re-dispatch / hedging* — once carving is exhausted and a fast peer
-  has idle slots, re-issue the slowest in-flight ranges to it and let the first arrival win
-  (bounds the tax at ~one slow chunk, keeps work conservation); (b) weight-scaled slot budgets
-  (a floor-weight peer gets slots only when nobody else has capacity AND the window is not
-  near the frontier); (c) a latency-aware assignment gate (never hand a peer a chunk whose
-  expected service time exceeds the projected remainder of the transfer). The striped-skew
-  bench's catastrophe guard (currently 0.04× single-best) is the acceptance test to tighten
-  when one of these lands.
+- Completion-time at asymptotic weights: **85–92% of the fastest peer** (bench floors: 0.8×
+  at 64:1, 0.7× at 4:1), vs 6% before the policy change. Remaining polish, if ever needed:
+  tail re-dispatch to shave the ping's 2 s chunk and the last few percent of median overhead.

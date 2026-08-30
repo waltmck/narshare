@@ -404,11 +404,10 @@ in
     print(f"[regret] VM deltas (ok, err, bytes): {d}")
     print("[regret] VM byte shares: " + ", ".join(f"{n}={s:.1f}%" for n, s in shares.items()))
     print(f"[regret] VM 3 striped fetches: {t_probe:.2f}s wall")
-    # Measurement only, deliberately: under saturation the thin peer's byte share is
-    # UNBOUNDED by design today — work conservation feeds whoever has a free slot, and its
-    # in-order chunks then gate completion (docs/regret.md, S3). A share threshold here is
-    # the acceptance test for the straggler mitigation, not for the sampler; until that
-    # lands, assert only that no chunk failed.
+    # Measurement, not a share threshold: assignment is weight-proportional now, so the thin
+    # peer's share tracks its (printed) weight — which mid-suite is often mid-recovery, not
+    # asymptotic. The asymptotic-weights throughput floor is asserted where the weights are
+    # controlled: the mw_regret_striped_skew bench. Here, assert only that nothing failed.
     assert all(v[1] == 0 for v in d.values()), f"probe chunks failed: {d}"
 
     # =====================================================================================

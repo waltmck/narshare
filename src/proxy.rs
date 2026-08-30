@@ -719,7 +719,9 @@ mod tests {
     #[ignore] // measurement bench, not a correctness test
     async fn mw_regret_striped_skew() {
         const MB: u64 = 1_000_000;
-        for (ra, rb, tag) in [(64 * MB, MB, "64:1"), (32 * MB, 8 * MB, "4:1")] {
+        for (ra, rb, tag, floor) in
+            [(64 * MB, MB, "64:1", 0.8), (32 * MB, 8 * MB, "4:1", 0.7)]
+        {
             let link_a = FluidLink::new(ra);
             let link_b = FluidLink::new(rb);
             let payload = bytes::Bytes::from(vec![(ra % 251) as u8; 32 * 1024 * 1024]);
@@ -734,38 +736,60 @@ mod tests {
             .await;
             let nar32 = seed_two_holders(&client, &payload, "striped");
             let http = reqwest::Client::new();
-            let t0 = Instant::now();
-            let body = http
-                .get(format!("{}/nar/{nar32}.nar", client.url))
-                .send()
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap();
-            let wall = t0.elapsed().as_secs_f64();
-            assert_eq!(body.len(), payload.len());
             let size_mb = payload.len() as f64 / MB as f64;
-            let achieved = size_mb / wall;
+            let single = ra as f64 / MB as f64;
+            let sum = (ra + rb) as f64 / MB as f64;
+            let url = format!("{}/nar/{nar32}.nar", client.url);
+            let fetch = |url: String| {
+                let http = http.clone();
+                async move {
+                    let t0 = Instant::now();
+                    let body = http.get(url).send().await.unwrap().bytes().await.unwrap();
+                    (body.len(), t0.elapsed().as_secs_f64())
+                }
+            };
+
+            // Cold: uniform weights — the learning cost, reported but not asserted
+            // (accepted: paid once per weight lifetime, amortized over the whole burst).
+            let (n, cold_wall) = fetch(url.clone()).await;
+            assert_eq!(n, payload.len());
+            println!(
+                "[regret] S3 {tag} cold (uniform weights): {:.1} MB/s (wall {cold_wall:.2}s)",
+                size_mb / cold_wall
+            );
+
+            // THE CONSTRAINT: at asymptotically stable weights, throughput must stay near
+            // the fastest peer's — the only residual cost being the W_MIN re-discovery
+            // ping. Install the asymptotic state deterministically (collapsed weight,
+            // learned rates) and take the median of 5 fetches: a ~W_MIN-probability draw
+            // still hands the slow peer one ~2 s chunk — that IS the ping — so single
+            // fetches have a deliberate fat tail the median ignores.
+            client.state.fetch.pool.restore(&[1.0, 0.03], ra as f64, 0.05);
+            client.state.fetch.set_rate(0, ra as f64);
+            client.state.fetch.set_rate(1, rb as f64);
+            let mut walls = Vec::new();
+            for _ in 0..5 {
+                let (n, w) = fetch(url.clone()).await;
+                assert_eq!(n, payload.len());
+                walls.push(w);
+            }
+            let mut sorted = walls.clone();
+            sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let median = sorted[2];
+            let achieved = size_mb / median;
             let (_, _, bytes_a) = client.state.fetch.peer_tally(0);
             let (_, _, bytes_b) = client.state.fetch.peer_tally(1);
             let share_b = 100.0 * bytes_b as f64 / (bytes_a + bytes_b) as f64;
-            let single = ra as f64 / MB as f64;
-            let sum = (ra + rb) as f64 / MB as f64;
             println!(
-                "[regret] S3 striped {tag}: {achieved:.1} MB/s (wall {wall:.2}s) vs \
-                 single-best {single:.0} / capacity-sum {sum:.0} MB/s; slow byte share \
-                 {share_b:.1}%; time regret vs single-best {:+.2}s",
-                wall - size_mb / single
+                "[regret] S3 {tag} warm: median {achieved:.1} MB/s = {:.0}% of single-best \
+                 {single:.0} (capacity-sum {sum:.0}); walls {walls:?}; slow byte share \
+                 (incl. cold fetch) {share_b:.1}%",
+                100.0 * achieved / single
             );
-            // MEASURED DEFICIENCY (documented in docs/regret.md): at extreme skew the
-            // work-conserving slot fallback keeps the slow peer's queue full, and its
-            // in-flight chunks gate completion — 64:1 measures ~0.06× single-best. This
-            // guard only catches a further collapse; tightening it is the acceptance test
-            // for any future straggler mitigation (tail re-dispatch/hedging).
             assert!(
-                achieved > 0.04 * single,
-                "{tag}: striped completion collapsed even below the known deficiency"
+                achieved > floor * single,
+                "{tag}: median {achieved:.1} MB/s violates the {floor}x-single-best floor \
+                 at asymptotic weights (walls {walls:?})"
             );
         }
     }
