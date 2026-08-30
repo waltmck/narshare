@@ -1179,8 +1179,24 @@ fn try_pick(st: &Arc<crate::proxy::ProxyState>, avail: &[usize]) -> Option<(usiz
     if ctx.limits[p].try_acquire() {
         return Some((p, Slot { st: st.clone(), peer: p }));
     }
+    #[cfg(test)]
+    if BENCH_WORK_CONSERVING.load(Ordering::Relaxed) {
+        // Bench-only resurrection of the pre-weight-routing policy (overflow to any free
+        // peer when the draw lands on a busy one), so aggregation A/B comparisons are
+        // measured against the real old behavior. Never enabled outside benches; run those
+        // benches with a name filter — the flag is process-global.
+        return avail
+            .iter()
+            .copied()
+            .find(|&q| ctx.limits[q].try_acquire())
+            .map(|q| (q, Slot { st: st.clone(), peer: q }));
+    }
     None
 }
+
+#[cfg(test)]
+pub static BENCH_WORK_CONSERVING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 mod tests {

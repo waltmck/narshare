@@ -81,11 +81,80 @@ sum (4:1 achieves 92% of single-best, not 125%), and a hung-but-breaker-closed p
 transfer for up to one chunk deadline before its strikes open the breaker — bounded by the
 deadline machinery.
 
+## S4 — aggregation A/B: what did dropping work conservation actually cost?
+
+`mw_aggregation_ab` (run it ALONE — it toggles a process-global policy flag) resurrects the
+old overflow policy behind a bench lever and measures both policies with **learned** weights
+(8 warmup fetches, then median of 5) across capacity ratios. Reference: the 32 MB/s peer
+*alone* through the same proxy path measures 28.8 MB/s — the fair single-best.
+
+| ratio | proportional (new) | work-conserving (old) | learned slow weight | capacity share |
+|---|---|---|---|---|
+| 1:1 (32/32) | **54.2 MB/s** | 54.6 MB/s | ~0.9 | 0.50 |
+| 2:1 (32/16) | 29.2 MB/s | 28.9 MB/s | **0.17** | 0.33 |
+| 4:1 (32/8) | 29.8 MB/s | 29.2 MB/s | 0.09 | 0.20 |
+| 64:1 (64/1) | 55.8 MB/s (87% of 64) | 4.0 MB/s (prior measurement) | 0.10 | 0.015 |
+
+Two findings. First, **the policy change cost ~nothing**: at every ratio the two policies land
+within noise of each other — except 64:1, where the new one is 14× better. The old policy's
+extra slow-peer traffic (30% byte share at 2:1 vs 10%) bought zero wall-clock: those bytes
+just moved the completion tail onto the slow peer.
+
+Second, the painful case is real but it is **not new**: *neither* policy aggregates unequal
+peers. 1:1 aggregates beautifully under both (≈ 1.9× solo — equal chunk durations mean no
+straggler), but 2:1 and 4:1 both sit at single-best. Two independent causes:
+(a) **the learned weight is not a capacity share** — MW weights are exponential in loss-vs-best,
+so a half-speed peer (loss ≈ 0.5/observation at η = 0.7) collapses to w ≈ 0.17 against a 0.33
+capacity share, and proportional routing under-feeds it; and (b) **the tail** — a slower peer's
+time-normalized ~2 s chunk near the end of a ~1 s transfer erases exactly the gains its
+mid-transfer bytes bought (in-order emission). Recovering unequal-peer aggregation therefore
+needs a rate-proportional share estimator (a learning-dynamics question: η shapes how hard
+sub-best peers collapse) *and* tail insurance — which is what hedged exploration below
+provides. Neither is a regression of the routing change.
+
+## Proposed (not yet implemented): hedged exploration
+
+The residual variance cost of weight routing is the ping itself: a `W_MIN`-probability draw
+hands the slow peer one ~2 s chunk and that fetch's completion waits for it. Threshold hacks
+("if w < 0.1, also try someone else") are ugly; the continuous rule falls out of the pool's
+own invariant. The pool renormalizes so the best weight is 1.0, making `w_i` read as "relative
+confidence that routing to i costs nothing vs best". So:
+
+> After drawing primary `i` (∝ w), dispatch a **duplicate** of the same chunk to a second peer
+> `j` (drawn ∝ w over the rest) with probability `h_i = 1 − w_i`. First arrival feeds the
+> emitter; the loser **completes anyway and is recorded normally**, its bytes discarded.
+
+Properties, in the order they matter:
+- **Asymptotically stable weights are unchanged.** Updates are per-completion; hedging changes
+  which bytes are *used*, never which requests complete. The crux is not cancelling the loser:
+  a cancelled ping produces no observation, so a floored peer would rise on fixed-share drift
+  alone (evidence-free) until it won real traffic — oscillation. Letting the loser finish
+  preserves the exact measurement the ping exists for.
+- **Continuous, knob-free, N-ary.** Best peer: h = 0, never hedged. Floor peer: h ≈ 0.97,
+  nearly always insured. Mid-recovery peer (w = 0.5): half its chunks carry a backup — paying
+  duplicate bytes exactly while the scheduler is uncertain about it. Arbitrary weight
+  distributions need no special-casing because h is defined pointwise against the renormalized
+  max. (If linear over/under-hedges mid-weights in practice, `h = (1−w)^γ` is the one-knob
+  generalization — a learning-dynamics tuning question.)
+- **Cost is the complement of confidence.** Expected duplicate bytes per decision =
+  Σ pᵢ(1−wᵢ)sᵢ; at asymptotic weights that is ≈ W_MIN · s_slow per ~30 decisions — noise. It
+  also degrades gracefully: the more the pool trusts a peer, the less it spends insuring it.
+- **What it fixes beyond the ping tail**: the S4 tail cause (b) — a slow-but-useful peer's
+  final chunk is hedged with probability 1−w, so unequal-peer aggregation stops being gated by
+  its straggler. What it deliberately does NOT fix: a *high*-weight frozen peer (h ≈ 0) still
+  parks a fresh transfer until its deadline strikes — that is the accepted
+  weights-were-wrong tradeoff, bounded by the deadline machinery.
+- **Bookkeeping it requires**: in-flight tracking keyed by (offset, attempt) instead of offset
+  (two copies of one range fly concurrently); the loser's Err must not requeue a range the
+  winner already delivered; loser bytes counted under a `hedged_waste` observable.
+
 ## Verdict
 
 - Decision-level: near-floor regret, linear at ~0.10/decision under 64:1 — acceptable and
   intentional (the slope is the exploration+tracking budget; tune η/W_MIN/SHARE next).
 - Tracking: majority flip ≤ 25 decisions — the design goal, confirmed.
 - Completion-time at asymptotic weights: **85–92% of the fastest peer** (bench floors: 0.8×
-  at 64:1, 0.7× at 4:1), vs 6% before the policy change. Remaining polish, if ever needed:
-  tail re-dispatch to shave the ping's 2 s chunk and the last few percent of median overhead.
+  at 64:1, 0.7× at 4:1), vs 6% before the policy change.
+- Aggregation: equal peers ≈ 1.9× solo under both policies; unequal peers sit at single-best
+  under both — an open (pre-existing) limitation whose fix path is rate-shaped shares +
+  hedged exploration, not admission policy.

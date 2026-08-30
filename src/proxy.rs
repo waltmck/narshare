@@ -715,6 +715,114 @@ mod tests {
         );
     }
 
+    /// One aggregation measurement: spawn two fluid-link peers, LEARN weights over 8 warmup
+    /// fetches of a 32 MiB NAR, then take the median of 5 measured fetches. Returns
+    /// (median MB/s, slow-peer byte share % over the measured fetches, learned weights).
+    async fn aggregation_run(ra: u64, rb: Option<u64>) -> (f64, f64, Vec<f64>) {
+        const MB: u64 = 1_000_000;
+        let link_a = FluidLink::new(ra);
+        let payload = bytes::Bytes::from(vec![0x51u8; 32 * 1024 * 1024]);
+        let url_a = spawn_router(throttled_peer(link_a.clone(), payload.clone())).await;
+        let (client, nar32);
+        if let Some(rb) = rb {
+            let link_b = FluidLink::new(rb);
+            let url_b = spawn_router(throttled_peer(link_b, payload.clone())).await;
+            client = spawn_client("c", &[("a", &url_a), ("b", &url_b)], "", TrustedKeys::none())
+                .await;
+            nar32 = seed_two_holders(&client, &payload, "agg");
+        } else {
+            client = spawn_client("c", &[("a", &url_a)], "", TrustedKeys::none()).await;
+            use sha2::{Digest, Sha256};
+            let h: [u8; 32] = Sha256::digest(&payload).into();
+            client
+                .index
+                .apply_snapshot(
+                    "a",
+                    1,
+                    1,
+                    &[proto::Narinfo {
+                        store_path: format!("/nix/store/{}-agg", "r".repeat(32)),
+                        nar_hash: h.to_vec(),
+                        nar_size: payload.len() as u64,
+                        references: vec![],
+                        ca: "fixed:r:sha256:dummy".into(),
+                        sigs: vec![],
+                    }],
+                )
+                .unwrap();
+            nar32 = crate::nixbase32::encode(&h);
+        }
+        let http = reqwest::Client::new();
+        let url = format!("{}/nar/{nar32}.nar", client.url);
+        for _ in 0..8 {
+            let b = http.get(&url).send().await.unwrap().bytes().await.unwrap();
+            assert_eq!(b.len(), payload.len());
+        }
+        let base_b = client.state.fetch.peer_tally(1.min(client.state.peers.list.len() - 1)).2;
+        let base_a = client.state.fetch.peer_tally(0).2;
+        let mut walls = Vec::new();
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let b = http.get(&url).send().await.unwrap().bytes().await.unwrap();
+            assert_eq!(b.len(), payload.len());
+            walls.push(t0.elapsed().as_secs_f64());
+        }
+        walls.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let median = walls[2];
+        let da = client.state.fetch.peer_tally(0).2 - base_a;
+        let db = if client.state.peers.list.len() > 1 {
+            client.state.fetch.peer_tally(1).2 - base_b
+        } else {
+            0
+        };
+        let share_b = 100.0 * db as f64 / (da + db).max(1) as f64;
+        let weights: Vec<f64> = client
+            .state
+            .fetch
+            .pool
+            .snapshot()
+            .0
+            .iter()
+            .map(|w| (w * 1000.0).round() / 1000.0)
+            .collect();
+        ((payload.len() as f64 / MB as f64) / median, share_b, weights)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // measurement bench — run ALONE (name filter): it toggles a process-global flag
+    async fn mw_aggregation_ab() {
+        const MB: u64 = 1_000_000;
+        // Reference: the fast peer alone, through the same proxy path (the fair single-best).
+        let (solo, _, _) = aggregation_run(32 * MB, None).await;
+        println!("[agg] solo 32 MB/s peer through the proxy: {solo:.1} MB/s (fluid ideal 32)");
+
+        for (ra, rb, tag) in [
+            (32 * MB, 32 * MB, "1:1"),
+            (32 * MB, 16 * MB, "2:1"),
+            (32 * MB, 8 * MB, "4:1"),
+        ] {
+            for wc in [false, true] {
+                crate::fetch::BENCH_WORK_CONSERVING.store(wc, Ordering::SeqCst);
+                let (mbps, share_b, weights) = aggregation_run(ra, Some(rb)).await;
+                let policy = if wc { "work-conserving(old)" } else { "proportional(new)" };
+                println!(
+                    "[agg] {tag} {policy}: median {mbps:.1} MB/s (fluid single-best {}, \
+                     sum {}); slow byte share {share_b:.1}%; learned weights {weights:?}",
+                    ra / MB,
+                    (ra + rb) / MB
+                );
+            }
+        }
+        crate::fetch::BENCH_WORK_CONSERVING.store(false, Ordering::SeqCst);
+        // 64:1 proportional for the same table (old policy at 64:1 is the known 4 MB/s
+        // catastrophe; re-measuring it costs minutes, so it is cited, not re-run).
+        let (mbps, share_b, weights) = aggregation_run(64 * MB, Some(MB)).await;
+        println!(
+            "[agg] 64:1 proportional(new): median {mbps:.1} MB/s (fluid single-best 64); \
+             slow byte share {share_b:.1}%; learned weights {weights:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore] // measurement bench, not a correctness test
     async fn mw_regret_striped_skew() {
