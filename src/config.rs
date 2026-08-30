@@ -123,9 +123,15 @@ pub struct ProxyCfg {
     pub listen: SocketAddr,
     #[serde(default = "d_proxy_priority")]
     pub priority: u32,
-    /// Refuse narinfos without a CA: field (FOD/CA-only sharing).
-    #[serde(default = "d_true")]
-    pub ca_only: bool,
+    /// The relay gate's trust anchor, as "name:base64" entries. The proxy relays paths that are
+    /// content-addressed (self-authenticating) OR carry a signature verifying under one of these
+    /// keys — e.g. cache.nixos.org's signature, retained in each peer's Nix db from the original
+    /// substitution. Verified at the proxy BEFORE any NAR bandwidth is spent; the consuming nix
+    /// re-verifies at ingestion; narshare holds no keys and signs nothing. Unset: parsed from
+    /// /etc/nix/nix.conf (trusted-public-keys / extra-trusted-public-keys, with nix's built-in
+    /// default when absent) — exactly what the consuming nix will accept. Set to `[]` to relay
+    /// content-addressed paths only.
+    pub trusted_public_keys: Option<Vec<String>>,
 
     /// Ceiling; actual chunk size adapts toward ~2s per chunk.
     #[serde(default = "d_chunk_max")]
@@ -182,7 +188,6 @@ fn d_segment_bytes() -> ByteSize { ByteSize(4 << 20) }
 fn d_store_dir() -> PathBuf { "/nix/store".into() }
 fn d_db_path() -> PathBuf { "/nix/var/nix/db/db.sqlite".into() }
 fn d_io_concurrency() -> usize { 64 }
-fn d_true() -> bool { true }
 fn d_chunk_max() -> ByteSize { ByteSize(16 << 20) }
 fn d_window_bytes() -> ByteSize { ByteSize(256 << 20) }
 fn d_dedup_budget() -> ByteSize { ByteSize(512 << 20) }
@@ -294,6 +299,28 @@ mod tests {
         assert_eq!(parse_bytes("1.5KiB"), Some(1536));
         assert_eq!(parse_bytes("2GiB"), Some(2 << 30));
         assert_eq!(parse_bytes("5MB"), None);
+    }
+
+    #[test]
+    fn trusted_public_keys_parse() {
+        let mk = |extra: &str| {
+            format!(
+                "[proxy]\nlisten = \"127.0.0.1:1\"\n{extra}\n\
+                 [[peers]]\nname = \"a\"\nurl = \"http://x:1\"\n"
+            )
+        };
+        // Unset: defer to /etc/nix/nix.conf at startup.
+        let cfg: Config = toml::from_str(&mk("")).unwrap();
+        assert_eq!(cfg.proxy.as_ref().unwrap().trusted_public_keys, None);
+        // Explicit list, and the explicit-empty "CA paths only" form.
+        let cfg: Config =
+            toml::from_str(&mk("trusted_public_keys = [\"k-1:AAAA\"]")).unwrap();
+        assert_eq!(
+            cfg.proxy.unwrap().trusted_public_keys.as_deref(),
+            Some(&["k-1:AAAA".to_owned()][..])
+        );
+        let cfg: Config = toml::from_str(&mk("trusted_public_keys = []")).unwrap();
+        assert_eq!(cfg.proxy.unwrap().trusted_public_keys.as_deref(), Some(&[][..]));
     }
 
     #[test]

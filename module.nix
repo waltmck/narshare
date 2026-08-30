@@ -48,8 +48,10 @@ in
       default = true;
       description = ''
         Add the proxy listener to nix.settings.substituters and enable fallback.
-        Deliberately adds NO trusted keys: only content-addressed (FOD/CA) paths
-        can be substituted from peers, preserving the zero-trust guarantee.
+        Deliberately adds NO trusted keys, ever: content-addressed (FOD/CA) paths
+        verify by hash, and signed input-addressed paths relay only when their
+        upstream signature already verifies against keys this machine trusts anyway
+        (trusted-public-keys in /etc/nix/nix.conf).
       '';
     };
   };

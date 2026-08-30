@@ -22,6 +22,10 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 io-uring = "0.7.14"
+# Verify-only ed25519 (nix binary-cache signatures) at the proxy gate, so a path signed by a key
+# the local nix.conf does not trust is refused at narinfo time instead of after the transfer.
+ed25519-compact = { version = "2", default-features = false, features = ["std"] }
+base64 = "0.22"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream"] }
 zstd = "0.13.3"
 # "asm" routes aarch64 through the SHA-2 crypto extensions (~2.4 GB/s vs ~260 MB/s soft) — the

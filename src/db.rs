@@ -201,6 +201,13 @@ pub mod tests {
         db
     }
 
+    /// Attach signatures to a fake-db row (space-separated, as nix stores them).
+    pub fn set_sigs(db: &Path, path: &str, sigs: &str) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute("UPDATE ValidPaths SET sigs = ?2 WHERE path = ?1", rusqlite::params![path, sigs])
+            .unwrap();
+    }
+
     #[test]
     fn lookup_roundtrip() {
         let dir = tempfile::tempdir().unwrap();

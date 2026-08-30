@@ -6,9 +6,12 @@ across all peers that hold it, deduplicating repeated segments within a transfer
 per-chunk on the wire, and adapting chunk sizes, stream counts, and compression levels to links
 from 500 kbit/s cellular to 10 GbE.
 
-Correct by construction: peers are configured with **no signing keys**, so only
-content-addressed paths (FODs — fetched sources, game data) can be substituted from them, and the
-consuming nix verifies every hash on ingestion. The daemon is stateless: it reads `/nix/store` and
+Correct by construction: narshare carries **no signing keys** and signs nothing. Peers substitute
+content-addressed paths (FODs — fetched sources, game data), which the consuming nix verifies on
+ingestion — plus input-addressed paths whose upstream cache signature (e.g. cache.nixos.org's,
+retained in each peer's Nix db from the original substitution) verifies against the local
+`trusted-public-keys` from /etc/nix/nix.conf; the proxy checks the signature before spending any
+bandwidth, and nix re-verifies at ingestion. The daemon is stateless: it reads `/nix/store` and
 Nix's database (both read-only) and writes nothing, ever.
 
 See [PLAN.md](PLAN.md) for the full design; `docs/perf.md` for measured numbers.

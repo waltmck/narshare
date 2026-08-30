@@ -20,10 +20,19 @@ process-lifetime caches.
 Designed for the propnix use case: hundreds-of-GB, highly-compressible, internally-duplicated FOD
 game trees, on links spanning **500 kbit/s cellular to 10 GbE** — same binary, same config.
 
-Trust model: none required. Every path the proxy relays is content-addressed (FOD / CA), so the
-consuming Nix validates the hash on ingestion. narshare carries no signing keys; by default the proxy
-refuses to relay narinfos *without* a `CA:` field (`ca_only`), so it structurally cannot become a
-channel for unsigned input-addressed paths even if a client misconfigures `trusted-public-keys`.
+Trust model: none added. Every path the proxy relays is either content-addressed (FOD / CA — the
+consuming Nix validates the hash on ingestion) or carries an upstream binary-cache signature that
+verifies under the downloader's own `trusted-public-keys` (read from /etc/nix/nix.conf;
+overridable as `proxy.trusted_public_keys`, where `[]` means CA-only relaying). A cache signature
+covers (StorePath, NarHash, NarSize, References) — never the URL or wire representation — so a
+cache.nixos.org signature retained in a peer's Nix db from the original substitution stays valid
+re-served from the mesh: the proxy verifies it BEFORE spending NAR bandwidth, and the consuming
+nix re-verifies at ingestion. narshare carries no signing keys, signs nothing, and never adds
+keys to nix's trust (the NixOS module touches substituters only); it structurally cannot relay
+an unsigned input-addressed path. If `proxy.trusted_public_keys` lists a key the local nix does
+not actually trust, nix rejects the path after the transfer — acceptable, since it only happens
+under misconfiguration; the two lists agree by construction in the default (nix.conf-anchored)
+mode.
 Manifests and segment hashes are *efficiency* metadata, not trust: a lying manifest produces a stream
 that fails the final NarHash check, same as any corruption. The integrity contract is deliberately
 one-sided: **a transfer that completes is correct**; availability against a peer serving wrong
@@ -341,7 +350,7 @@ concurrency = 64                   # bounded in-flight reads: keeps NVMe queue d
 [proxy]
 listen = "127.0.0.1:5051"
 priority = 30                      # strictly ahead of cache.nixos.org (40): loopback, fast negatives
-ca_only = true                     # refuse narinfos without a CA: field (FOD/CA sharing only)
+# trusted_public_keys = [ ... ]   # relay-gate trust anchor; default: /etc/nix/nix.conf; [] = CA-only
 
 chunk_max = "16MiB"                # ceiling; actual chunk size adapts to ~2s per chunk
 window_bytes = "256MiB"            # ordered read-ahead bound

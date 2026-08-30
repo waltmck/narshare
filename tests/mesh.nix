@@ -14,8 +14,11 @@
 ## which makes it a CA path — so the client's nix substitutes it through the proxy with NO
 ## trusted keys, the trust model end to end.
 ##
-## Scenarios: striped substitution across all three links at once; the ca_only gate; proxy
-## restart recovery (NAR-by-hash discovery); per-link benchmarks (recorded in the test log);
+## Scenarios: striped substitution across all three links at once; the relay gate (CA paths
+## always; signed input-addressed paths relay Sig-verbatim only where the trust anchor —
+## /etc/nix/nix.conf by default, or narshare's own trusted_public_keys — holds the key, with
+## unsigned/untrusted ones refused at narinfo time, and nix's own trust never touched);
+## proxy restart recovery (NAR-by-hash discovery); per-link benchmarks (recorded in the log);
 ## the dedup+compression wire-savings assertion on the thin link; a CPU-bound holder
 ## (CPUQuota=20% set live on the unit) where the closed-loop encoding controller must beat a
 ## pinned-high-level control proxy; an IO-bound holder (IOReadBandwidthMax on the store's
@@ -69,7 +72,7 @@ let
     '';
   };
 
-  # An input-addressed (non-CA) path present in every VM's store, for the ca_only gate test.
+  # An input-addressed (non-CA) path present in every VM's store, for the relay-gate test.
   hello = pkgs.hello;
 
   narsharePkg = self.packages.${pkgs.stdenv.hostPlatform.system}.narshare;
@@ -138,6 +141,7 @@ in
         };
       };
       # Only the proxy — a cache.nixos.org entry would stall every miss on a network-less VM.
+      # nix's trust configuration is deliberately UNTOUCHED: narshare adds no keys, ever.
       nix.settings.substituters = lib.mkForce [ "http://127.0.0.1:5051" ];
       # The CPU/IO-bound scenarios run scratch proxies with per-scenario configs by hand.
       environment.systemPackages = [ narsharePkg ];
@@ -303,17 +307,21 @@ in
     # the closed-loop controller, started FRESH under throttle so it must adapt from its seed.
     peers_up("alpha", "beta", "noisy")
 
-    def scratch_proxy(name, port, extra_peer_line):
+    def scratch_proxy(name, port, proxy_line="", peer_line=""):
         lines = [
             "[proxy]",
             f'listen = "127.0.0.1:{port}"',
             'chunk_max = "1MiB"',
+        ]
+        if proxy_line:
+            lines.append(proxy_line)
+        lines += [
             "[[peers]]",
             'name = "alpha"',
             'url = "http://192.168.1.10:5050"',
         ]
-        if extra_peer_line:
-            lines.append(extra_peer_line)
+        if peer_line:
+            lines.append(peer_line)
         body = "\n".join(lines)
         client.succeed(f"cat > /tmp/{name}.toml <<'NSHEOF'\n{body}\nNSHEOF")
         # Pidfile, not pkill-by-pattern: a pattern like "narshare -c /tmp" also matches the
@@ -329,7 +337,7 @@ in
 
     # Warm alpha's seek-table and manifest caches (and take an unthrottled baseline) through
     # the pinned proxy, so the throttled runs measure the throttle, not cold caches.
-    scratch_proxy("pinned", 5052, 'encoding = "zstd:19"')
+    scratch_proxy("pinned", 5052, peer_line='encoding = "zstd:19"')
     prime_on(5052)
     timed_fetch("alpha-only, unthrottled (baseline)", f"http://127.0.0.1:5052/nar/{nar32}.nar")
 
@@ -341,7 +349,7 @@ in
     _, pinned_speed = timed_fetch(
         "alpha CPU-bound (20%), pinned zstd:19", f"http://127.0.0.1:5052/nar/{nar32}.nar"
     )
-    scratch_proxy("auto", 5053, "")
+    scratch_proxy("auto", 5053)
     prime_on(5053)
     _, auto_speed = timed_fetch(
         "alpha CPU-bound (20%), auto level", f"http://127.0.0.1:5053/nar/{nar32}.nar"
@@ -373,6 +381,61 @@ in
     assert io_secs < 60, f"IO-bound transfer took {io_secs:.1f}s"
 
     client.succeed("kill $(cat /tmp/pinned.pid /tmp/auto.pid) 2>/dev/null || true")
+
+    # --- signed relay. narshare never owns keys: the keypair here is generated at RUNTIME on
+    # the throwaway holder, standing in for "some cache whose signature a peer's db retained".
+    # The main proxy anchors its relay gate on the VM's untouched /etc/nix/nix.conf, so this
+    # key is untrusted there → refused at narinfo time (no NAR bandwidth). A proxy whose own
+    # config.toml lists the key relays it, Sig intact — and nix STILL refuses to ingest it,
+    # because nix's trust is nix's alone (the acceptable-misconfiguration case). ---
+    alpha.succeed("nix-store --generate-binary-cache-key mesh-vm-test-1 /tmp/ck.sec /tmp/ck.pub")
+    pk = alpha.succeed("cat /tmp/ck.pub").strip()
+    expr = (
+        'derivation { name = "signed-tool"; system = builtins.currentSystem; '
+        'builder = "/bin/sh"; args = [ "-c" "echo hello-from-the-mesh > $out" ]; }'
+    )
+    signed_path = (
+        alpha.succeed(f"nix-build --option sandbox false --no-out-link -E '{expr}'")
+        .strip()
+        .splitlines()[-1]
+    )
+    alpha.succeed(
+        "nix --extra-experimental-features nix-command store sign "
+        f"--key-file /tmp/ck.sec {signed_path}"
+    )
+    signed_hp = signed_path.removeprefix("/nix/store/")[:32]
+
+    code = client.succeed(
+        f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:5051/{signed_hp}.narinfo"
+    ).strip()
+    assert code == "404", f"a signature nix.conf does not trust must be refused early, got {code}"
+
+    scratch_proxy("signed", 5054, proxy_line=f'trusted_public_keys = ["{pk}"]')
+    ni = client.succeed(f"curl -sf http://127.0.0.1:5054/{signed_hp}.narinfo")
+    assert "Sig: mesh-vm-test-1:" in ni, f"signature must be relayed verbatim:\n{ni}"
+    signed_nar = next(l for l in ni.splitlines() if l.startswith("URL: ")).removeprefix("URL: ")
+    client.succeed(f"curl -sf -o /tmp/signed.nar http://127.0.0.1:5054/{signed_nar}")
+    client.succeed("grep -q hello-from-the-mesh /tmp/signed.nar")
+    # Even through the relaying proxy, nix itself refuses ingestion — its trust is its own.
+    client.fail(
+        "nix-store --option substituters http://127.0.0.1:5054 --option fallback false "
+        f"-r {signed_path}"
+    )
+    client.succeed("kill $(cat /tmp/signed.pid) 2>/dev/null || true")
+
+    # Unsigned input-addressed paths are refused outright.
+    expr2 = expr.replace("signed-tool", "unsigned-tool")
+    unsigned_path = (
+        alpha.succeed(f"nix-build --option sandbox false --no-out-link -E '{expr2}'")
+        .strip()
+        .splitlines()[-1]
+    )
+    unsigned_hp = unsigned_path.removeprefix("/nix/store/")[:32]
+    code = client.succeed(
+        f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:5051/{unsigned_hp}.narinfo"
+    ).strip()
+    assert code == "404", "an unsigned input-addressed path must be refused at narinfo time"
+    print("[bench] signed relay: verbatim Sig relay + early refusal of untrusted keys")
 
     # --- kill a holder mid-transfer: the stripe must finish via the survivors ---
     peers_up("alpha", "beta", "noisy")

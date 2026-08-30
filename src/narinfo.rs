@@ -52,6 +52,10 @@ pub struct RemoteNarinfo {
     pub references: Vec<String>,
     pub deriver: Option<String>,
     pub ca: Option<String>,
+    /// "keyname:base64" signatures, verbatim. Relayed to the client (which verifies them
+    /// against its own trusted keys); the proxy's relay gate pre-verifies them (sig.rs) so an
+    /// untrusted-key path is refused before any NAR bandwidth is spent.
+    pub sigs: Vec<String>,
 }
 
 pub fn parse_narinfo(text: &str) -> Result<RemoteNarinfo> {
@@ -64,6 +68,7 @@ pub fn parse_narinfo(text: &str) -> Result<RemoteNarinfo> {
     let mut references = Vec::new();
     let mut deriver = None;
     let mut ca = None;
+    let mut sigs = Vec::new();
 
     for line in text.lines() {
         if line.is_empty() {
@@ -89,7 +94,12 @@ pub fn parse_narinfo(text: &str) -> Result<RemoteNarinfo> {
             }
             "Deriver" => deriver = Some(value.to_owned()).filter(|d| !d.is_empty()),
             "CA" => ca = Some(value.to_owned()).filter(|c| !c.is_empty()),
-            // URL value, FileHash, FileSize, Sig, unknown keys: ignored.
+            "Sig" => {
+                if !value.is_empty() {
+                    sigs.push(value.to_owned());
+                }
+            }
+            // URL value, FileHash, FileSize, unknown keys: ignored.
             _ => {}
         }
     }
@@ -104,13 +114,17 @@ pub fn parse_narinfo(text: &str) -> Result<RemoteNarinfo> {
         references,
         deriver,
         ca,
+        sigs,
     })
 }
 
 /// Render the narinfo the proxy serves to the local nix: our own /nar URL (keyed by narhash),
-/// Sig dropped (CA carries the trust), and Compression: none regardless of what peers serve —
-/// the engine reconstructs the uncompressed NAR (wire compression is per-chunk, proxy-internal),
-/// and the proxy→nix hop is loopback where recompression is pure waste.
+/// and Compression: none regardless of what peers serve — the engine reconstructs the
+/// uncompressed NAR (wire compression is per-chunk, proxy-internal), and the proxy→nix hop is
+/// loopback where recompression is pure waste. Sigs pass through verbatim: a cache signature
+/// covers (StorePath, NarHash, NarSize, References) — all preserved here — never the URL or
+/// representation, so it stays valid re-served from the mesh and the client verifies it against
+/// its own trusted keys.
 pub fn rewrite_for_client(info: &RemoteNarinfo) -> String {
     let nar32 = nixbase32::encode(&info.nar_hash);
     let mut out = String::with_capacity(512);
@@ -124,6 +138,9 @@ pub fn rewrite_for_client(info: &RemoteNarinfo) -> String {
     let _ = writeln!(out, "References: {}", info.references.join(" "));
     if let Some(d) = &info.deriver {
         let _ = writeln!(out, "Deriver: {d}");
+    }
+    for sig in &info.sigs {
+        let _ = writeln!(out, "Sig: {sig}");
     }
     if let Some(ca) = &info.ca {
         let _ = writeln!(out, "CA: {ca}");
@@ -156,7 +173,8 @@ mod tests {
         assert_eq!(parsed.references, vec!["cccccccccccccccccccccccccccccccc-dep"]);
 
         let rewritten = rewrite_for_client(&parsed);
-        assert!(!rewritten.contains("Sig:"));
+        // Sigs pass through verbatim — the client verifies them against its own trusted keys.
+        assert!(rewritten.contains("Sig: cache.example:xyz\n"));
         assert!(rewritten.contains("CA: fixed:r:sha256:abcd\n"));
         assert!(rewritten.contains("Compression: none\n"));
         // Idempotent under parse→rewrite.

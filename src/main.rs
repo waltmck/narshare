@@ -12,6 +12,7 @@ mod peers;
 mod pool;
 mod proxy;
 mod serve;
+mod sig;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

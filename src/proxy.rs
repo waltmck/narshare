@@ -1,9 +1,12 @@
 //! The proxy listener: the substituter the local nix talks to (loopback).
 //!
-//!   GET /nix-cache-info
 //!   GET|HEAD /<hashpart>.narinfo   → tiered, hedged, coalesced peer fan-out; rewritten narinfo
-//!                                    (our URL, Sig dropped); `ca_only` enforced; negatives cached
-//!                                    only on definitive 404s
+//!                                    (our URL; upstream Sigs relayed verbatim); the relay gate
+//!                                    enforced (CA, or — under "ca-or-signed" — a signature
+//!                                    verified against the downloader's trusted keys, so
+//!                                    untrusted paths cost no NAR bandwidth); negatives cached
+//!                                    on definitive 404s and unrelayable answers
+//!   GET /nix-cache-info
 //!   GET /nar/<narhash>.nar         → relay from a holding peer with source failover at request
 //!                                    time and a byte-progress stall watchdog on the stream
 //!
@@ -43,6 +46,8 @@ pub struct ProxyState {
     pub peers: Peers,
     pub fetch: FetchCtx,
     cfg: ProxyCfg,
+    /// The downloader's trust anchor, for relay = "ca-or-signed" (empty under "ca-only").
+    trusted: crate::sig::TrustedKeys,
     /// narhash → everything we know about where the NAR lives.
     holders: Mutex<LruCache<[u8; 32], HolderSet>>,
     /// hash part → when a definitive negative was recorded (valid for `negative_ttl`).
@@ -64,10 +69,25 @@ pub(crate) struct HolderSet {
 
 impl ProxyState {
     pub fn new(peers: Peers, peer_cfgs: &[config::Peer], cfg: ProxyCfg) -> Arc<Self> {
+        // The relay gate's trust anchor: explicit config, else the local nix.conf — the same
+        // list the consuming nix will enforce at ingestion. Empty (explicitly, or because
+        // nix.conf is unreadable) means only content-addressed paths relay.
+        let trusted = match &cfg.trusted_public_keys {
+            Some(list) => crate::sig::TrustedKeys::parse(list),
+            None => crate::sig::TrustedKeys::from_nix_conf(std::path::Path::new(
+                "/etc/nix/nix.conf",
+            ))
+            .unwrap_or_else(|e| {
+                warn!("/etc/nix/nix.conf is unreadable ({e}); relaying CA paths only");
+                crate::sig::TrustedKeys::none()
+            }),
+        };
+        debug!("relay trust anchor: {} key(s)", trusted.len());
         Arc::new(Self {
             fetch: FetchCtx::new(peer_cfgs, &cfg),
             peers,
             cfg,
+            trusted,
             holders: Mutex::new(LruCache::new(NonZeroUsize::new(HOLDERS_LRU).unwrap())),
             negative: Mutex::new(LruCache::new(NonZeroUsize::new(NEGATIVE_LRU).unwrap())),
             pending: Mutex::new(HashMap::new()),
@@ -84,7 +104,10 @@ impl ProxyState {
     /// resolve to an arbitrary host. Deriving the URL from the content hash keeps the fetch
     /// target a pure function of the request.
     fn accept_holder(&self, info: &RemoteNarinfo, peer_idx: usize) -> Option<RemoteNarinfo> {
-        if self.cfg.ca_only && info.ca.is_none() {
+        // The relay gate: content-addressed (self-authenticating), or carrying a signature that
+        // VERIFIES under the downloader's trusted keys. Verified here so an untrusted-key path
+        // is refused at narinfo time, never after a wasted transfer.
+        if info.ca.is_none() && !self.trusted.any_sig_valid(info) {
             return None;
         }
         if info.compression != "none" {
@@ -190,6 +213,7 @@ async fn discover_nar(st: &Arc<ProxyState>, nar_hash: [u8; 32]) -> Option<Holder
         references: Vec::new(),
         deriver: None,
         ca: None,
+        sigs: Vec::new(),
     };
     let set = HolderSet { info, synthetic: true, sources };
     st.holders.lock().unwrap().put(nar_hash, set.clone());
@@ -310,6 +334,7 @@ async fn fan_out(st: &Arc<ProxyState>, hash_part: &str) -> Option<RemoteNarinfo>
 
     let mut consulted_any = false;
     let mut saw_404 = false;
+    let mut saw_unrelayable = false;
 
     for tier in tiers {
         let candidates: Vec<usize> = st
@@ -346,14 +371,32 @@ async fn fan_out(st: &Arc<ProxyState>, hash_part: &str) -> Option<RemoteNarinfo>
         let deadline = tokio::time::Instant::now() + wait;
 
         let mut outstanding = candidates.len();
-        let mut found: Option<(usize, RemoteNarinfo)> = None;
+        let mut accepted: Option<RemoteNarinfo> = None;
         while outstanding > 0 {
             tokio::select! {
                 msg = rx.recv() => match msg {
                     Some((idx, Answer::Found(info))) => {
                         outstanding -= 1;
-                        found = Some((idx, info));
-                        break;
+                        // Gates are decided per ANSWER, not per tier: a signature one peer's db
+                        // retained, another's may lack, so an unusable answer keeps the wait
+                        // going for the remaining candidates. A StorePath naming a different
+                        // hash is likewise no usable answer (and keeps our caches keyed by the
+                        // REQUESTED hash part, never a peer-controlled string).
+                        if hash_part_of(&info.store_path) != hash_part {
+                            warn!(
+                                "peer {} answered {hash_part} with unrelated path {}",
+                                st.peers.list[idx].name, info.store_path
+                            );
+                        } else if let Some(canonical) = st.accept_holder(&info, idx) {
+                            accepted = Some(canonical);
+                            break;
+                        } else {
+                            debug!(
+                                "peer {}: {} not relayable (no CA, no trusted signature)",
+                                st.peers.list[idx].name, info.store_path
+                            );
+                            saw_unrelayable = true;
+                        }
                     }
                     Some((_, Answer::NotFound)) => {
                         saw_404 = true;
@@ -372,7 +415,7 @@ async fn fan_out(st: &Arc<ProxyState>, hash_part: &str) -> Option<RemoteNarinfo>
         // Whatever is still outstanding keeps running; late positives land via the drainer,
         // which applies the SAME gates as the leader and clears the negative by the REQUESTED
         // hash part (never the peer-controlled StorePath).
-        if outstanding > 0 || found.is_some() {
+        if outstanding > 0 || accepted.is_some() {
             let st = st.clone();
             let hp = hash_part.to_owned();
             tokio::spawn(async move {
@@ -388,32 +431,18 @@ async fn fan_out(st: &Arc<ProxyState>, hash_part: &str) -> Option<RemoteNarinfo>
             });
         }
 
-        if let Some((idx, info)) = found {
-            // The answer must be for the path we asked about; a StorePath naming a different hash
-            // is not a usable answer (nix would reject a mismatched StorePath anyway, but this also
-            // keeps our own caches keyed correctly — see the negative-cache eviction below). Treat
-            // a mismatch as no usable answer and fall to the next tier.
-            if hash_part_of(&info.store_path) != hash_part {
-                warn!(
-                    "peer {} answered {hash_part} with unrelated path {}",
-                    st.peers.list[idx].name, info.store_path
-                );
-            } else if let Some(canonical) = st.accept_holder(&info, idx) {
-                st.negative.lock().unwrap().pop(hash_part);
-                return Some(canonical);
-            } else {
-                // ca_only / non-"none" compression: refuse and negative-cache (all peers serve
-                // the same store paths, so this path is unusable meshwide).
-                debug!("refusing {} (content-addressing / representation gate)", info.store_path);
-                st.negative.lock().unwrap().put(hash_part.to_owned(), Instant::now());
-                return None;
-            }
+        if let Some(canonical) = accepted {
+            st.negative.lock().unwrap().pop(hash_part);
+            return Some(canonical);
         }
     }
 
-    // Cache the miss only when at least one peer definitively answered 404. All-errors (mesh
-    // down) is not evidence about the path; leaving it uncached makes recovery immediate.
-    if consulted_any && saw_404 {
+    // Cache the miss only on evidence: a definitive 404, or answers that exist but cannot be
+    // relayed (no CA, no trusted signature). All-errors (mesh down) is not evidence about the
+    // path; leaving it uncached makes recovery immediate. An unrelayable verdict can be
+    // peer-specific (signatures live in each peer's db), so negative_ttl bounds how long a
+    // better-provisioned peer's answer is masked.
+    if consulted_any && (saw_404 || saw_unrelayable) {
         st.negative.lock().unwrap().put(hash_part.to_owned(), Instant::now());
     }
     None
@@ -622,12 +651,18 @@ mod tests {
             .iter()
             .map(|(n, u)| format!("[[peers]]\nname = \"{n}\"\nurl = \"{u}\"\n"))
             .collect::<String>();
+        // Hermetic by default: an unset trust anchor would read the HOST's /etc/nix/nix.conf.
+        let keys = if extra.contains("trusted_public_keys") {
+            ""
+        } else {
+            "trusted_public_keys = []\n"
+        };
         let cfg: Config = toml::from_str(&format!(
-            "[proxy]\nlisten = \"127.0.0.1:0\"\n{extra}\n{peers}"
+            "[proxy]\nlisten = \"127.0.0.1:0\"\n{keys}{extra}\n{peers}"
         ))
         .unwrap();
         let pcfg: ProxyCfg = toml::from_str(&format!(
-            "listen = \"127.0.0.1:0\"\n{extra}"
+            "listen = \"127.0.0.1:0\"\n{keys}{extra}"
         ))
         .unwrap();
         (cfg, pcfg)
@@ -662,7 +697,7 @@ mod tests {
         let nar32 = crate::nixbase32::encode(&nar_hash);
         assert!(text.contains(&format!("URL: nar/{nar32}.nar")));
 
-        // ca_only refusal.
+        // Relay-gate refusal: no CA, no trusted signature.
         let no = client
             .get(format!("{proxy_url}/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.narinfo"))
             .send()
@@ -1469,6 +1504,105 @@ mod tests {
         let nar = client.get(format!("{url}/nar/{nar32}.nar")).send().await.unwrap();
         assert_eq!(nar.status(), 200);
         assert_eq!(nar.bytes().await.unwrap().len() as u64, table.nar_size);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signed_non_ca_path_relays_only_under_a_trusted_key() {
+        use base64::Engine as _;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+
+        // An input-addressed path (no CA) with real content.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("sstore");
+        let path_dir = store.join("ssssssssssssssssssssssssssssssss-signed-tool-1.0");
+        std::fs::create_dir_all(&path_dir).unwrap();
+        std::fs::write(path_dir.join("payload"), vec![0x42u8; 100_000]).unwrap();
+        let table = nar::build(&path_dir).unwrap();
+        let nar_hash = nar_hash_of(&path_dir);
+        let store_dir = store.to_str().unwrap().to_owned();
+        let full_path =
+            format!("{store_dir}/ssssssssssssssssssssssssssssssss-signed-tool-1.0");
+        let db_path = crate::db::tests::fake_db(
+            dir.path(),
+            &[(&full_path, nar_hash, table.nar_size, None)],
+        );
+
+        // Sign its fingerprint with a fresh key, exactly as `nix store sign` would.
+        let kp = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new([9u8; 32]));
+        let info = crate::narinfo::RemoteNarinfo {
+            store_path: full_path.clone(),
+            compression: "none".into(),
+            nar_hash,
+            nar_size: table.nar_size,
+            references: Vec::new(),
+            deriver: None,
+            ca: None,
+            sigs: Vec::new(),
+        };
+        let fp = crate::sig::fingerprint(&info);
+        let sig = format!("mesh-test-1:{}", b64(&*kp.sk.sign(fp.as_bytes(), None)));
+        crate::db::tests::set_sigs(&db_path, &full_path, &sig);
+
+        let scfg: ServeCfg = toml::from_str(&format!(
+            "listen = \"127.0.0.1:0\"\nstore_dir = {store_dir:?}\ndb_path = {:?}",
+            db_path.to_str().unwrap()
+        ))
+        .unwrap();
+        let db = Arc::new(StoreDb::open(&db_path, &store_dir).unwrap());
+        let serve_url = spawn_router(serve::router(serve::ServeState::new(
+            db,
+            SegmentReader::for_tests(),
+            scfg,
+        )))
+        .await;
+        let client = reqwest::Client::new();
+
+        // Trusting proxy: relays the narinfo with the Sig intact, and serves the NAR.
+        let pk = format!("mesh-test-1:{}", b64(&*kp.pk));
+        let (proxy_url, _) =
+            spawn_proxy(&[("t", &serve_url)], &format!("trusted_public_keys = [{pk:?}]")).await;
+        let ni = client
+            .get(format!("{proxy_url}/ssssssssssssssssssssssssssssssss.narinfo"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ni.status(), 200);
+        let text = ni.text().await.unwrap();
+        assert!(text.contains("Sig: mesh-test-1:"), "signature must be relayed:\n{text}");
+        let nar32 = crate::nixbase32::encode(&nar_hash);
+        let body = client
+            .get(format!("{proxy_url}/nar/{nar32}.nar"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(body.len() as u64, table.nar_size);
+
+        // A proxy trusting a DIFFERENT key under the same name: refused at narinfo time —
+        // the bandwidth-saving property (no NAR transfer ever starts).
+        let other = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new([1u8; 32]));
+        let opk = format!("mesh-test-1:{}", b64(&*other.pk));
+        let (untrusting, _) =
+            spawn_proxy(&[("t", &serve_url)], &format!("trusted_public_keys = [{opk:?}]")).await;
+        let code = client
+            .get(format!("{untrusting}/ssssssssssssssssssssssssssssssss.narinfo"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(code, 404, "an untrusted signature must be refused before any transfer");
+
+        // Empty trust anchor: CA-only behavior.
+        let (ca_only, _) = spawn_proxy(&[("t", &serve_url)], "trusted_public_keys = []").await;
+        let code = client
+            .get(format!("{ca_only}/ssssssssssssssssssssssssssssssss.narinfo"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(code, 404);
     }
 
     #[tokio::test(flavor = "multi_thread")]
