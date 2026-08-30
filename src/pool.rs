@@ -39,6 +39,8 @@ struct State {
     best_rate: f64,
     avg_loss: f64,
     rng: u64,
+    /// Observations folded in since construction — the persistence layer's dirty check.
+    observations: u64,
 }
 
 impl HostPool {
@@ -52,6 +54,7 @@ impl HostPool {
                 // Fixed seed: peer choice cannot affect output hashes, and a fixed seed makes a
                 // bad run reproducible.
                 rng: 0x9E3779B97F4A7C15,
+                observations: 0,
             }),
         }
     }
@@ -107,6 +110,23 @@ impl HostPool {
         st.apply(idx, 1.0);
     }
 
+    /// Adopt persisted state (already staleness-decayed by the loader). Values are clamped to
+    /// the pool's own invariants, so a corrupt cache can only yield a fresh-ish pool.
+    pub fn restore(&self, weights: &[f64], best_rate: f64, avg_loss: f64) {
+        let mut st = self.state.lock().unwrap();
+        for (w, &v) in st.weight.iter_mut().zip(weights) {
+            *w = if v.is_finite() { v.clamp(W_MIN, 1.0) } else { 1.0 };
+        }
+        st.best_rate = if best_rate.is_finite() { best_rate.max(0.0) } else { 0.0 };
+        st.avg_loss = if avg_loss.is_finite() { avg_loss.clamp(0.0, 1.0) } else { 0.0 };
+    }
+
+    /// (weights, best_rate, avg_loss, observation count) — for the persistence layer.
+    pub fn snapshot(&self) -> (Vec<f64>, f64, f64, u64) {
+        let st = self.state.lock().unwrap();
+        (st.weight.clone(), st.best_rate, st.avg_loss, st.observations)
+    }
+
     #[cfg(test)]
     fn weights(&self) -> Vec<f64> {
         self.state.lock().unwrap().weight.clone()
@@ -118,6 +138,7 @@ impl State {
         if idx >= self.weight.len() {
             return;
         }
+        self.observations += 1;
         self.weight[idx] *= (-ETA * (loss - self.avg_loss)).exp();
         self.avg_loss += AVG_ALPHA * (loss - self.avg_loss);
         // Rescale so the best sits at 1.0 (bounded range whatever the run length; the floor
@@ -235,6 +256,28 @@ mod tests {
         assert!(counts[1] > counts[2] * 3, "restricted sampling ignored weights: {counts:?}");
         assert!(counts[2] > 0, "floor must survive restriction");
         assert!(pool.pick_among(&[]).is_none());
+    }
+
+    #[test]
+    fn restore_shapes_sampling_and_snapshot_counts_observations() {
+        let pool = HostPool::new(2);
+        let (_, _, _, obs0) = pool.snapshot();
+        assert_eq!(obs0, 0);
+        // A restored collapsed weight biases sampling immediately, before any observation.
+        pool.restore(&[1.0, W_MIN], 5e6, 0.1);
+        let s = share_all(&pool, 20_000);
+        assert!(s[1] < 0.06, "restored collapse must bias sampling: {s:?}");
+        // Garbage restores clamp to a sane pool rather than poisoning it.
+        pool.restore(&[f64::NAN, -3.0], f64::INFINITY, 9.0);
+        let (w, br, al, _) = pool.snapshot();
+        assert_eq!(w, vec![1.0, W_MIN]);
+        assert_eq!(br, 0.0);
+        assert_eq!(al, 1.0);
+        // Observations tick the dirty counter.
+        pool.record_success(0, 8 << 20, Duration::from_secs(1));
+        pool.record_failure(1);
+        let (_, _, _, obs) = pool.snapshot();
+        assert_eq!(obs, 2);
     }
 
     #[test]

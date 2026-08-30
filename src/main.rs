@@ -152,6 +152,7 @@ async fn run(cfg: config::Config) -> Result<()> {
         let peers = peers.clone().context("[proxy] requires [[peers]]")?;
         let n = peers.list.len();
         let state = proxy::ProxyState::new(peers, idx.clone(), &cfg.peers, pcfg);
+        state.spawn_weight_saver(shutdown_rx.clone());
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .with_context(|| format!("binding proxy listener {listen}"))?;

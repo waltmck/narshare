@@ -36,6 +36,10 @@ pub mod proto {
 const JOURNAL_BACKSTOP: u64 = 50_000;
 /// Suffix bytes per origin per sync response; more sets `truncated` and the puller loops.
 const SUFFIX_BYTES_CAP: usize = 8 << 20;
+/// Half-life of persisted MW weights: at load, each weight is pulled toward uniform (1.0) by
+/// 2^(-age/half_life) — an hour-old vector keeps ~97% of its shape, a week-old one ~1%
+/// (effectively fresh). The best-rate yardstick and mean-loss decay toward 0 the same way.
+const MW_HALF_LIFE_SECS: f64 = 86_400.0;
 
 pub struct Index {
     conn: Mutex<Connection>,
@@ -107,7 +111,11 @@ impl Index {
                  peer TEXT NOT NULL,
                  origin TEXT NOT NULL,
                  seq INTEGER NOT NULL,
-                 PRIMARY KEY (peer, origin));",
+                 PRIMARY KEY (peer, origin));
+             CREATE TABLE IF NOT EXISTS mw_state (
+                 peer TEXT PRIMARY KEY,
+                 weight REAL NOT NULL,
+                 updated INTEGER NOT NULL);",
         )?;
 
         // Self generation: minted once per database lifetime. A lost cache mints a new one, so
@@ -660,6 +668,110 @@ impl Index {
         Ok(out)
     }
 
+    /// Persist the MW pool's learned state, stamped now. Keyed by peer NAME — indices are not
+    /// stable across config edits.
+    pub fn save_mw(
+        &self,
+        peers: &[String],
+        weights: &[f64],
+        best_rate: f64,
+        avg_loss: f64,
+    ) -> Result<()> {
+        let now = unix_now() as i64;
+        let conn = self.conn.lock().unwrap();
+        for (name, w) in peers.iter().zip(weights) {
+            conn.execute(
+                "INSERT INTO mw_state (peer, weight, updated) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (peer) DO UPDATE SET weight = excluded.weight,
+                                                  updated = excluded.updated",
+                params![name, w, now],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('mw_globals', ?1)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [format!("{best_rate} {avg_loss} {now}")],
+        )?;
+        Ok(())
+    }
+
+    /// Load persisted MW state for the given peer order, decayed toward the fresh pool
+    /// (uniform weights, zero yardstick) by staleness. None when nothing was ever saved.
+    pub fn load_mw(&self, peers: &[String]) -> Result<Option<(Vec<f64>, f64, f64)>> {
+        let now = unix_now() as i64;
+        let conn = self.conn.lock().unwrap();
+        let rows: HashMap<String, (f64, i64)> = conn
+            .prepare("SELECT peer, weight, updated FROM mw_state")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?
+            .collect::<rusqlite::Result<_>>()?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        // Reap rows for peers that left the config.
+        for name in rows.keys() {
+            if !peers.contains(name) {
+                conn.execute("DELETE FROM mw_state WHERE peer = ?1", [name])?;
+            }
+        }
+        let decay = |age: i64| 0.5f64.powf((age.max(0) as f64) / MW_HALF_LIFE_SECS);
+        let mut any = false;
+        let weights: Vec<f64> = peers
+            .iter()
+            .map(|name| match rows.get(name) {
+                Some(&(w, updated)) => {
+                    any = true;
+                    1.0 + (w - 1.0) * decay(now - updated)
+                }
+                None => 1.0, // a new peer starts fresh
+            })
+            .collect();
+        if !any {
+            return Ok(None);
+        }
+        let globals: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key = 'mw_globals'", [], |r| r.get(0))
+            .optional()?;
+        let (best_rate, avg_loss) = match globals.as_deref().map(|g| {
+            let mut it = g.split_whitespace();
+            (
+                it.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0),
+                it.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0),
+                it.next().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0),
+            )
+        }) {
+            Some((br, al, updated)) => {
+                let f = decay(now - updated);
+                (br * f, al * f)
+            }
+            None => (0.0, 0.0),
+        };
+        Ok(Some((weights, best_rate, avg_loss)))
+    }
+
+    /// Test hook: age every persisted MW stamp backwards.
+    #[cfg(test)]
+    pub fn age_mw(&self, secs: i64) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE mw_state SET updated = updated - ?1", [secs]).unwrap();
+        if let Ok(g) =
+            conn.query_row("SELECT value FROM meta WHERE key = 'mw_globals'", [], |r| {
+                r.get::<_, String>(0)
+            })
+        {
+            let mut it = g.split_whitespace();
+            let (br, al, up) = (
+                it.next().unwrap().to_owned(),
+                it.next().unwrap().to_owned(),
+                it.next().unwrap().parse::<i64>().unwrap(),
+            );
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'mw_globals'",
+                [format!("{br} {al} {}", up - secs)],
+            )
+            .unwrap();
+        }
+    }
+
     /// (generation, seq) of an origin as we know it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn origin_clock(&self, origin: &str) -> Result<(u64, u64)> {
@@ -687,6 +799,13 @@ impl Index {
         })
         .unwrap() as usize
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Drop a holder edge and orphan-GC the narinfo it pointed at.
@@ -964,6 +1083,37 @@ mod tests {
             panic!("expected the relayed suffix");
         };
         assert_eq!(sfx.events.len(), 1);
+    }
+
+    #[test]
+    fn mw_weights_persist_and_decay_toward_uniform() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = idx(dir.path(), "b", &["p", "q"]);
+        let names = vec!["p".to_string(), "q".to_string()];
+        assert!(b.load_mw(&names).unwrap().is_none(), "nothing saved yet");
+
+        b.save_mw(&names, &[1.0, 0.05], 1e8, 0.2).unwrap();
+        // Fresh: essentially unchanged.
+        let (w, br, al) = b.load_mw(&names).unwrap().unwrap();
+        assert!((w[0] - 1.0).abs() < 1e-6 && (w[1] - 0.05).abs() < 0.01, "{w:?}");
+        assert!(br > 9e7 && al > 0.19);
+
+        // A day old: halfway back toward uniform.
+        b.age_mw(86_400);
+        let (w, _, _) = b.load_mw(&names).unwrap().unwrap();
+        assert!((w[1] - 0.525).abs() < 0.02, "one half-life ⇒ midpoint, got {}", w[1]);
+
+        // A week old: effectively fresh again (the yardstick fades with it).
+        b.age_mw(6 * 86_400);
+        let (w, br, al) = b.load_mw(&names).unwrap().unwrap();
+        assert!(w[1] > 0.99, "week-old weights are not worth much: {w:?}");
+        assert!(br < 1e6 && al < 0.01);
+
+        // Peers that left the config are reaped; new peers start uniform.
+        let renamed = vec!["p".to_string(), "r".to_string()];
+        let (w, _, _) = b.load_mw(&renamed).unwrap().unwrap();
+        assert_eq!(w.len(), 2);
+        assert!((w[1] - 1.0).abs() < 1e-9, "unknown peer must start fresh");
     }
 
     #[test]

@@ -461,7 +461,12 @@ src/
   sync.rs        sync endpoints (pull + hint) and the background loops (per-peer pulls, hint
                  fan-out, inotify-triggered own-db export)
   peers.rs       reqwest client pool, circuit breakers, sync/manifest/chunk requests
-  pool.rs        MW pool — lifted from propnix hosts.rs (same author; add provenance note)
+  pool.rs        MW pool — lifted from propnix hosts.rs (same author; add provenance note).
+                 ONE pool serves every concurrent transfer (randomized proportional sampling is
+                 the anti-stampede fairness); its weights persist in the cache db and are
+                 staleness-decayed toward uniform at load (24 h half-life: an hour-old vector is
+                 ~97% retained, a week-old one is effectively fresh), so link shape learned by
+                 one run warms the next
   governor.rs    per-peer stream-count hill climber — adapted from propnix pin/concurrency.rs
   dedup.rs       occurrence planner — lifted from propnix pin/dedup.rs (budgeted retention)
   fetch.rs       one NAR reconstruction: planner (local/replay/remote), adaptive chunking, window,

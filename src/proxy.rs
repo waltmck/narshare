@@ -42,7 +42,59 @@ impl ProxyState {
         peer_cfgs: &[config::Peer],
         cfg: ProxyCfg,
     ) -> Arc<Self> {
-        Arc::new(Self { fetch: FetchCtx::new(peer_cfgs, &cfg), peers, index, cfg })
+        let st = Arc::new(Self { fetch: FetchCtx::new(peer_cfgs, &cfg), peers, index, cfg });
+        // Warm-start the MW pool from the last run's weights (staleness-decayed by the
+        // loader), so a mesh whose link shape was learned an hour ago starts learned.
+        let names: Vec<String> = peer_cfgs.iter().map(|p| p.name.clone()).collect();
+        match st.index.load_mw(&names) {
+            Ok(Some((weights, best_rate, avg_loss))) => {
+                st.fetch.pool.restore(&weights, best_rate, avg_loss);
+                tracing::debug!("restored MW weights: {weights:?}");
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("could not restore MW weights: {e:#}"),
+        }
+        st
+    }
+
+    /// Persist the MW pool periodically (and once at shutdown) whenever observations were
+    /// folded in — one shared pool serves every concurrent transfer, so this is the whole
+    /// process's learned state.
+    pub fn spawn_weight_saver(
+        self: &Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<()>,
+    ) {
+        let st = self.clone();
+        tokio::spawn(async move {
+            let names: Vec<String> = st.peers.list.iter().map(|p| p.name.clone()).collect();
+            if names.is_empty() {
+                return;
+            }
+            let mut saved_at_obs = 0u64;
+            loop {
+                let stop = tokio::select! {
+                    _ = shutdown.changed() => true,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => false,
+                };
+                let (weights, best_rate, avg_loss, obs) = st.fetch.pool.snapshot();
+                if obs != saved_at_obs {
+                    saved_at_obs = obs;
+                    let index = st.index.clone();
+                    let names = names.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        index.save_mw(&names, &weights, best_rate, avg_loss)
+                    })
+                    .await
+                    .expect("weight saver task panicked");
+                    if let Err(e) = res {
+                        tracing::warn!("could not persist MW weights: {e:#}");
+                    }
+                }
+                if stop {
+                    return;
+                }
+            }
+        });
     }
 
     /// Fetchable sources for a found narinfo: holders that are configured peers (never self —
@@ -507,6 +559,37 @@ mod tests {
             http.get(format!("{}/nar/{nar32}.nar", second.url)).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.bytes().await.unwrap().len() as u64, nar_size);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mw_weights_warm_start_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store_dir, db_path, _sz, _hash) = fake_store(dir.path());
+        let node =
+            spawn_node("a", &["a", "b", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        // Two peers so relative weights exist (the pool renormalizes max → 1.0): "b" is dead.
+        let peers: [(&str, &str); 2] = [("a", &node.url), ("b", "http://127.0.0.1:9")];
+        let first = spawn_client("c", &peers, "", TrustedKeys::none()).await;
+        for _ in 0..8 {
+            first.state.fetch.pool.record_success(0, 8 << 20, std::time::Duration::from_secs(1));
+            first.state.fetch.pool.record_failure(1);
+        }
+        let (w, br, al, _) = first.state.fetch.pool.snapshot();
+        assert!(w[1] < 0.1, "precondition: b collapsed: {w:?}");
+        first
+            .index
+            .save_mw(&["a".to_string(), "b".to_string()], &w, br, al)
+            .unwrap();
+        let cache = first.dir;
+        drop(first.state);
+
+        // "Restart": same cache dir. The pool must start already knowing b is bad.
+        let second = spawn_client_at("c", &peers, "", TrustedKeys::none(), cache).await;
+        let (w2, br2, _, obs) = second.state.fetch.pool.snapshot();
+        assert_eq!(obs, 0, "no observations yet — this is purely restored state");
+        assert!(w2[1] < 0.1, "restored weights must reflect the learned collapse: {w2:?}");
+        assert!((w2[0] - 1.0).abs() < 0.01);
+        assert!(br2 > 0.0, "the yardstick survives (staleness-decayed)");
     }
 
     #[tokio::test(flavor = "multi_thread")]
