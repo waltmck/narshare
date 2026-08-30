@@ -923,6 +923,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn slow_but_alive_link_does_not_false_stall() {
+        // The stall watchdog judges wire BYTES, not chunk completions: one chunk that takes
+        // several stall periods to trickle in — the 500 kbit cellular case scaled down — must
+        // complete, not abort. (Regression: completion-based liveness false-fired here, killing
+        // any transfer whose first seed chunk outlasted stall_timeout.)
+        const SIZE: usize = 100_000;
+        use sha2::{Digest, Sha256};
+        let sha_hex = {
+            let d: [u8; 32] = Sha256::digest(vec![0x77u8; SIZE]).into();
+            hex::encode(d)
+        };
+        let nar_hash: [u8; 32] = Sha256::digest(vec![0x77u8; SIZE]).into();
+
+        let trickle = Router::new().route(
+            "/nar/{f}",
+            get(|| async {
+                let (tx, rx) = mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
+                tokio::spawn(async move {
+                    let payload = vec![0x77u8; SIZE];
+                    for chunk in payload.chunks(2_000) {
+                        if tx.send(Ok(bytes::Bytes::copy_from_slice(chunk))).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    }
+                });
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+                    .unwrap()
+            }),
+        );
+        let peer_url = spawn_router(trickle).await;
+        // ~50 KB/s wire vs a 500 ms stall: the single 100 KB chunk needs ~2 s — four stall
+        // periods — and must survive them all.
+        let client = spawn_client(
+            "c",
+            &[("drip", &peer_url)],
+            "stall_timeout = \"500ms\"",
+            TrustedKeys::none(),
+        )
+        .await;
+        client
+            .index
+            .apply_snapshot(
+                "drip",
+                1,
+                1,
+                &[proto::Narinfo {
+                    store_path: "/nix/store/dddddddddddddddddddddddddddddddd-slow".into(),
+                    nar_hash: nar_hash.to_vec(),
+                    nar_size: SIZE as u64,
+                    references: vec![],
+                    ca: "fixed:r:sha256:dummy".into(),
+                    sigs: vec![],
+                }],
+            )
+            .unwrap();
+        let http = reqwest::Client::new();
+        let nar32 = crate::nixbase32::encode(&nar_hash);
+        let body = http
+            .get(format!("{}/nar/{nar32}.nar", client.url))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .expect("a slow-but-alive transfer must complete, not stall out");
+        assert_eq!(body.len(), SIZE);
+        assert_eq!(hex::encode::<[u8; 32]>(Sha256::digest(&body).into()), sha_hex);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn oversized_decode_output_is_rejected() {
         use axum::routing::any;
         // A holder whose chunks decompress far beyond the requested length: the bounded

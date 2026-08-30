@@ -32,8 +32,14 @@ const WIRE_SLACK: usize = 64 << 10;
 
 /// Read a response body with a hard cap, checking Content-Length first and bounding the stream.
 /// Neither reqwest nor HTTP bounds this by default, so without a cap a response of any size would
-/// be buffered in full.
-async fn read_capped(resp: reqwest::Response, cap: usize) -> Result<Bytes> {
+/// be buffered in full. `progress` (when given) is ticked per wire fragment AS IT ARRIVES —
+/// the transfer engine's byte-level liveness signal, so a chunk that takes longer than the
+/// stall timeout still reads as alive while bytes flow.
+async fn read_capped_progress(
+    resp: reqwest::Response,
+    cap: usize,
+    progress: Option<&std::sync::atomic::AtomicU64>,
+) -> Result<Bytes> {
     if let Some(len) = resp.content_length() {
         if len > cap as u64 {
             bail!("response Content-Length {len} exceeds cap {cap}");
@@ -46,9 +52,16 @@ async fn read_capped(resp: reqwest::Response, cap: usize) -> Result<Bytes> {
         if buf.len() + chunk.len() > cap {
             bail!("response body exceeds cap {cap}");
         }
+        if let Some(p) = progress {
+            p.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         buf.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(buf))
+}
+
+async fn read_capped(resp: reqwest::Response, cap: usize) -> Result<Bytes> {
+    read_capped_progress(resp, cap, None).await
 }
 
 pub struct Peers {
@@ -307,6 +320,7 @@ impl Peers {
         start: u64,
         end: u64,
         zstd_level: Option<i32>,
+        progress: &std::sync::atomic::AtomicU64,
     ) -> Result<Chunk> {
         let peer = &self.list[peer_idx];
         let url = peer.base.join(nar_url).context("bad NAR url from peer")?;
@@ -343,7 +357,7 @@ impl Peers {
         // Cap the WIRE body: raw must be exactly `want`; a compressed frame must be no larger than
         // `want + slack` (it should be smaller). This bounds the read before decompression.
         let wire_cap = if encoded { want + WIRE_SLACK } else { want };
-        let body = match read_capped(resp, wire_cap).await {
+        let body = match read_capped_progress(resp, wire_cap, Some(progress)).await {
             Ok(b) => b,
             Err(e) => {
                 // A body that dies mid-read (reset) or overruns its cap is a hard failure,

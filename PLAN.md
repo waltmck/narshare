@@ -369,8 +369,12 @@ persistently corrupt peer therefore degrades paths it holds until removed from c
   peers leave stripe sets and sync scheduling. Breakers handle *dead*; MW weights handle *slow*;
   the two are deliberately separate mechanisms.
 * Transfer give-up: byte-progress stall (`stall_timeout`, default 60 s — generous enough to ride
-  out cellular radio handoffs), plus the optional `min_bandwidth` floor with its roaming epoch.
-  Everything else is nix's own `fallback` behavior.
+  out cellular radio handoffs; liveness is wire BYTES as they arrive, so a chunk that takes
+  longer than the timeout on a slow-but-alive link never false-fires), a consecutive-failure
+  streak (bytes prove the link is alive, but a peer can stream bytes that never become completed
+  chunks — 30 chunk failures with no completion anywhere aborts, and any completion resets it),
+  plus the optional `min_bandwidth` floor with its roaming epoch. Everything else is nix's own
+  `fallback` behavior.
 * Index staleness: a holder that GC'd seconds ago still appears until its events sync — the
   transfer fails over to other holders or aborts cleanly (the GC-race semantics). A fresh add
   not yet synced is a fast local 404; hints make that window seconds. A fresh node serves 404s

@@ -48,6 +48,12 @@ const ROAMING_EPOCH: Duration = Duration::from_secs(600);
 const MANIFEST_MIN: u64 = 4 << 20;
 // (There is deliberately no per-segment verification and no segment retry budget: see the
 // module doc — corruption is detected once, at the NarHash gate, without attribution.)
+/// Give-up complement to the byte-progress stall: bytes prove the LINK is alive, but a peer can
+/// stream bytes forever that never become completed chunks (garbage frames, wrong lengths).
+/// This many consecutive chunk failures with no completion anywhere aborts the transfer; any
+/// completion resets it, so flaky-but-usable links are untouched. Requeues are paced at 100 ms,
+/// so this is also a floor of ~3 s on the abort.
+const MAX_FAILURE_STREAK: u32 = 30;
 /// Fetch ranges are merged across non-fetch gaps (framing lits, tiny replay holes) up to this
 /// size. An HTTP chunk request costs ~milliseconds regardless of size, so a tree of many small
 /// files would otherwise fragment the range space at every file boundary into sub-chunk
@@ -724,7 +730,13 @@ pub async fn run_transfer(
     // Carving cursor over the fetch ranges.
     let mut range_i = 0usize;
     let mut range_pos = 0u64;
+    // Byte-level liveness: workers tick this as wire bytes ARRIVE (not as chunks complete), so
+    // a chunk that takes longer than stall_timeout on a slow-but-alive link never false-fires
+    // the watchdog — the design's original rationale for byte-progress stall.
+    let progress = Arc::new(AtomicU64::new(0));
+    let mut last_seen_bytes = 0u64;
     let mut last_progress = Instant::now();
+    let mut failure_streak = 0u32;
     let mut retry_gate: Option<Instant> = None;
     // Bytes actually pulled from the network for THIS transfer (excludes local lits and replays),
     // so the min_bandwidth floor measures real link goodput, not synthesized/replayed bytes.
@@ -796,11 +808,12 @@ pub async fn run_transfer(
             let stc = st.clone();
             let level = ctx.zstd_level(peer);
             let deadline = ctx.chunk_deadline(peer, len);
+            let prog = progress.clone();
             workers.spawn(async move {
                 let started = Instant::now();
                 let result = match tokio::time::timeout(
                     deadline,
-                    stc.peers.fetch_range(peer, &url, off, off + len, level),
+                    stc.peers.fetch_range(peer, &url, off, off + len, level, &prog),
                 )
                 .await
                 {
@@ -844,6 +857,8 @@ pub async fn run_transfer(
                         ctx.stats.wire_bytes.fetch_add(chunk.wire, Ordering::Relaxed);
                         em.buffered.insert(done.off, chunk.bytes);
                         last_progress = Instant::now();
+                        last_seen_bytes = progress.load(Ordering::Relaxed);
+                        failure_streak = 0;
 
                         match em.pump(&out, &ctx.stats).await {
                             Err(()) => { workers.abort_all(); return; }
@@ -891,14 +906,43 @@ pub async fn run_transfer(
                         debug!("chunk @{} from peer {} failed: {e:#}", done.off, done.peer);
                         ctx.pool.record_failure(done.peer);
                         ctx.limits[done.peer].observe(false, 0);
+                        // A chunk that died on its deadline BEFORE any completion means the
+                        // seed size outran the link: seed the rate estimate from raw wire
+                        // progress so the next carve is completable, instead of retrying an
+                        // uncompletable seed chunk forever.
+                        if ctx.rate_of(done.peer) <= 0.0 {
+                            let seen = progress.load(Ordering::Relaxed);
+                            if seen > 0 && t0.elapsed() > Duration::from_secs(5) {
+                                ctx.record_rate(done.peer, seen, t0.elapsed());
+                            }
+                        }
                         ctx.stats.requeues.fetch_add(1, Ordering::Relaxed);
                         requeue.push(Reverse((done.off, done.len)));
                         retry_gate = Some(Instant::now() + Duration::from_millis(100));
+                        failure_streak += 1;
+                        if failure_streak >= MAX_FAILURE_STREAK {
+                            warn!(
+                                "transfer of {} aborted: {failure_streak} consecutive chunk \
+                                 failures with no completion",
+                                info.store_path
+                            );
+                            let _ = out
+                                .send(Err(std::io::Error::other("peers failing persistently")))
+                                .await;
+                            workers.abort_all();
+                            return;
+                        }
                     }
                 }
             }
             _ = tokio::time::sleep_until(stall_at) => {
-                if last_progress.elapsed() >= ctx.cfg_stall {
+                // Liveness = wire BYTES, not chunk completions: sample the counter before
+                // judging (a slow chunk mid-flight keeps ticking it).
+                let seen = progress.load(Ordering::Relaxed);
+                if seen != last_seen_bytes {
+                    last_seen_bytes = seen;
+                    last_progress = Instant::now();
+                } else if last_progress.elapsed() >= ctx.cfg_stall {
                     warn!(
                         "transfer of {} stalled ({:?} without progress)",
                         info.store_path, ctx.cfg_stall
