@@ -61,12 +61,40 @@ impl<'de> Deserialize<'de> for ByteSize {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// This node's mesh-wide name — the identifier every peer's [[peers]] entry for this node
+    /// must use. Origin identity for the sync protocol: watermark vectors are keyed by it, so
+    /// all nodes must agree on it (validated at runtime against sync responses).
+    pub name: String,
     pub serve: Option<ServeCfg>,
     pub proxy: Option<ProxyCfg>,
     #[serde(default)]
     pub io: IoCfg,
     #[serde(default)]
+    pub cache: CacheCfg,
+    /// The mesh's shared relay-gate trust anchor, as "name:base64" entries. Feasible narinfos
+    /// are CA, or signed under one of these keys — verified when exporting, when applying sync
+    /// data, and again at use. Unset: parsed from /etc/nix/nix.conf (trusted-public-keys /
+    /// extra-trusted-public-keys, with nix's built-in default when absent) — exactly what the
+    /// consuming nix will accept at ingestion. Set to `[]` to relay content-addressed paths only.
+    pub trusted_public_keys: Option<Vec<String>>,
+    #[serde(default)]
     pub peers: Vec<Peer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheCfg {
+    /// The mesh index database lives at <dir>/index.db — the daemon's only on-disk state, and
+    /// state it can always afford to lose (self-verifying, re-learnable from the mesh; loss
+    /// bumps this node's generation so peers resync it from a snapshot).
+    #[serde(default = "d_cache_dir")]
+    pub dir: PathBuf,
+}
+
+impl Default for CacheCfg {
+    fn default() -> Self {
+        Self { dir: d_cache_dir() }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,15 +151,6 @@ pub struct ProxyCfg {
     pub listen: SocketAddr,
     #[serde(default = "d_proxy_priority")]
     pub priority: u32,
-    /// The relay gate's trust anchor, as "name:base64" entries. The proxy relays paths that are
-    /// content-addressed (self-authenticating) OR carry a signature verifying under one of these
-    /// keys — e.g. cache.nixos.org's signature, retained in each peer's Nix db from the original
-    /// substitution. Verified at the proxy BEFORE any NAR bandwidth is spent; the consuming nix
-    /// re-verifies at ingestion; narshare holds no keys and signs nothing. Unset: parsed from
-    /// /etc/nix/nix.conf (trusted-public-keys / extra-trusted-public-keys, with nix's built-in
-    /// default when absent) — exactly what the consuming nix will accept. Set to `[]` to relay
-    /// content-addressed paths only.
-    pub trusted_public_keys: Option<Vec<String>>,
 
     /// Ceiling; actual chunk size adapts toward ~2s per chunk.
     #[serde(default = "d_chunk_max")]
@@ -146,11 +165,9 @@ pub struct ProxyCfg {
     #[serde(default = "d_per_peer_connections")]
     pub per_peer_connections: usize,
 
-    /// Hedge deadline CAP (the actual deadline adapts to observed lookup latency).
+    /// Cap on small mesh requests (manifest fetches; sync pulls get a generous multiple).
     #[serde(with = "humantime_serde", default = "d_narinfo_timeout")]
     pub narinfo_timeout: Duration,
-    #[serde(with = "humantime_serde", default = "d_negative_ttl")]
-    pub negative_ttl: Duration,
     /// Give up when NO bytes arrive for this long (byte-progress liveness).
     #[serde(with = "humantime_serde", default = "d_stall_timeout")]
     pub stall_timeout: Duration,
@@ -193,8 +210,8 @@ fn d_window_bytes() -> ByteSize { ByteSize(256 << 20) }
 fn d_dedup_budget() -> ByteSize { ByteSize(512 << 20) }
 fn d_per_peer_connections() -> usize { 8 }
 fn d_narinfo_timeout() -> Duration { Duration::from_secs(5) }
-fn d_negative_ttl() -> Duration { Duration::from_secs(30) }
 fn d_stall_timeout() -> Duration { Duration::from_secs(60) }
+fn d_cache_dir() -> PathBuf { "/var/cache/narshare".into() }
 fn d_zero_bytes() -> ByteSize { ByteSize(0) }
 fn d_min_bandwidth_grace() -> Duration { Duration::from_secs(60) }
 fn d_breaker_failures() -> u32 { 3 }
@@ -212,11 +229,20 @@ pub fn load(path: &Path) -> Result<Config> {
 }
 
 fn validate(cfg: &Config) -> Result<()> {
+    if cfg.name.is_empty() {
+        bail!("`name` must be this node's mesh-wide name (peers reference it in [[peers]])");
+    }
     if cfg.serve.is_none() && cfg.proxy.is_none() {
         bail!("config must define at least one of [serve] or [proxy]");
     }
     if cfg.proxy.is_some() && cfg.peers.is_empty() {
         bail!("[proxy] is configured but no [[peers]] are defined");
+    }
+    let mut names: Vec<&str> = cfg.peers.iter().map(|p| p.name.as_str()).collect();
+    names.push(&cfg.name);
+    names.sort_unstable();
+    if names.windows(2).any(|w| w[0] == w[1]) {
+        bail!("node and peer names must all be distinct (they are mesh-wide origin identifiers)");
     }
     if let Some(s) = &cfg.serve {
         // 0 would make the manifest builder loop forever (min(0) never advances).
@@ -225,14 +251,6 @@ fn validate(cfg: &Config) -> Result<()> {
         }
     }
     if let Some(p) = &cfg.proxy {
-        // The adaptive hedge deadline clamps to [DEADLINE_FLOOR, narinfo_timeout]; a cap below
-        // the floor would make that clamp panic at the first recorded RTT sample.
-        if p.narinfo_timeout < crate::peers::DEADLINE_FLOOR {
-            bail!(
-                "proxy.narinfo_timeout must be at least {:?} (it caps the adaptive hedge deadline)",
-                crate::peers::DEADLINE_FLOOR
-            );
-        }
         if p.breaker_failures == 0 {
             bail!("proxy.breaker_failures must be at least 1");
         }
@@ -269,6 +287,7 @@ mod tests {
     fn parses_example() {
         let cfg: Config = toml::from_str(
             r#"
+            name = "me"
             [serve]
             listen = "127.0.0.1:15050"
             [proxy]
@@ -276,6 +295,8 @@ mod tests {
             chunk_max = "16MiB"
             stall_timeout = "60s"
             min_bandwidth = "0"
+            [cache]
+            dir = "/tmp/narshare-cache"
             [[peers]]
             name = "a"
             url = "http://10.0.0.1:5050"
@@ -289,6 +310,8 @@ mod tests {
         assert_eq!(p.stall_timeout, Duration::from_secs(60));
         assert_eq!(p.min_bandwidth.0, 0);
         assert_eq!(cfg.serve.unwrap().priority, 30);
+        assert_eq!(cfg.name, "me");
+        assert_eq!(cfg.cache.dir, PathBuf::from("/tmp/narshare-cache"));
     }
 
     #[test]
@@ -301,60 +324,56 @@ mod tests {
         assert_eq!(parse_bytes("5MB"), None);
     }
 
+    fn mk(pre: &str, proxy_extra: &str, peer: &str) -> String {
+        format!(
+            "name = \"me\"\n{pre}\n[proxy]\nlisten = \"127.0.0.1:1\"\n{proxy_extra}\n\
+             [[peers]]\nname = \"a\"\nurl = \"http://x:1\"\n{peer}"
+        )
+    }
+
     #[test]
     fn trusted_public_keys_parse() {
-        let mk = |extra: &str| {
-            format!(
-                "[proxy]\nlisten = \"127.0.0.1:1\"\n{extra}\n\
-                 [[peers]]\nname = \"a\"\nurl = \"http://x:1\"\n"
-            )
-        };
         // Unset: defer to /etc/nix/nix.conf at startup.
-        let cfg: Config = toml::from_str(&mk("")).unwrap();
-        assert_eq!(cfg.proxy.as_ref().unwrap().trusted_public_keys, None);
+        let cfg: Config = toml::from_str(&mk("", "", "")).unwrap();
+        assert_eq!(cfg.trusted_public_keys, None);
         // Explicit list, and the explicit-empty "CA paths only" form.
         let cfg: Config =
-            toml::from_str(&mk("trusted_public_keys = [\"k-1:AAAA\"]")).unwrap();
-        assert_eq!(
-            cfg.proxy.unwrap().trusted_public_keys.as_deref(),
-            Some(&["k-1:AAAA".to_owned()][..])
-        );
-        let cfg: Config = toml::from_str(&mk("trusted_public_keys = []")).unwrap();
-        assert_eq!(cfg.proxy.unwrap().trusted_public_keys.as_deref(), Some(&[][..]));
+            toml::from_str(&mk("trusted_public_keys = [\"k-1:AAAA\"]", "", "")).unwrap();
+        assert_eq!(cfg.trusted_public_keys.as_deref(), Some(&["k-1:AAAA".to_owned()][..]));
+        let cfg: Config = toml::from_str(&mk("trusted_public_keys = []", "", "")).unwrap();
+        assert_eq!(cfg.trusted_public_keys.as_deref(), Some(&[][..]));
     }
 
     #[test]
     fn rejects_degenerate_proxy_knobs() {
-        let mk = |extra: &str| {
-            format!(
-                "[proxy]\nlisten = \"127.0.0.1:1\"\n{extra}\n\
-                 [[peers]]\nname = \"a\"\nurl = \"http://x:1\"\n"
-            )
-        };
-        let cfg: Config = toml::from_str(&mk("")).unwrap();
+        let cfg: Config = toml::from_str(&mk("", "", "")).unwrap();
         validate(&cfg).unwrap();
-        // A hedge cap below the deadline floor would panic Duration::clamp at runtime.
-        let cfg: Config = toml::from_str(&mk("narinfo_timeout = \"50ms\"")).unwrap();
-        assert!(validate(&cfg).is_err());
-        let cfg: Config = toml::from_str(&mk("breaker_failures = 0")).unwrap();
+        let cfg: Config = toml::from_str(&mk("", "breaker_failures = 0", "")).unwrap();
         assert!(validate(&cfg).is_err());
         // https accepted at parse time would only fail at request time: no TLS is built in.
-        let cfg: Config = toml::from_str(
-            "[proxy]\nlisten = \"127.0.0.1:1\"\n[[peers]]\nname = \"a\"\nurl = \"https://x:1\"\n",
-        )
-        .unwrap();
+        let cfg: Config = toml::from_str(&mk("", "", "").replace("http://x:1", "https://x:1"))
+            .unwrap();
         assert!(validate(&cfg).is_err());
     }
 
     #[test]
     fn rejects_bad() {
+        // missing node name
+        assert!(toml::from_str::<Config>("[serve]\nlisten = \"127.0.0.1:1\"").is_err());
         // neither section
-        let cfg: Config = toml::from_str("").unwrap();
+        let cfg: Config = toml::from_str("name = \"me\"").unwrap();
         assert!(validate(&cfg).is_err());
         // proxy without peers
-        let cfg: Config = toml::from_str("[proxy]\nlisten = \"127.0.0.1:1\"").unwrap();
+        let cfg: Config =
+            toml::from_str("name = \"me\"\n[proxy]\nlisten = \"127.0.0.1:1\"").unwrap();
+        assert!(validate(&cfg).is_err());
+        // name collision with a peer: origin identifiers must be distinct mesh-wide
+        let cfg: Config = toml::from_str(&mk("", "", "").replace("\"a\"", "\"me\"")).unwrap();
         assert!(validate(&cfg).is_err());
         // unknown key
-        assert!(toml::from_str::<Config>("[serve]\nlisten = \"127.0.0.1:1\"\nbogus = 1").is_err());
+        assert!(toml::from_str::<Config>(
+            "name = \"me\"\n[serve]\nlisten = \"127.0.0.1:1\"\nbogus = 1"
+        )
+        .is_err());
     }
 }

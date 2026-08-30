@@ -16,9 +16,11 @@
           # Only the crate inputs: doc edits must not rebuild the package.
           src = pkgs.lib.fileset.toSource {
             root = ./.;
-            fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ];
+            fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./proto ./build.rs ];
           };
           cargoLock.lockFile = ./Cargo.lock;
+          # prost-build compiles proto/mesh.proto at build time.
+          nativeBuildInputs = [ pkgs.protobuf ];
           # Differential tests exec `nix`/compare against the real store; they skip themselves
           # when `nix` is absent, so the sandboxed check phase runs the pure tests only.
           meta = {
@@ -31,7 +33,7 @@
 
       devShells = eachSystem (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
+          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer protobuf ];
         };
       });
 

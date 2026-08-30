@@ -1,33 +1,31 @@
-//! Peer client: narinfo lookups and NAR fetches against other narshare serve listeners, with the
-//! M3 resilience semantics:
+//! Peer client: NAR/manifest fetches and index-sync calls against other narshare nodes.
 //!
-//!   * **Hedge deadlines adapt to observed latency** (TCP-RTO-style: srtt + 4·rttvar, clamped to
-//!     [100ms, narinfo_timeout]). A peer with no samples yet gets the full cap — generous first
-//!     contact, tightening as evidence arrives.
-//!   * **Missing the hedge deadline is "late", never "failed"**: the responder stops waiting, but
-//!     the lookup runs on to the cap and a late positive still lands (holder map, negative-cache
-//!     clearing) via the drainer.
-//!   * **Only hard errors trip the circuit breaker** (connect refused/reset, 5xx, malformed
-//!     narinfo). After `breaker_failures` consecutive strikes a peer is skipped for
-//!     `breaker_cooldown`, then probed again. Breakers handle *dead*; adaptive deadlines handle
-//!     *slow*; the two are deliberately separate.
+//! Only hard errors trip the circuit breaker (connect refused/reset, 5xx, dead bodies). After
+//! `breaker_failures` consecutive strikes a peer is skipped for `breaker_cooldown`, then probed
+//! again. Breakers handle *dead*; MW weights (pool.rs) handle *slow*; the two are deliberately
+//! separate. Lookup latency machinery is gone: narinfo answers come from the local mesh index
+//! (index.rs), not from per-request fan-outs.
 
-use crate::config::{self, ProxyCfg};
+use crate::config;
+use crate::index::proto;
 use crate::manifest::Manifest;
-use crate::narinfo::{parse_narinfo, RemoteNarinfo};
 use crate::nixbase32;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use prost::Message as _;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
-pub(crate) const DEADLINE_FLOOR: Duration = Duration::from_millis(100);
-/// Response-body ceilings: a peer's response must never make the proxy allocate without bound.
-/// narinfos are ~1 KB; manifests are ~1.3 MB per 100 GB of content — both capped generously.
-const NARINFO_CAP: usize = 1 << 20;
+/// Response-body ceilings: a peer's response must never make us allocate without bound.
+/// Manifests are ~1.3 MB per 100 GB of content; sync responses are suffix-capped per origin.
 const MANIFEST_CAP: usize = 256 << 20;
+/// Compressed sync-response cap, and the bound on its decompressed form.
+const SYNC_CAP: usize = 64 << 20;
+const SYNC_RAW_CAP: usize = 256 << 20;
+/// Sync round-trips move megabytes over possibly-thin links: a generous fixed budget.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 /// Slack over the requested length allowed for a compressed chunk body (zstd's worst-case
 /// expansion plus framing is tiny; this is deliberately loose).
 const WIRE_SLACK: usize = 64 << 10;
@@ -56,7 +54,7 @@ async fn read_capped(resp: reqwest::Response, cap: usize) -> Result<Bytes> {
 pub struct Peers {
     pub list: Vec<Peer>,
     client: reqwest::Client,
-    /// narinfo_timeout: the hard cap on any lookup, and the deadline before latency is learned.
+    /// Cap on small mesh requests (manifests); sync gets SYNC_TIMEOUT.
     pub cap: Duration,
     breaker_failures: u32,
     breaker_cooldown: Duration,
@@ -71,27 +69,11 @@ pub struct Peer {
 
 #[derive(Default)]
 struct Health {
-    /// Smoothed narinfo round-trip stats, milliseconds (RFC 6298 shape).
-    srtt: f64,
-    rttvar: f64,
-    samples: u32,
     strikes: u32,
     open_until: Option<Instant>,
 }
 
 impl Peer {
-    /// Hedge deadline for this peer: how long the responder should wait for it.
-    pub fn deadline(&self, cap: Duration) -> Duration {
-        let h = self.health.lock().unwrap();
-        if h.samples == 0 {
-            return cap;
-        }
-        // cap ≥ floor is enforced by config validation; max() keeps a hand-built cap from
-        // panicking the clamp.
-        Duration::from_millis((h.srtt + 4.0 * h.rttvar) as u64)
-            .clamp(DEADLINE_FLOOR, cap.max(DEADLINE_FLOOR))
-    }
-
     /// Breaker gate. An elapsed cooldown lets requests through again (probing); a failed probe
     /// re-opens, a success resets.
     pub fn available(&self) -> bool {
@@ -103,20 +85,10 @@ impl Peer {
         self.health.lock().unwrap().open_until
     }
 
-    fn record_ok(&self, rtt: Duration) {
+    fn record_ok(&self) {
         let mut h = self.health.lock().unwrap();
         h.strikes = 0;
         h.open_until = None;
-        let ms = rtt.as_secs_f64() * 1000.0;
-        if h.samples == 0 {
-            h.srtt = ms;
-            h.rttvar = ms / 2.0;
-        } else {
-            let err = (ms - h.srtt).abs();
-            h.rttvar = 0.75 * h.rttvar + 0.25 * err;
-            h.srtt = 0.875 * h.srtt + 0.125 * ms;
-        }
-        h.samples = h.samples.saturating_add(1);
     }
 
     fn record_strike(&self, threshold: u32, cooldown: Duration, name: &str) {
@@ -157,17 +129,14 @@ fn micros_header(resp: &reqwest::Response, name: &str) -> Duration {
         .unwrap_or_default()
 }
 
-/// One peer's answer to a narinfo lookup.
-pub enum Answer {
-    Found(RemoteNarinfo),
-    /// Definitive 404 — the peer does not have the path.
-    NotFound,
-    /// Hard error (struck) or cap timeout (not struck): no information.
-    Unknown,
-}
-
 impl Peers {
-    pub fn new(peers: &[config::Peer], proxy: &ProxyCfg) -> Result<Self> {
+    pub fn new(
+        peers: &[config::Peer],
+        cap: Duration,
+        breaker_failures: u32,
+        breaker_cooldown: Duration,
+        pool_idle: usize,
+    ) -> Result<Self> {
         let list = peers
             .iter()
             .map(|p| {
@@ -183,73 +152,78 @@ impl Peers {
             })
             .collect::<Result<Vec<_>>>()?;
         let client = reqwest::Client::builder()
-            .pool_max_idle_per_host(proxy.per_peer_connections)
+            .pool_max_idle_per_host(pool_idle)
             .connect_timeout(Duration::from_secs(3))
             .build()
             .context("building http client")?;
-        Ok(Self {
-            list,
-            client,
-            cap: proxy.narinfo_timeout,
-            breaker_failures: proxy.breaker_failures,
-            breaker_cooldown: proxy.breaker_cooldown,
-        })
+        Ok(Self { list, client, cap, breaker_failures, breaker_cooldown })
     }
 
-    /// Look up one narinfo on one peer, recording health. Runs to the cap regardless of hedge
-    /// deadlines — the caller decides how long to *wait*, not how long we *try*. The cap bounds
-    /// the WHOLE exchange, body included: a peer that returns headers and then dribbles the body
-    /// forever must not pin the lookup task (and its drainer) past the cap.
-    pub async fn lookup(&self, idx: usize, hash_part: &str) -> Answer {
+    pub fn idx_of(&self, name: &str) -> Option<usize> {
+        self.list.iter().position(|p| p.name == name)
+    }
+
+    /// One sync round-trip: POST our clock vector, get per-origin suffixes/snapshots back
+    /// (zstd-compressed protobuf). Hard failures strike the breaker; success resets it.
+    pub async fn sync_pull(
+        &self,
+        idx: usize,
+        req: &proto::SyncRequest,
+    ) -> Result<proto::SyncResponse> {
         let peer = &self.list[idx];
-        let Ok(url) = peer.base.join(&format!("{hash_part}.narinfo")) else {
-            return Answer::Unknown;
-        };
-        let started = Instant::now();
+        let url = peer.base.join("narshare/v1/sync").context("bad sync url")?;
         let exchange = async {
-            match self.client.get(url).send().await {
-                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-                    peer.record_ok(started.elapsed());
-                    Answer::NotFound
-                }
-                Ok(r) if r.status().is_success() => match read_capped(r, NARINFO_CAP).await {
-                    Ok(body) => match parse_narinfo(&String::from_utf8_lossy(&body)) {
-                        Ok(info) => {
-                            peer.record_ok(started.elapsed());
-                            Answer::Found(info)
-                        }
-                        Err(e) => {
-                            warn!("peer {}: unparseable narinfo: {e:#}", peer.name);
-                            self.strike(idx);
-                            Answer::Unknown
-                        }
-                    },
-                    Err(e) => {
-                        debug!("peer {}: narinfo body error: {e:#}", peer.name);
-                        self.strike(idx);
-                        Answer::Unknown
-                    }
-                },
-                Ok(r) => {
-                    debug!("peer {}: narinfo HTTP {}", peer.name, r.status());
-                    self.strike(idx);
-                    Answer::Unknown
-                }
-                Err(e) => {
-                    debug!("peer {}: narinfo error: {e}", peer.name);
-                    self.strike(idx);
-                    Answer::Unknown
-                }
+            let resp = self
+                .client
+                .post(url)
+                .body(req.encode_to_vec())
+                .send()
+                .await
+                .with_context(|| format!("peer {}", peer.name))?;
+            if !resp.status().is_success() {
+                bail!("peer {}: sync HTTP {}", peer.name, resp.status());
             }
+            let body = read_capped(resp, SYNC_CAP).await?;
+            let raw = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                use std::io::Read;
+                let mut dec = zstd::stream::read::Decoder::new(&body[..])?;
+                let mut out = Vec::new();
+                dec.by_ref().take(SYNC_RAW_CAP as u64 + 1).read_to_end(&mut out)?;
+                if out.len() > SYNC_RAW_CAP {
+                    bail!("sync response exceeds decompressed cap");
+                }
+                Ok(out)
+            })
+            .await
+            .expect("decode task panicked")?;
+            proto::SyncResponse::decode(&raw[..]).context("bad sync response proto")
         };
-        match tokio::time::timeout(self.cap, exchange).await {
-            Ok(answer) => answer,
+        match tokio::time::timeout(SYNC_TIMEOUT, exchange).await {
+            Ok(Ok(resp)) => {
+                peer.record_ok();
+                Ok(resp)
+            }
+            Ok(Err(e)) => {
+                self.strike(idx);
+                Err(e)
+            }
             Err(_) => {
-                // Cap timeout: "late", not "failed" — no strike, no sample.
-                debug!("peer {}: narinfo exceeded cap", peer.name);
-                Answer::Unknown
+                self.strike(idx);
+                bail!("peer {}: sync exceeded {SYNC_TIMEOUT:?}", peer.name)
             }
         }
+    }
+
+    /// Fire-and-forget "I have news — pull from me."
+    pub async fn hint(&self, idx: usize, from: &str) {
+        let peer = &self.list[idx];
+        let Ok(url) = peer.base.join("narshare/v1/sync-hint") else { return };
+        let body = proto::SyncHint { from: from.to_owned() }.encode_to_vec();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.client.post(url).body(body).send(),
+        )
+        .await;
     }
 
     pub fn strike(&self, idx: usize) {
@@ -271,34 +245,6 @@ impl Peers {
             }
         }
         soonest
-    }
-
-    /// HEAD-probe a peer for a NAR by hash (proxy-restart recovery: nix caches narinfos
-    /// client-side and may request a NAR we never resolved). Returns its size when present.
-    pub async fn head_nar(&self, peer_idx: usize, nar_url: &str) -> Option<u64> {
-        let peer = &self.list[peer_idx];
-        let url = peer.base.join(nar_url).ok()?;
-        let resp = tokio::time::timeout(self.cap, self.client.head(url).send()).await;
-        match resp {
-            Ok(Ok(r)) if r.status().is_success() => r
-                .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse().ok()),
-            Ok(Ok(r)) => {
-                if r.status().is_server_error() {
-                    self.strike(peer_idx);
-                }
-                None
-            }
-            Ok(Err(e)) => {
-                if e.is_connect() {
-                    self.strike(peer_idx);
-                }
-                None
-            }
-            Err(_) => None,
-        }
     }
 
     /// Fetch a peer's segment manifest for a narhash. Absence — 404, an old peer, a build error,
@@ -438,6 +384,7 @@ impl Peers {
                 want
             );
         }
+        peer.record_ok(); // a delivered chunk closes any half-open breaker
         Ok(Chunk { bytes, wire, srv_read, srv_encode, decode })
     }
 }

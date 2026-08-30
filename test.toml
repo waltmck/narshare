@@ -1,8 +1,18 @@
 # Local smoke-test config: serve the real store read-only, and proxy through it via loopback
-# (in a real deployment, peers are OTHER hosts' serve listeners on the mesh).
+# (in a real deployment, peers are OTHER hosts' serve listeners on the mesh, every node lists
+# every other node, and `name` is the node's mesh-wide identity).
 #   nix run .#narshare -- -c test.toml
 #   curl http://127.0.0.1:15050/nix-cache-info   # serve side
 #   curl http://127.0.0.1:15051/nix-cache-info   # proxy side
+#
+# Note: the self-peer below deliberately exercises the origin-identity check — sync pulls from
+# it are rejected ("peer identifies as smoke-test, config says self") and logged, which is
+# exactly what a misconfigured mesh looks like. Serving and proxying still work.
+
+name = "smoke-test"
+
+[cache]
+dir = "/tmp/narshare-smoke-cache"
 
 [serve]
 listen = "127.0.0.1:15050"

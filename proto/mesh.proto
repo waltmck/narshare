@@ -1,0 +1,73 @@
+// The mesh index sync protocol. Every synced set has exactly ONE writer (its origin), so each
+// origin's history is totally ordered by its own sequence counter; receivers keep one watermark
+// per (peer, origin) and apply events idempotently (last-writer-wins per (origin, store_path)).
+// Protobuf so that mesh nodes running different narshare versions keep interoperating: add
+// fields, never renumber.
+syntax = "proto3";
+package narshare.mesh.v1;
+
+// One feasible narinfo: CA, or carrying a signature the mesh anchor trusts. Receivers re-verify
+// feasibility on apply — an exporter's claim is never trusted.
+message Narinfo {
+  string store_path = 1;
+  bytes nar_hash = 2;             // 32-byte sha256 of the uncompressed NAR
+  uint64 nar_size = 3;
+  repeated string references = 4; // basenames, narinfo-style
+  string ca = 5;                  // empty = none
+  repeated string sigs = 6;       // "keyname:base64", verbatim
+}
+
+// One journal event of an origin's holdings.
+message Event {
+  uint64 seq = 1;
+  oneof op {
+    Narinfo add = 2;        // origin now holds this (replaces any prior holding of store_path)
+    string remove = 3;      // store_path the origin no longer holds
+  }
+}
+
+// The requester's knowledge of one origin — doubles as the ack that lets the responder
+// compact its journal ("seq N seen" implies every deletion <= N was seen).
+message OriginClock {
+  string origin = 1;
+  uint64 generation = 2;    // 0 = nothing known
+  uint64 seq = 3;
+}
+
+message SyncRequest {
+  string requester = 1;               // self-declared node name (validated against config)
+  repeated OriginClock have = 2;      // full watermark vector
+}
+
+// Per-origin answer: nothing new, a journal suffix, or a full snapshot (the recovery path —
+// first contact, compacted-past-your-watermark, or generation change).
+message OriginUpdate {
+  string origin = 1;
+  uint64 generation = 2;
+  uint64 seq = 3;                     // responder's current seq for this origin
+  oneof body {
+    bool up_to_date = 4;
+    Suffix suffix = 5;
+    Snapshot snapshot = 6;
+  }
+  // Suffix only: more events remain past what fit the response cap; pull again.
+  bool truncated = 7;
+}
+
+message Suffix {
+  repeated Event events = 1;
+}
+
+message Snapshot {
+  repeated Narinfo held = 1;          // the origin's complete current holdings
+}
+
+message SyncResponse {
+  string responder = 1;               // self-declared node name (validated against config)
+  repeated OriginUpdate origins = 2;
+}
+
+// "I have news — pull from me." Carries no data: pull is the only data path.
+message SyncHint {
+  string from = 1;
+}

@@ -13,9 +13,11 @@ server anywhere:
   striped across all holding peers by multiplicative weights over observed throughput —
   zstd-compressed on the wire.
 
-narshare is **completely stateless**: it writes nothing to disk, ever. Its only inputs are
-`/nix/store` and Nix's database, both read-only; seek tables and manifests are in-memory,
-process-lifetime caches.
+narshare writes nothing it can't afford to lose. Its inputs are `/nix/store` and Nix's database,
+both read-only; seek tables and manifests are in-memory, process-lifetime caches; and its one
+piece of on-disk state — the replicated mesh index at `/var/cache/narshare` (see "The replicated
+mesh index") — is self-verifying and re-learnable: losing it costs a snapshot resync, never
+correctness.
 
 Designed for the propnix use case: hundreds-of-GB, highly-compressible, internally-duplicated FOD
 game trees, on links spanning **500 kbit/s cellular to 10 GbE** — same binary, same config.
@@ -102,7 +104,7 @@ Scope decisions (settled):
 ```
              ┌──────────────────────── one narshare process ───────────────────────┐
 nix daemon ──▶ proxy listener (127.0.0.1:5051)      serve listener (mesh:5050) ◀──── peers' proxies,
-             │   narinfo fan-out + cache              narinfo ← nix db (sqlite ro)│   plain nix clients
+             │   narinfo ← mesh index (local)         narinfo ← nix db (sqlite ro)│   plain nix clients
              │   NAR reconstruction:                  NAR walk + seek table       │
              │     replay | remote                    Range (uncompressed offsets)│
              │   MW pool + governor per peer          per-chunk zstd on the wire  │
@@ -111,14 +113,57 @@ nix daemon ──▶ proxy listener (127.0.0.1:5051)      serve listener (mesh:5
                         │ HTTP over wg mesh to each peer's serve listener
 ```
 
-One process, two listeners. The proxy listener binds loopback (its rewritten narinfos are only
-meaningful to the local nix). The serve listener binds the mesh address; reachability policy is the
-mesh firewall's job. The proxy never lists itself as a peer — nix checks the local store first
-anyway. All derived structures — seek tables, manifests — are **in-memory, process-lifetime LRU
-caches**; narshare writes nothing to disk. A path's manifest is computed on first request (one
-hashing read of the path through the bounded IO pool) and reused for the life of the process. (The
-*Nix* database, `/nix/var/nix/db/db.sqlite`, is read strictly read-only for narinfo metadata —
-narshare never writes it; that is Nix's state, not narshare's.)
+One process, two listeners; every node runs both. The proxy listener binds loopback (its
+rewritten narinfos are only meaningful to the local nix). The serve listener binds the mesh
+address and also carries the index-sync endpoints; reachability policy is the mesh firewall's
+job. The proxy never lists itself as a peer — nix checks the local store first anyway. Derived
+structures — seek tables, manifests — are **in-memory, process-lifetime LRU caches**; the mesh
+index persists under `/var/cache/narshare` (see below). A path's manifest is computed on first
+request and reused for the life of the process. (The *Nix* database,
+`/nix/var/nix/db/db.sqlite`, is read strictly read-only — narshare never writes it; that is
+Nix's state, not narshare's.)
+
+### The replicated mesh index
+
+Every node maintains a full replica of the mesh's catalog: which FEASIBLE narinfos exist — CA,
+or signed under the shared trust anchor (`trusted_public_keys`, default /etc/nix/nix.conf) —
+and which peers currently hold each. Proxy lookups are answered from this LOCAL index: a hit
+costs zero RTT, a miss costs a database read (nix falls through to its other substituters or
+the builder immediately). There is deliberately no per-lookup fallback to the network — a new
+derivation must not cost every peer a miss cycle.
+
+The sync protocol leans on one structural fact: **every synced set has exactly one writer**, its
+origin. Each node diffs its own Nix db against its exported state (triggered by inotify on the
+db directory — registrations and GC both touch the WAL — with a timer fallback) and emits
+add/remove events into its own journal, numbered by a monotonic per-origin seq. Because each
+origin's history is totally ordered, "peer P saw deletion N" collapses to "P's watermark ≥ N":
+
+* **Pull is the only data path.** A pull request carries the puller's full per-origin watermark
+  vector — which doubles as the ack stream. Responses carry, per origin: up-to-date, a journal
+  suffix, or a full snapshot. Relaying other origins' journals is what makes propagation
+  transitive; per-(origin, path) state is last-writer-wins in origin order, so relayed and
+  direct copies converge identically and replays are no-ops.
+* **Hints, not pushes.** A node whose index grew nudges its peers ("pull from me", carrying no
+  data); pulls that insert nothing re-hint nobody, so cascades terminate exactly at
+  convergence. Local change → mesh-wide visibility is ~one hint round.
+* **Compaction to the minimum watermark** across the (fixed, configured) peer set — with a size
+  backstop so one dead peer can't pin journals forever. Stragglers, newcomers, and anyone whose
+  watermark predates the retained tail land on the **snapshot** path, the single recovery
+  mechanism that also serves first contact and cache loss (a node that loses /var/cache mints a
+  new GENERATION; peers detect it and resync from snapshot — regenerated sequence numbers never
+  alias old ones).
+* **Origin identity is the node `name`**: config-declared, mesh-wide unique, validated at
+  runtime against sync responses. The origin universe is exactly {self} ∪ configured peers;
+  anything else is rejected, and origins that leave the config are reaped — including their
+  watermark contribution, which would otherwise pin compaction.
+* **Feasibility is verified three times**: by the exporter (only CA/trusted-signed rows leave a
+  node), on apply (an exporter's claim is never trusted), and at use (a key removed from the
+  anchor makes rows inert without deleting them; re-adding it wakes them). Infeasible events are
+  journaled verbatim for faithful relay but never enter the tables.
+* **GC**: when the last holder of a narinfo departs, the row and its signatures are deleted —
+  the index catalogs what is *currently fetchable*, not history. Staleness is bounded by hint
+  latency and carries the same semantics as the long-standing GC race: a transfer from a
+  just-departed holder fails cleanly and nix falls back.
 
 ### Representation vs. addressing (the compression design)
 
@@ -172,11 +217,11 @@ that sets each:
   capacity on game data; on 10 GbE, zstd-1 keeps compression off the critical path. Per-peer
   manual override remains one line of config (it pins the *requested* level; the server's
   `max_zstd_level` cap still applies, and its pool wait still shows up honestly in the headers).
-* **Hedge deadline** — narinfo fan-out hedging uses a per-peer deadline derived from observed
-  lookup latency (clamped p95 × factor), with `narinfo_timeout` as the *cap*. A fixed 1.5 s deadline
-  is generous on LAN and flapping-prone at cellular RTTs. Crucially, **missing the hedge deadline is
-  "late", not "failed"**: late positives still widen the holder map; only hard errors (connect
-  refused, 5xx, reset) count toward the circuit breaker.
+* **Lookup latency** — solved structurally rather than adaptively: narinfo lookups are answered
+  from the local replicated index, so there is nothing to hedge and no deadline to tune at any
+  link speed. (The fan-out era's adaptive hedge deadlines were built, then retired with the
+  fan-out itself.) `narinfo_timeout` survives as the cap on small mesh requests (manifest
+  fetches; sync pulls get a generous fixed multiple).
 
 And the one give-up signal that is correct at any speed: **stall = no bytes received across all
 streams of a transfer for `stall_timeout`** (byte-progress liveness, engine.rs's rationale — a
@@ -279,14 +324,15 @@ Backed directly by the local Nix store, read-only:
 ### Proxy side
 
 * `GET /nix-cache-info` — `Priority:` from config.
-* `GET|HEAD /<hash>.narinfo` — fan out to all healthy peers in parallel, hedged per Adaptivity.
-  First positive answers the client; every positive (including late arrivals) widens the
-  path→holders map used for striping. Rewrites before serving: `URL: nar/<narhash>.nar`,
-  `Compression: none` (the proxy⇄nix hop is loopback; recompressing for localhost is waste), drop
-  `Sig:`. Negatives cached with `negative_ttl`. **Fan-out is bounded** (semaphore) and identical
-  in-flight lookups are coalesced — nix's mass queries against big closures must not become a
-  narinfo storm multiplied by peer count (matters at cellular narinfo latencies).
-* `GET /nar/<narhash>.nar` — reconstruction + striped fetch (below).
+* `GET|HEAD /<hash>.narinfo` — a LOCAL mesh-index lookup: the feasible narinfo composed from the
+  index row (`URL: nar/<narhash>.nar`, `Compression: none` — the proxy⇄nix hop is loopback —
+  upstream `Sig:` lines relayed verbatim), holders restricted to the lowest tier present. The
+  same store path can exist with different content (a non-reproducible rebuild): the copy the
+  most peers can serve wins. Zero RTT on hits; misses are a free database read — nix's mass
+  queries against big closures cost the mesh nothing.
+* `GET /nar/<narhash>.nar` — index lookup by narhash (different store paths with identical
+  content pool their holders), then reconstruction + striped fetch (below). Works after a proxy
+  restart with no re-resolution: the index persists.
 
 ### The reconstruction planner (dedup + striping)
 
@@ -318,14 +364,19 @@ persistently corrupt peer therefore degrades paths it holds until removed from c
 
 ### Failure semantics, consolidated
 
-* Hedge misses are "late", never "failed" (Adaptivity). Hard errors only (refused / reset / 5xx /
-  malformed) count toward the per-peer circuit breaker: `breaker_failures` consecutive → down for
-  `breaker_cooldown` → half-open probe. Down peers leave fan-out and stripe sets. Breakers handle
-  *dead*; MW weights handle *slow*; the two are deliberately separate mechanisms.
+* Hard errors only (refused / reset / 5xx / dead bodies) count toward the per-peer circuit
+  breaker: `breaker_failures` consecutive → down for `breaker_cooldown` → half-open probe. Down
+  peers leave stripe sets and sync scheduling. Breakers handle *dead*; MW weights handle *slow*;
+  the two are deliberately separate mechanisms.
 * Transfer give-up: byte-progress stall (`stall_timeout`, default 60 s — generous enough to ride
   out cellular radio handoffs), plus the optional `min_bandwidth` floor with its roaming epoch.
   Everything else is nix's own `fallback` behavior.
-* All-peers-down: breakers make lookups fail fast; nix proceeds to other substituters or builds.
+* Index staleness: a holder that GC'd seconds ago still appears until its events sync — the
+  transfer fails over to other holders or aborts cleanly (the GC-race semantics). A fresh add
+  not yet synced is a fast local 404; hints make that window seconds. A fresh node serves 404s
+  until its first snapshots land, which is indistinguishable from having booted later.
+* All-peers-down: lookups still answer instantly from the index; transfers fail cleanly; sync
+  retries on its timer. nix proceeds to other substituters or builds.
 
 ## Configuration
 
@@ -335,7 +386,12 @@ as a build-time assertion). Everything except `listen` addresses and `[[peers]]`
 the minimal real config is ~6 lines.
 
 ```toml
-# test.toml
+name = "desktop"                   # this node's mesh-wide identity (origins are keyed by it;
+                                   # every peer's [[peers]] entry for this node must match)
+# trusted_public_keys = [ ... ]    # mesh trust anchor; default: /etc/nix/nix.conf; [] = CA-only
+
+[cache]
+dir = "/var/cache/narshare"        # the replicated mesh index (the module provides this)
 
 [serve]
 listen = "100.64.0.3:5050"         # mesh address; reachability = mesh firewall's job
@@ -350,15 +406,13 @@ concurrency = 64                   # bounded in-flight reads: keeps NVMe queue d
 [proxy]
 listen = "127.0.0.1:5051"
 priority = 30                      # strictly ahead of cache.nixos.org (40): loopback, fast negatives
-# trusted_public_keys = [ ... ]   # relay-gate trust anchor; default: /etc/nix/nix.conf; [] = CA-only
 
 chunk_max = "16MiB"                # ceiling; actual chunk size adapts to ~2s per chunk
 window_bytes = "256MiB"            # ordered read-ahead bound
 dedup_budget_bytes = "512MiB"      # retention budget for replayed duplicate segments
 per_peer_connections = 8           # ceiling; the governor finds the operating point
 
-narinfo_timeout = "5s"             # hedge deadline CAP (actual deadline adapts to observed RTT)
-negative_ttl = "30s"
+narinfo_timeout = "5s"             # cap on small mesh requests (manifest fetches)
 stall_timeout = "60s"              # give up when NO bytes arrive for this long
 
 min_bandwidth = "0"                # give-up floor, off by default; e.g. "1MiB" to forfeit hopeless
@@ -368,7 +422,7 @@ breaker_failures = 3
 breaker_cooldown = "15s"
 
 [[peers]]
-name = "server"
+name = "server"                    # MUST equal that node's own `name`
 url = "http://100.64.0.2:5050"     # encoding defaults to "auto" (goodput-tiered zstd level)
 
 [[peers]]
@@ -379,8 +433,10 @@ encoding = "zstd:9"                # manual override when you know better than a
 ```
 
 MW constants are **not** configurable — the propnix-proven values live in code. Sizes/durations
-parse human units (`byte-unit`, `humantime-serde`). `[serve]` or `[proxy]` is omittable: serve-only
-(always-on host) and proxy-only (Steam Frame) deployments are both legitimate.
+parse human units (`byte-unit`, `humantime-serde`). Every node runs both roles and lists every
+other node (the mesh is a configured full graph — transitivity covers unreachable peers, not
+unconfigured ones); `[serve]`/`[proxy]` remain individually omittable for exotic cases, at the
+cost of not exporting / not consuming respectively.
 
 ## Crate layout
 
@@ -398,23 +454,30 @@ src/
   manifest.rs    manifest (de)serialization; segment coalescing for remote requests
   serve.rs       serve listener: nix-cache-info, narinfo-from-db, ranged/zstd NAR, manifest
   narinfo.rs     parse/serialize/rewrite narinfo (tiny line format, hand-rolled)
-  peers.rs       reqwest client pool, circuit breakers, hedge-deadline tracking, health state
+  sig.rs         nix binary-cache signature verification (ed25519 over the fingerprint);
+                 trust-anchor loading from /etc/nix/nix.conf
+  index.rs       the replicated mesh index: sqlite at /var/cache/narshare, per-origin journals,
+                 watermarks, snapshots, generations, feasibility, own-db differ, GC
+  sync.rs        sync endpoints (pull + hint) and the background loops (per-peer pulls, hint
+                 fan-out, inotify-triggered own-db export)
+  peers.rs       reqwest client pool, circuit breakers, sync/manifest/chunk requests
   pool.rs        MW pool — lifted from propnix hosts.rs (same author; add provenance note)
   governor.rs    per-peer stream-count hill climber — adapted from propnix pin/concurrency.rs
   dedup.rs       occurrence planner — lifted from propnix pin/dedup.rs (budgeted retention)
-  engine.rs      chunk queue + ordered emitter — adapted from propnix engine.rs (byte-based stall)
   fetch.rs       one NAR reconstruction: planner (local/replay/remote), adaptive chunking, window,
                  hashing, give-up
-  proxy.rs       proxy listener: bounded/coalesced fan-out, negative cache, handoff to fetch.rs
+  proxy.rs       proxy listener: local index lookups, handoff to fetch.rs
+proto/mesh.proto the sync wire format — protobuf so mixed narshare versions interoperate
+                 across a rolling mesh upgrade
 ```
 
 Deps: `tokio`, `axum` (or bare `hyper`), `reqwest` (plain HTTP only — no TLS is compiled in;
 peers live inside the mesh, whose transport is the mesh's own encryption, and integrity comes
-from content addressing; https peer URLs are rejected at config validation), `rusqlite`, `zstd`,
-`blake3`, `sha2`,
+from content addressing; https peer URLs are rejected at config validation), `rusqlite` (Nix's
+db read-only, plus narshare's own index db), `zstd`, `blake3`, `sha2`, `prost` (+`protoc` at
+build time), `ed25519-compact`, `inotify`,
 `clap` (derive), `serde`, `toml`, `tracing`/`tracing-subscriber`, `anyhow`, `humantime-serde`,
-`byte-unit`. narshare owns no database: `rusqlite` exists solely to read Nix's own db read-only,
-and narshare has no on-disk artifacts at all. (snix's
+`byte-unit`. (snix's
 `nix-compat` crate is the fallback for narinfo/NAR/store-path formats if hand-rolling grates, but
 the seek table and manifest want their own walk anyway and the formats are small.)
 
@@ -472,7 +535,9 @@ the module.
   hardware recorded in `docs/perf.md`.
 * **M2 — proxy passthrough.** One peer, no striping: fan-out of one, URL rewrite, negative cache.
   End-to-end `nix build` through the proxy.
-* **M3 — fan-out + resilience.** Bounded/coalesced parallel narinfo hedging with adaptive deadlines,
+* **M3 — fan-out + resilience.** (Lookup machinery later SUPERSEDED by M8's replicated index —
+  hedging, coalescing, negative cache, and NAR discovery were deleted; breakers and the
+  byte-progress stall survive.) Bounded/coalesced parallel narinfo hedging with adaptive deadlines,
   circuit breakers, byte-progress stall give-up on single-source streams. Kill-a-peer-mid-lookup
   works.
 * **M4 — striping + MW + governor + wire compression.** Adaptive chunk sizing, per-chunk zstd with
@@ -496,7 +561,15 @@ the module.
   false-fires, auto-encoding lands at high zstd. `[io] concurrency`, chunk targets, and encoding
   tiers swept and recorded in `docs/perf.md` so the defaults are measured, not guessed.
 * **M6 — observability.** `tracing` spans per fetch; `/metrics` (per-peer weight, goodput, governor
-  operating point, breaker state, replay/remote byte split — the fun dashboard).
+  operating point, breaker state, replay/remote byte split, index size + sync watermarks — the
+  fun dashboard).
+* **M8 — the replicated mesh index.** Feasible-narinfo catalog with holder tracking, per-origin
+  journals with watermark-ack compaction and snapshot recovery, generations, hint+pull
+  propagation (transitive), inotify-triggered own-db export, /var/cache/narshare persistence,
+  protobuf wire format. Local-only lookups replace the M3 fan-out. Acceptance: unit-level
+  protocol tests (LWW, orphan GC, idempotent replay, gap→snapshot, generation bump, compaction
+  gating, departed-origin reaping, transitive relay) plus the VM suite's distributed-systems
+  scenarios (partitions, restarts, cache loss, GC propagation).
 * **M7 — NixOS module + VM test.** Three-node `nixosTest`, every node running only narshare: A and B
   hold a synthetic 100 MiB FOD and serve; C proxies both, `nix build`s the FOD via the proxy with no
   trusted keys; assert substitution, then stop A mid-second-build and assert completion via B.

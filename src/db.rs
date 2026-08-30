@@ -11,6 +11,12 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
+/// A malformed row in the Nix db (unsupported hash algo, missing narSize) is skipped, not
+/// fatal: one odd row must not stop the mesh differ from exporting the other 17k.
+fn warn_once(e: &anyhow::Error) {
+    tracing::warn!("skipping malformed nix-db row: {e:#}");
+}
+
 #[derive(Debug, Clone)]
 pub struct PathInfo {
     /// Full store path.
@@ -129,6 +135,51 @@ impl StoreDb {
         .transpose()
     }
 
+    /// Every valid store path — the mesh-index differ's view of what we currently hold.
+    pub fn all_paths(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached("SELECT path FROM ValidPaths")?;
+        let v = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(v)
+    }
+
+    /// Rows that could be mesh-feasible (CA, or carrying signatures), with references — the
+    /// candidate set the index differ exports from. Signature validity is the caller's check.
+    pub fn feasible_candidates(&self) -> Result<Vec<PathInfo>> {
+        type Row = (i64, String, String, Option<i64>, Option<String>, Option<String>, Option<String>);
+        let conn = self.conn.lock().unwrap();
+        let rows: Vec<Row> = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, path, hash, narSize, deriver, sigs, ca FROM ValidPaths \
+                 WHERE (sigs IS NOT NULL AND sigs != '') OR (ca IS NOT NULL AND ca != '')",
+            )?;
+            let v = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            v
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, path, hash, sz, drv, sigs, ca) in rows {
+            match Self::info_from_row(&conn, id, path, hash, sz, drv, sigs, ca) {
+                Ok(info) => out.push(info),
+                Err(e) => warn_once(&e),
+            }
+        }
+        Ok(out)
+    }
+
     /// Look up by NAR hash (nar request). The hash column is unindexed, so this scans; callers
     /// cache the result per narhash, and one scan per NAR transfer is noise next to the transfer.
     pub fn by_nar_hash(&self, nar_hash: &[u8; 32]) -> Result<Option<PathInfo>> {
@@ -206,6 +257,12 @@ pub mod tests {
         let conn = Connection::open(db).unwrap();
         conn.execute("UPDATE ValidPaths SET sigs = ?2 WHERE path = ?1", rusqlite::params![path, sigs])
             .unwrap();
+    }
+
+    /// Simulate a GC: drop a row from the fake db.
+    pub fn delete_path(db: &Path, path: &str) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute("DELETE FROM ValidPaths WHERE path = ?1", [path]).unwrap();
     }
 
     #[test]

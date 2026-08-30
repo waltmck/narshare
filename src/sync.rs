@@ -1,0 +1,342 @@
+//! The mesh-index sync subsystem: two endpoints on the serve listener, one pull client, and
+//! three background loops.
+//!
+//! Pull is the ONLY data path. A node that has news sends a tiny hint ("pull from me"); pulls
+//! carry the puller's full watermark vector, which doubles as the ack stream that lets journals
+//! compact (index.rs). Pulls that insert nothing trigger no further hints, so hint cascades
+//! terminate exactly when the mesh has converged; pulls that do insert re-hint, which is what
+//! makes propagation transitive.
+//!
+//! The own-db loop is the exporting half: an inotify watch on the Nix database directory (every
+//! registration and GC touches the WAL) triggers a debounced diff of the Nix db against our
+//! indexed self-holdings, emitting add/remove events to our own journal — with a timer fallback
+//! where inotify is unavailable.
+
+use crate::db::StoreDb;
+use crate::index::{proto, Apply, Index};
+use crate::peers::Peers;
+use anyhow::{bail, Context, Result};
+use axum::extract::State;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::Router;
+use prost::Message as _;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, info, warn};
+
+/// Fallback pull cadence when no hints arrive. Also the reconvergence bound after a partition
+/// heals with no new writes (hints only fire on changes) — and an up-to-date round trip is
+/// under a kilobyte, so a tight timer costs nothing even on cellular.
+const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Own-db diff cadence when inotify is unavailable (and the safety-net re-scan besides).
+const OWN_DB_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Quiet time after an inotify burst before diffing (a closure registration is many rows).
+const OWN_DB_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(2000);
+/// Outbound hint debounce.
+const HINT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Sync request body cap (a clock vector is tiny).
+const REQUEST_CAP: usize = 1 << 20;
+/// Truncated-suffix pull rounds before giving up until the next trigger.
+const MAX_ROUNDS: usize = 64;
+
+pub struct Sync {
+    pub index: Arc<Index>,
+    pub peers: Arc<Peers>,
+    /// The exporting half; None on a node with no [serve] (consume-only).
+    db: Option<Arc<StoreDb>>,
+    nix_db_dir: Option<PathBuf>,
+    kicks: Vec<mpsc::Sender<()>>,
+    kick_rxs: std::sync::Mutex<Vec<Option<mpsc::Receiver<()>>>>,
+    hint_tx: mpsc::Sender<()>,
+    hint_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl Sync {
+    pub fn new(
+        index: Arc<Index>,
+        peers: Arc<Peers>,
+        db: Option<Arc<StoreDb>>,
+        nix_db_dir: Option<PathBuf>,
+    ) -> Arc<Self> {
+        let n = peers.list.len();
+        let mut kicks = Vec::with_capacity(n);
+        let mut kick_rxs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (tx, rx) = mpsc::channel(1);
+            kicks.push(tx);
+            kick_rxs.push(Some(rx));
+        }
+        let (hint_tx, hint_rx) = mpsc::channel(1);
+        Arc::new(Self {
+            index,
+            peers,
+            db,
+            nix_db_dir,
+            kicks,
+            kick_rxs: std::sync::Mutex::new(kick_rxs),
+            hint_tx,
+            hint_rx: std::sync::Mutex::new(Some(hint_rx)),
+        })
+    }
+
+    pub fn router(self: &Arc<Self>) -> Router {
+        Router::new()
+            .route("/narshare/v1/sync", post(handle_sync))
+            .route("/narshare/v1/sync-hint", post(handle_hint))
+            .with_state(self.clone())
+    }
+
+    /// One full sync with a peer: pull journal suffixes / snapshots for every origin until
+    /// nothing is truncated. Returns whether anything changed locally.
+    pub async fn pull_from(&self, idx: usize) -> Result<bool> {
+        let mut changed_any = false;
+        for _ in 0..MAX_ROUNDS {
+            let req = proto::SyncRequest {
+                requester: self.index.self_name.clone(),
+                have: self.index.clock_vector()?,
+            };
+            let resp = self.peers.sync_pull(idx, &req).await?;
+            let expect = &self.peers.list[idx].name;
+            if &resp.responder != expect {
+                bail!(
+                    "peer at {} identifies as {:?} but this config names it {:?} — origin \
+                     names must agree mesh-wide",
+                    self.peers.list[idx].base,
+                    resp.responder,
+                    expect
+                );
+            }
+            let mut truncated = false;
+            for up in resp.origins {
+                if up.origin == self.index.self_name || !self.index.is_known_origin(&up.origin)
+                {
+                    continue; // only we author our own set; unknown origins are rejected
+                }
+                let index = self.index.clone();
+                let origin = up.origin.clone();
+                let out = tokio::task::spawn_blocking(move || -> Result<(bool, bool)> {
+                    match up.body {
+                        None | Some(proto::origin_update::Body::UpToDate(_)) => {
+                            Ok((false, false))
+                        }
+                        Some(proto::origin_update::Body::Suffix(sfx)) => {
+                            match index.apply_suffix(&origin, up.generation, &sfx.events)? {
+                                Apply::Applied(n) => Ok((n > 0, up.truncated)),
+                                Apply::NeedSnapshot => {
+                                    // Shouldn't happen against a consistent responder (it
+                                    // decides suffix-vs-snapshot from OUR clock); recover on a
+                                    // later pull rather than looping here.
+                                    warn!("origin {origin}: suffix did not connect to our state");
+                                    Ok((false, false))
+                                }
+                            }
+                        }
+                        Some(proto::origin_update::Body::Snapshot(snap)) => {
+                            let n =
+                                index.apply_snapshot(&origin, up.generation, up.seq, &snap.held)?;
+                            debug!("origin {origin}: snapshot applied ({n} rows)");
+                            Ok((true, false))
+                        }
+                    }
+                })
+                .await
+                .expect("apply task panicked")?;
+                changed_any |= out.0;
+                truncated |= out.1;
+            }
+            if !truncated {
+                break;
+            }
+        }
+        Ok(changed_any)
+    }
+
+    /// Diff the Nix db against our indexed self-holdings once (the exporting half).
+    pub async fn export_own_db(&self) -> Result<usize> {
+        let Some(db) = self.db.clone() else { return Ok(0) };
+        let index = self.index.clone();
+        tokio::task::spawn_blocking(move || index.sync_own_db(&db))
+            .await
+            .expect("differ task panicked")
+    }
+
+    /// Nudge every peer to pull from us (debounced by the hint loop).
+    pub fn hint_peers(&self) {
+        let _ = self.hint_tx.try_send(());
+    }
+
+    pub fn spawn_loops(self: &Arc<Self>, shutdown: watch::Receiver<()>) {
+        // Per-peer pull loops.
+        let rxs = std::mem::take(&mut *self.kick_rxs.lock().unwrap());
+        for (idx, rx) in rxs.into_iter().enumerate() {
+            let Some(rx) = rx else { continue };
+            tokio::spawn(self.clone().peer_loop(idx, rx, shutdown.clone()));
+        }
+        // The hint fan-out loop.
+        if let Some(rx) = self.hint_rx.lock().unwrap().take() {
+            tokio::spawn(self.clone().hint_loop(rx, shutdown.clone()));
+        }
+        // The own-db exporter.
+        tokio::spawn(self.clone().own_db_loop(shutdown));
+    }
+
+    async fn peer_loop(
+        self: Arc<Self>,
+        idx: usize,
+        mut kick: mpsc::Receiver<()>,
+        mut shutdown: watch::Receiver<()>,
+    ) {
+        loop {
+            if self.peers.list[idx].available() {
+                match self.pull_from(idx).await {
+                    Ok(true) => self.hint_peers(), // news travels transitively
+                    Ok(false) => {}
+                    Err(e) => debug!("sync with {}: {e:#}", self.peers.list[idx].name),
+                }
+            }
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = tokio::time::sleep(SYNC_INTERVAL) => {}
+                Some(()) = kick.recv() => {
+                    // Let a hint burst settle into one pull.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    while kick.try_recv().is_ok() {}
+                }
+            }
+        }
+    }
+
+    async fn hint_loop(
+        self: Arc<Self>,
+        mut rx: mpsc::Receiver<()>,
+        mut shutdown: watch::Receiver<()>,
+    ) {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                msg = rx.recv() => {
+                    if msg.is_none() { return; }
+                    tokio::time::sleep(HINT_DEBOUNCE).await;
+                    while rx.try_recv().is_ok() {}
+                    for idx in 0..self.peers.list.len() {
+                        self.peers.hint(idx, &self.index.self_name).await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn own_db_loop(self: Arc<Self>, mut shutdown: watch::Receiver<()>) {
+        if self.db.is_none() {
+            return;
+        }
+        // inotify on the Nix db directory: registrations and GC both touch the WAL. Watch the
+        // DIRECTORY — the -wal file itself is checkpointed away and recreated.
+        let mut events = self.nix_db_dir.as_ref().and_then(|dir| {
+            let inotify = inotify::Inotify::init().ok()?;
+            inotify
+                .watches()
+                .add(
+                    dir,
+                    inotify::WatchMask::MODIFY
+                        | inotify::WatchMask::CREATE
+                        | inotify::WatchMask::DELETE
+                        | inotify::WatchMask::MOVED_TO,
+                )
+                .ok()?;
+            let stream = inotify.into_event_stream(vec![0u8; 4096]).ok()?;
+            info!("mesh index: watching {} for store changes", dir.display());
+            Some(stream)
+        });
+        if events.is_none() {
+            info!("mesh index: inotify unavailable; polling every {OWN_DB_INTERVAL:?}");
+        }
+        loop {
+            match self.export_own_db().await {
+                Ok(n) if n > 0 => {
+                    info!("mesh index: exported {n} local change(s)");
+                    self.hint_peers();
+                }
+                Ok(_) => {}
+                Err(e) => warn!("mesh index: own-db diff failed: {e:#}"),
+            }
+            // Wait for the next trigger, then let the burst go quiet.
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = tokio::time::sleep(OWN_DB_INTERVAL) => {}
+                _ = async {
+                    if let Some(s) = events.as_mut() {
+                        use tokio_stream::StreamExt as _;
+                        let _ = s.next().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    tokio::time::sleep(OWN_DB_DEBOUNCE).await;
+                    if let Some(s) = events.as_mut() {
+                        use tokio_stream::StreamExt as _;
+                        while let Ok(Some(_)) =
+                            tokio::time::timeout(std::time::Duration::from_millis(1), s.next())
+                                .await
+                        {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_sync(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> Response {
+    if body.len() > REQUEST_CAP {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let Ok(req) = proto::SyncRequest::decode(&body[..]) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if req.requester == s.index.self_name || !s.index.is_known_origin(&req.requester) {
+        warn!("sync request from unknown node {:?} refused", req.requester);
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let index = s.index.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        // The request's clock vector IS the ack stream: record it, then answer, then use the
+        // fresh watermarks to compact opportunistically.
+        index.record_watermarks(&req.requester, &req.have)?;
+        let origins = index.respond(&req)?;
+        let resp =
+            proto::SyncResponse { responder: index.self_name.clone(), origins };
+        let z = zstd::stream::encode_all(&resp.encode_to_vec()[..], 3)
+            .context("compressing sync response")?;
+        index.compact()?;
+        Ok(z)
+    })
+    .await
+    .expect("sync respond task panicked");
+    match out {
+        Ok(z) => (
+            [(header::CONTENT_TYPE, "application/x-narshare-sync")],
+            z,
+        )
+            .into_response(),
+        Err(e) => {
+            warn!("sync response failed: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "sync failed\n").into_response()
+        }
+    }
+}
+
+async fn handle_hint(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> StatusCode {
+    if body.len() > 4096 {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+    let Ok(hint) = proto::SyncHint::decode(&body[..]) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if let Some(idx) = s.peers.idx_of(&hint.from) {
+        let _ = s.kicks[idx].try_send(());
+    }
+    StatusCode::OK
+}

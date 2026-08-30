@@ -1,6 +1,7 @@
 # NixOS module, modeled on nixpkgs' wgautomesh module: enable/package/logLevel plus a freeform
-# TOML `config` rendered verbatim. The daemon is stateless (reads /nix/store and the Nix db only),
-# so the unit gets strict hardening and no writable paths.
+# TOML `config` rendered verbatim. The daemon reads /nix/store and the Nix db (both read-only)
+# and writes only the disposable mesh index under /var/cache/narshare, so the unit gets strict
+# hardening with a single CacheDirectory.
 self:
 { config, lib, pkgs, ... }:
 let
@@ -69,7 +70,10 @@ in
         Restart = "on-failure";
         RestartSec = 2;
 
-        # Stateless: no writable paths at all.
+        # The one writable path: the mesh index at /var/cache/narshare — state the daemon can
+        # always afford to lose (self-verifying, re-learnable; loss bumps the node's sync
+        # generation so peers snapshot it back up).
+        CacheDirectory = "narshare";
         DynamicUser = true;
         ProtectSystem = "strict";
         ProtectHome = true;

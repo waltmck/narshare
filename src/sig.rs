@@ -30,10 +30,25 @@ impl TrustedKeys {
         Self { keys: Vec::new() }
     }
 
+    /// The mesh trust anchor: explicit config, else the local nix.conf — the same list the
+    /// consuming nix will enforce at ingestion. Empty (explicitly, or because nix.conf is
+    /// unreadable) means only content-addressed paths are feasible.
+    pub fn load(explicit: &Option<Vec<String>>) -> Self {
+        match explicit {
+            Some(list) => Self::parse(list),
+            None => Self::from_nix_conf(Path::new("/etc/nix/nix.conf")).unwrap_or_else(|e| {
+                warn!("/etc/nix/nix.conf is unreadable ({e}); CA paths only");
+                Self::none()
+            }),
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.keys.len()
     }

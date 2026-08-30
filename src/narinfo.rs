@@ -45,6 +45,8 @@ pub fn format_narinfo(info: &PathInfo, store_dir: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct RemoteNarinfo {
     pub store_path: String,
+    /// Retained for protocol completeness; index-composed narinfos are always "none".
+    #[allow(dead_code)]
     pub compression: String,
     pub nar_hash: [u8; 32],
     pub nar_size: u64,
@@ -58,6 +60,9 @@ pub struct RemoteNarinfo {
     pub sigs: Vec<String>,
 }
 
+/// Parse a peer-format narinfo. The proxy no longer consumes these (lookups are index-local);
+/// kept for the format's own round-trip tests, which pin what we SERVE.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_narinfo(text: &str) -> Result<RemoteNarinfo> {
     let mut store_path = None;
     let mut url_seen = false;
@@ -94,11 +99,7 @@ pub fn parse_narinfo(text: &str) -> Result<RemoteNarinfo> {
             }
             "Deriver" => deriver = Some(value.to_owned()).filter(|d| !d.is_empty()),
             "CA" => ca = Some(value.to_owned()).filter(|c| !c.is_empty()),
-            "Sig" => {
-                if !value.is_empty() {
-                    sigs.push(value.to_owned());
-                }
-            }
+            "Sig" if !value.is_empty() => sigs.push(value.to_owned()),
             // URL value, FileHash, FileSize, unknown keys: ignored.
             _ => {}
         }
