@@ -51,6 +51,7 @@ async fn status(State(ctx): State<Arc<StatusCtx>>) -> Response {
             .map(|(i, p)| {
                 let b = p.breaker_status();
                 let (rate, level, inflight, limit) = st.fetch.peer_net_status(i);
+                let (chunks_ok, chunks_err, bytes) = st.fetch.peer_tally(i);
                 serde_json::json!({
                     "name": p.name,
                     "url": p.base.as_str(),
@@ -59,6 +60,9 @@ async fn status(State(ctx): State<Arc<StatusCtx>>) -> Response {
                     "mw_weight": weights.get(i).copied().unwrap_or(1.0),
                     "rate_bps": rate,
                     "auto_zstd_level": level,
+                    "chunks_ok": chunks_ok,
+                    "chunks_err": chunks_err,
+                    "bytes_fetched": bytes,
                     "streams": { "inflight": inflight, "limit": limit },
                     "breaker": {
                         "strikes": b.strikes,

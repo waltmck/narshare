@@ -226,11 +226,21 @@ struct PeerNet {
     level: i32,
 }
 
+/// Cumulative per-peer decision tallies — the observables regret accounting needs: every chunk
+/// the scheduler routed to this peer, split by outcome, plus the bytes that came back.
+#[derive(Default)]
+pub struct PeerTally {
+    pub chunks_ok: AtomicU64,
+    pub chunks_err: AtomicU64,
+    pub bytes: AtomicU64,
+}
+
 /// Everything the striped fetches share across transfers.
 pub struct FetchCtx {
     pub pool: crate::pool::HostPool,
     limits: Vec<PeerLimit>,
     net: Vec<Mutex<PeerNet>>,
+    tally: Vec<PeerTally>,
     encodings: Vec<String>,
     pub stats: Stats,
     /// Pinged whenever a stream slot frees anywhere, so a capacity-starved transfer relaunches
@@ -255,6 +265,7 @@ impl FetchCtx {
             net: (0..n)
                 .map(|_| Mutex::new(PeerNet { rate: 0.0, level: ENC_SEED }))
                 .collect(),
+            tally: (0..n).map(|_| PeerTally::default()).collect(),
             encodings: peer_cfgs.iter().map(|p| p.encoding.clone()).collect(),
             stats: Stats::default(),
             slot_freed: tokio::sync::Notify::new(),
@@ -367,6 +378,16 @@ impl FetchCtx {
         let net = self.net[peer].lock().unwrap();
         let (inflight, limit) = self.limits[peer].snapshot();
         (net.rate, net.level, inflight, limit)
+    }
+
+    /// (chunks_ok, chunks_err, bytes fetched) routed to this peer since startup.
+    pub fn peer_tally(&self, peer: usize) -> (u64, u64, u64) {
+        let t = &self.tally[peer];
+        (
+            t.chunks_ok.load(Ordering::Relaxed),
+            t.chunks_err.load(Ordering::Relaxed),
+            t.bytes.load(Ordering::Relaxed),
+        )
     }
 
     pub fn roaming_ms_remaining(&self) -> Option<u64> {
@@ -1006,6 +1027,8 @@ pub async fn run_transfer(
                             ctx.record_rate(done.peer, done.len, done.elapsed);
                             ctx.observe_encoding(done.peer, done.elapsed, &chunk);
                         }
+                        ctx.tally[done.peer].chunks_ok.fetch_add(1, Ordering::Relaxed);
+                        ctx.tally[done.peer].bytes.fetch_add(done.len, Ordering::Relaxed);
                         ctx.limits[done.peer].observe(true, done.len);
                         // An epoch close may have RAISED the limit — capacity without a release.
                         ctx.slot_freed.notify_waiters();
@@ -1070,6 +1093,7 @@ pub async fn run_transfer(
                     }
                     Err(e) => {
                         debug!("chunk @{} from peer {} failed: {e:#}", done.off, done.peer);
+                        ctx.tally[done.peer].chunks_err.fetch_add(1, Ordering::Relaxed);
                         ctx.pool.record_failure(done.peer);
                         ctx.limits[done.peer].observe(false, 0);
                         // A chunk that died on its deadline BEFORE any completion means the

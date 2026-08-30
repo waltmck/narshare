@@ -377,6 +377,32 @@ in
     timed_fetch("striped again after proxy restart", nar_url, nar_size, sha_hex)
 
     # =====================================================================================
+    # Empirical MW regret probe on the shaped topology (precise numbers live in the
+    # in-process bench, mw_regret_*; this is the same accounting on real netem links).
+    # Ground truth: alpha is strictly fastest, so its hindsight share should dominate and
+    # the thin 20 Mbit peer's byte share should sit near its tiny capacity share, not at
+    # a slot-fallback plateau.
+    # =====================================================================================
+    def peer_split(machine):
+        return {
+            p["name"]: (p["chunks_ok"], p["chunks_err"], p["bytes_fetched"])
+            for p in status(machine)["proxy"]["peers"]
+        }
+    pre_split = peer_split(client)
+    t_probe = 0.0
+    for _ in range(3):
+        secs, _ = timed_fetch("regret probe (fast+thin+noisy)", nar_url, nar_size, sha_hex)
+        t_probe += secs
+    post_split = peer_split(client)
+    d = {n: tuple(b - a for a, b in zip(pre_split[n], post_split[n])) for n in pre_split}
+    tot = max(sum(v[2] for v in d.values()), 1)
+    shares = {n: 100.0 * v[2] / tot for n, v in d.items()}
+    print(f"[regret] VM deltas (ok, err, bytes): {d}")
+    print("[regret] VM byte shares: " + ", ".join(f"{n}={s:.1f}%" for n, s in shares.items()))
+    print(f"[regret] VM 3 striped fetches: {t_probe:.2f}s wall")
+    assert shares.get("beta", 0.0) < 40.0, f"thin-peer byte share out of control: {shares}"
+
+    # =====================================================================================
     # Partition: beta drops off entirely. The mesh keeps moving; divergent writes on both
     # sides of the cut converge after the heal.
     # =====================================================================================

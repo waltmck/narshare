@@ -558,6 +558,218 @@ mod tests {
         assert_eq!(miss.status(), 404);
     }
 
+    // ---------------------------------------------------------------------------------
+    // MW regret bench (ignored; run with: cargo test --release mw_regret -- --ignored
+    // --nocapture). A "fluid link" serializes every request through a shared byte rate, so
+    // concurrency cannot multiply capacity and the configured rates ARE the ground-truth
+    // counterfactuals classic regret needs.
+    // ---------------------------------------------------------------------------------
+
+    struct FluidLink {
+        rate: std::sync::atomic::AtomicU64,
+        next_free: tokio::sync::Mutex<tokio::time::Instant>,
+    }
+
+    impl FluidLink {
+        fn new(rate: u64) -> Arc<Self> {
+            Arc::new(Self {
+                rate: std::sync::atomic::AtomicU64::new(rate),
+                next_free: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            })
+        }
+    }
+
+    fn throttled_peer(link: Arc<FluidLink>, payload: bytes::Bytes) -> Router {
+        Router::new().route(
+            "/nar/{f}",
+            get(move |headers: HeaderMap| {
+                let link = link.clone();
+                let payload = payload.clone();
+                async move {
+                    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+                    let (start, end) = match parse_range(range, payload.len() as u64) {
+                        RangeSpec::Partial(s, e) => (s, e),
+                        _ => (0, payload.len() as u64),
+                    };
+                    let rate = link.rate.load(Ordering::Relaxed) as f64;
+                    let finish = {
+                        let mut nf = link.next_free.lock().await;
+                        let now = tokio::time::Instant::now();
+                        let begin = if *nf > now { *nf } else { now };
+                        let fin = begin
+                            + std::time::Duration::from_secs_f64((end - start) as f64 / rate);
+                        *nf = fin;
+                        fin
+                    };
+                    tokio::time::sleep_until(finish).await;
+                    Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .body(Body::from(payload.slice(start as usize..end as usize)))
+                        .unwrap()
+                }
+            }),
+        )
+    }
+
+    /// Seed one narinfo for `payload`, held by BOTH origins a and b. Returns the nar32 name.
+    fn seed_two_holders(client: &TestClient, payload: &bytes::Bytes, name: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let h: [u8; 32] = Sha256::digest(payload).into();
+        let ni = proto::Narinfo {
+            store_path: format!("/nix/store/{}-{name}", "r".repeat(32)),
+            nar_hash: h.to_vec(),
+            nar_size: payload.len() as u64,
+            references: vec![],
+            ca: "fixed:r:sha256:dummy".into(),
+            sigs: vec![],
+        };
+        client.index.apply_snapshot("a", 1, 1, std::slice::from_ref(&ni)).unwrap();
+        client.index.apply_snapshot("b", 1, 1, &[ni]).unwrap();
+        crate::nixbase32::encode(&h)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // measurement bench, not a correctness test
+    async fn mw_regret_sequential_and_tracking() {
+        const MB: u64 = 1_000_000;
+        let link_a = FluidLink::new(64 * MB);
+        let link_b = FluidLink::new(MB);
+        let payload = bytes::Bytes::from(vec![0x42u8; 256 * 1024]);
+        let url_a = spawn_router(throttled_peer(link_a.clone(), payload.clone())).await;
+        let url_b = spawn_router(throttled_peer(link_b.clone(), payload.clone())).await;
+        let client = spawn_client(
+            "c",
+            &[("a", &url_a), ("b", &url_b)],
+            "",
+            TrustedKeys::none(),
+        )
+        .await;
+        let nar32 = seed_two_holders(&client, &payload, "seq");
+        let http = reqwest::Client::new();
+        let url = format!("{}/nar/{nar32}.nar", client.url);
+        let tally = |i: usize| client.state.fetch.peer_tally(i);
+
+        // S1 — static 64:1, unsaturated (one decision per fetch): bandit decision regret
+        // against the hindsight-best peer, with ground-truth counterfactual losses.
+        const T1: usize = 300;
+        let mut picks_b_at = Vec::with_capacity(T1);
+        for _ in 0..T1 {
+            let b = http.get(&url).send().await.unwrap().bytes().await.unwrap();
+            assert_eq!(b.len(), payload.len());
+            picks_b_at.push(tally(1).0);
+        }
+        let (ok_a, err_a, _) = tally(0);
+        let (ok_b, err_b, _) = tally(1);
+        assert_eq!(err_a + err_b, 0, "the fluid links never fail");
+        assert_eq!((ok_a + ok_b) as usize, T1, "one decision per fetch");
+        let loss_b = 1.0 - 1.0 / 64.0;
+        let regret = ok_b as f64 * loss_b;
+        let hedge_ref = (T1 as f64 / 2.0 * 2f64.ln()).sqrt();
+        let first25 = picks_b_at[24];
+        let last100 = picks_b_at[T1 - 1] - picks_b_at[T1 - 101];
+        println!(
+            "[regret] S1 static 64:1 — T={T1}: slow-peer picks {ok_b} \
+             (first25={first25}, last100={last100})"
+        );
+        println!(
+            "[regret] S1 cumulative regret {regret:.1} (per-decision {:.4}) vs \
+             Hedge sqrt-ref {hedge_ref:.1}; exploration floor W_MIN≈0.03",
+            regret / T1 as f64
+        );
+        assert!(
+            (last100 as f64) < 15.0,
+            "steady-state slow share must sit near the exploration floor: {last100}/100"
+        );
+
+        // S2 — the links swap capabilities: tracking (the fixed-share raison d'être).
+        link_a.rate.store(MB, Ordering::Relaxed);
+        link_b.rate.store(64 * MB, Ordering::Relaxed);
+        const T2: usize = 300;
+        let (base_a, base_b) = (tally(0).0, tally(1).0);
+        let mut blocks = Vec::new();
+        let mut prev_b = base_b;
+        for i in 0..T2 {
+            http.get(&url).send().await.unwrap().bytes().await.unwrap();
+            if (i + 1) % 25 == 0 {
+                let nb = tally(1).0;
+                blocks.push(nb - prev_b);
+                prev_b = nb;
+            }
+        }
+        let stale_picks = tally(0).0 - base_a;
+        let flip = blocks
+            .iter()
+            .position(|&n| n >= 13)
+            .map(|i| (i + 1) * 25)
+            .unwrap_or(usize::MAX);
+        println!("[regret] S2 swap — new-best picks per 25-block: {blocks:?}");
+        println!(
+            "[regret] S2 majority flipped within ≤{flip} decisions; post-swap tracking \
+             regret {:.1} ({stale_picks} stale picks of the collapsed peer)",
+            stale_picks as f64 * loss_b
+        );
+        let late: u64 = blocks[blocks.len() - 4..].iter().sum();
+        assert!(
+            late as f64 / 100.0 > 0.7,
+            "the pool must track the swap: new-best share in the last 100 was {late}/100"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // measurement bench, not a correctness test
+    async fn mw_regret_striped_skew() {
+        const MB: u64 = 1_000_000;
+        for (ra, rb, tag) in [(64 * MB, MB, "64:1"), (32 * MB, 8 * MB, "4:1")] {
+            let link_a = FluidLink::new(ra);
+            let link_b = FluidLink::new(rb);
+            let payload = bytes::Bytes::from(vec![(ra % 251) as u8; 32 * 1024 * 1024]);
+            let url_a = spawn_router(throttled_peer(link_a.clone(), payload.clone())).await;
+            let url_b = spawn_router(throttled_peer(link_b.clone(), payload.clone())).await;
+            let client = spawn_client(
+                "c",
+                &[("a", &url_a), ("b", &url_b)],
+                "",
+                TrustedKeys::none(),
+            )
+            .await;
+            let nar32 = seed_two_holders(&client, &payload, "striped");
+            let http = reqwest::Client::new();
+            let t0 = Instant::now();
+            let body = http
+                .get(format!("{}/nar/{nar32}.nar", client.url))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let wall = t0.elapsed().as_secs_f64();
+            assert_eq!(body.len(), payload.len());
+            let size_mb = payload.len() as f64 / MB as f64;
+            let achieved = size_mb / wall;
+            let (_, _, bytes_a) = client.state.fetch.peer_tally(0);
+            let (_, _, bytes_b) = client.state.fetch.peer_tally(1);
+            let share_b = 100.0 * bytes_b as f64 / (bytes_a + bytes_b) as f64;
+            let single = ra as f64 / MB as f64;
+            let sum = (ra + rb) as f64 / MB as f64;
+            println!(
+                "[regret] S3 striped {tag}: {achieved:.1} MB/s (wall {wall:.2}s) vs \
+                 single-best {single:.0} / capacity-sum {sum:.0} MB/s; slow byte share \
+                 {share_b:.1}%; time regret vs single-best {:+.2}s",
+                wall - size_mb / single
+            );
+            // MEASURED DEFICIENCY (documented in docs/regret.md): at extreme skew the
+            // work-conserving slot fallback keeps the slow peer's queue full, and its
+            // in-flight chunks gate completion — 64:1 measures ~0.06× single-best. This
+            // guard only catches a further collapse; tightening it is the acceptance test
+            // for any future straggler mitigation (tail re-dispatch/hedging).
+            assert!(
+                achieved > 0.04 * single,
+                "{tag}: striped completion collapsed even below the known deficiency"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn status_endpoint_reports_the_whole_story() {
         let dir = tempfile::tempdir().unwrap();
