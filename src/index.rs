@@ -36,6 +36,14 @@ pub mod proto {
 const JOURNAL_BACKSTOP: u64 = 50_000;
 /// Suffix bytes per origin per sync response; more sets `truncated` and the puller loops.
 const SUFFIX_BYTES_CAP: usize = 8 << 20;
+/// Soft byte budget for one WHOLE sync response (suffix events + snapshot rows, encoded).
+/// Origins that would overflow it are deferred with an empty truncated suffix and picked up by
+/// the puller's truncated loop next round — without this, a response carrying several origins'
+/// full snapshots (first contact with a mature mesh) can exceed the puller's hard caps
+/// (SYNC_CAP/SYNC_RAW_CAP in peers.rs) and every retry fails identically: a permanent wedge.
+/// A SINGLE origin's snapshot is never split (wipe-and-replace semantics), so one origin's
+/// holdings must stay under the puller's 256 MiB raw cap — ~600k paths, far past any real node.
+const RESPONSE_BYTES_CAP: usize = 24 << 20;
 /// Half-life of persisted MW weights: at load, each weight is pulled toward uniform (1.0) by
 /// 2^(-age/half_life) — an hour-old vector keeps ~97% of its shape, a week-old one ~1%
 /// (effectively fresh). The best-rate yardstick and mean-loss decay toward 0 the same way.
@@ -43,6 +51,8 @@ const MW_HALF_LIFE_SECS: f64 = 86_400.0;
 
 pub struct Index {
     conn: Mutex<Connection>,
+    /// Read-only sibling for lookups (see open()); never used for writes.
+    reader: Mutex<Connection>,
     pub self_name: String,
     /// Configured origin universe: self + peers. Anything else is rejected and reaped.
     origin_set: HashSet<String>,
@@ -76,7 +86,14 @@ impl Index {
         let conn = Connection::open(dir.join("index.db"))
             .with_context(|| format!("opening {}/index.db", dir.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // FULL, deliberately: the sync protocol treats every seq a peer has OBSERVED as
+        // permanent — with NORMAL, a power loss can revert the WAL past a seq a peer already
+        // pulled, and re-issuing those numbers with different events diverges that peer until
+        // the paths independently change. Write rate is one transaction per diff/apply, so the
+        // fsync is noise. (The pull-side self-clock regression check is the backstop for the
+        // same failure arriving via other roads, e.g. a restored disk image.)
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS origins (
@@ -144,7 +161,9 @@ impl Index {
         conn.execute(
             "INSERT INTO origins (name, generation, seq, tail_seq) VALUES (?1, ?2, 0, 0)
              ON CONFLICT (name) DO NOTHING",
-            params![self_name, self_gen],
+            // Through i64, like every other generation column access: the two's-complement
+            // round-trip preserves the full u64 range (rusqlite rejects raw u64 > i64::MAX).
+            params![self_name, self_gen as i64],
         )?;
         for p in peer_names {
             conn.execute(
@@ -171,8 +190,47 @@ impl Index {
             }
         }
 
+        // A changed trust anchor voids every peer origin's clock: events applied under the old
+        // anchor may have been skipped as infeasible (they are journaled at their ORIGIN, not
+        // here), and a clock that already covers those seqs would answer "up to date" forever —
+        // re-adding a key must force full snapshots instead. Holders/narinfos stay (incoming
+        // snapshots wipe-replace them, and use-time feasibility keeps them honest meanwhile);
+        // the self origin needs nothing, because the own-db differ re-exports newly-feasible
+        // paths on its own.
+        let anchor = trusted.anchor_digest();
+        let stored_anchor: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key = 'trust_anchor'", [], |r| r.get(0))
+            .optional()?;
+        if stored_anchor.as_deref() != Some(anchor.as_str()) {
+            if stored_anchor.is_some() {
+                info!("trust anchor changed: forcing a full resync of every peer origin");
+                conn.execute(
+                    "UPDATE origins SET generation = 0, seq = 0, tail_seq = 0 WHERE name != ?1",
+                    [self_name],
+                )?;
+                conn.execute("DELETE FROM journal WHERE origin != ?1", [self_name])?;
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('trust_anchor', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [&anchor],
+            )?;
+        }
+
+        // A read-only sibling connection for the hot lookups: WAL gives it snapshot reads
+        // while a sync apply holds the writer, so narinfo/nar latency is independent of how
+        // busy the mesh is. (A single shared connection behind one Mutex would forfeit
+        // exactly that property.)
+        let reader = Connection::open_with_flags(
+            dir.join("index.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening {}/index.db read-only", dir.display()))?;
+        reader.busy_timeout(std::time::Duration::from_secs(5))?;
+
         Ok(Self {
             conn: Mutex::new(conn),
+            reader: Mutex::new(reader),
             self_name: self_name.to_owned(),
             origin_set,
             peer_names: peer_names.to_vec(),
@@ -197,8 +255,10 @@ impl Index {
     }
 
     /// Our full clock vector, for sync requests (doubles as the ack that drives compaction).
+    /// Served by the read-only connection: pull loops call this on the runtime, and it must
+    /// not queue behind a long apply transaction.
     pub fn clock_vector(&self) -> Result<Vec<proto::OriginClock>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader.lock().unwrap();
         let mut stmt = conn.prepare("SELECT name, generation, seq FROM origins")?;
         let v = stmt
             .query_map([], |r| {
@@ -241,15 +301,27 @@ impl Index {
     }
 
     /// Build the per-origin answer for a sync request: up-to-date, journal suffix, or snapshot.
+    /// Runs on the read-only connection inside one deferred transaction — a consistent WAL
+    /// snapshot, concurrent with (never behind) sync applies on the writer.
     pub fn respond(&self, req: &proto::SyncRequest) -> Result<Vec<proto::OriginUpdate>> {
+        self.respond_budgeted(req, RESPONSE_BYTES_CAP)
+    }
+
+    fn respond_budgeted(
+        &self,
+        req: &proto::SyncRequest,
+        budget: usize,
+    ) -> Result<Vec<proto::OriginUpdate>> {
         let have: HashMap<&str, &proto::OriginClock> =
             req.have.iter().map(|c| (c.origin.as_str(), c)).collect();
-        let conn = self.conn.lock().unwrap();
-        let origins: Vec<(String, i64, i64, i64)> = conn
-            .prepare("SELECT name, generation, seq, tail_seq FROM origins")?
+        let conn = self.reader.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let origins: Vec<(String, i64, i64, i64)> = tx
+            .prepare_cached("SELECT name, generation, seq, tail_seq FROM origins")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut out = Vec::new();
+        let mut used = 0usize;
         for (name, gen, seq, tail) in origins {
             let (gen, seq, tail) = (gen as u64, seq as u64, tail as u64);
             if gen == 0 {
@@ -261,14 +333,36 @@ impl Index {
             if their_gen > gen {
                 continue; // they are ahead of us on this origin; nothing useful from us
             }
-            let body = if their_gen == gen && their_seq >= seq {
-                proto::origin_update::Body::UpToDate(true)
-            } else if their_gen == gen && their_seq >= tail {
-                // Journal suffix (their_seq, ...], capped.
+            if their_gen == gen && their_seq >= seq {
+                out.push(proto::OriginUpdate {
+                    origin: name,
+                    generation: gen,
+                    seq,
+                    truncated: false,
+                    body: Some(proto::origin_update::Body::UpToDate(true)),
+                });
+                continue;
+            }
+            // This origin needs data. If the response is already at budget, defer it whole:
+            // an empty truncated suffix makes the puller come straight back for another round.
+            if used >= budget {
+                out.push(proto::OriginUpdate {
+                    origin: name,
+                    generation: gen,
+                    seq,
+                    truncated: true,
+                    body: Some(proto::origin_update::Body::Suffix(proto::Suffix {
+                        events: Vec::new(),
+                    })),
+                });
+                continue;
+            }
+            let body = if their_gen == gen && their_seq >= tail {
+                // Journal suffix (their_seq, ...], capped per origin and by the response budget.
                 let mut events = Vec::new();
                 let mut bytes = 0usize;
                 let mut truncated = false;
-                let mut stmt = conn.prepare_cached(
+                let mut stmt = tx.prepare_cached(
                     "SELECT seq, event FROM journal WHERE origin = ?1 AND seq > ?2 ORDER BY seq",
                 )?;
                 let mut rows = stmt.query(params![name, their_seq as i64])?;
@@ -283,6 +377,7 @@ impl Index {
                         proto::Event::decode(&blob[..]).context("corrupt journal event")?,
                     );
                 }
+                used += bytes;
                 let update = proto::OriginUpdate {
                     origin: name.clone(),
                     generation: gen,
@@ -294,9 +389,9 @@ impl Index {
                 continue;
             } else {
                 // Their watermark predates our tail, or their generation is stale: snapshot.
-                proto::origin_update::Body::Snapshot(proto::Snapshot {
-                    held: snapshot_tx(&conn, &name)?,
-                })
+                let held = snapshot_tx(&tx, &name)?;
+                used += held.iter().map(prost::Message::encoded_len).sum::<usize>();
+                proto::origin_update::Body::Snapshot(proto::Snapshot { held })
             };
             out.push(proto::OriginUpdate {
                 origin: name,
@@ -319,6 +414,16 @@ impl Index {
         if origin == self.self_name || !self.origin_set.contains(origin) {
             bail!("suffix for unexpected origin {origin:?}");
         }
+        // Feasibility (an ed25519 verify per signed add) needs no database: do it BEFORE
+        // taking the write lock, so a large apply cannot hold every other index user hostage
+        // for the crypto's duration.
+        let feasible: Vec<bool> = events
+            .iter()
+            .map(|e| match &e.op {
+                Some(proto::event::Op::Add(n)) => self.feasible(n),
+                _ => true,
+            })
+            .collect();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let (our_gen, mut our_seq): (u64, u64) = {
@@ -347,7 +452,7 @@ impl Index {
             }
         }
         let mut applied = 0usize;
-        for e in events {
+        for (e, feas) in events.iter().zip(&feasible) {
             if e.seq <= our_seq {
                 continue; // replay
             }
@@ -358,7 +463,7 @@ impl Index {
                 "INSERT OR REPLACE INTO journal (origin, seq, event) VALUES (?1, ?2, ?3)",
                 params![origin, e.seq as i64, e.encode_to_vec()],
             )?;
-            self.apply_op_tx(&tx, origin, e)?;
+            apply_op_tx(&tx, origin, e, *feas)?;
             our_seq = e.seq;
             applied += 1;
         }
@@ -381,23 +486,33 @@ impl Index {
         if origin == self.self_name || !self.origin_set.contains(origin) {
             bail!("snapshot for unexpected origin {origin:?}");
         }
+        // Verify outside the write lock (see apply_suffix) — this is the path where it matters
+        // most: a first-contact snapshot of a large signed origin is thousands of verifies.
+        let feasible: Vec<bool> = held.iter().map(|n| self.feasible(n)).collect();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let our_gen: u64 = tx
-            .query_row("SELECT generation FROM origins WHERE name = ?1", [origin], |r| {
-                r.get::<_, i64>(0).map(|g| g as u64)
-            })?;
-        if generation < our_gen {
-            return Ok(0); // stale relay
+        let (our_gen, our_seq): (u64, u64) = {
+            let (g, s): (i64, i64) = tx.query_row(
+                "SELECT generation, seq FROM origins WHERE name = ?1",
+                [origin],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            (g as u64, s as u64)
+        };
+        if generation < our_gen || (generation == our_gen && seq < our_seq) {
+            // Stale relay — including the concurrent-pull race where another peer's loop
+            // advanced this origin past `seq` while this snapshot was in flight; wiping to the
+            // older state would silently drop the newer events.
+            return Ok(0);
         }
         wipe_origin_tx(&tx, origin)?;
         let mut inserted = 0usize;
-        for n in held {
-            if !self.feasible(n) {
+        for (n, feas) in held.iter().zip(&feasible) {
+            if !feas {
                 debug!("snapshot of {origin}: skipping infeasible {}", n.store_path);
                 continue;
             }
-            self.hold_tx(&tx, origin, n)?;
+            hold_tx(&tx, origin, n)?;
             inserted += 1;
         }
         // We have state as of `seq` but no journal history: suffixes we can serve start there.
@@ -409,159 +524,124 @@ impl Index {
         Ok(inserted)
     }
 
-    fn apply_op_tx(&self, tx: &Connection, origin: &str, e: &proto::Event) -> Result<()> {
-        match &e.op {
-            Some(proto::event::Op::Add(n)) => {
-                if self.feasible(n) {
-                    self.hold_tx(tx, origin, n)?;
-                } else {
-                    // Journaled verbatim for faithful relay, but never enters our tables.
-                    debug!("origin {origin}: infeasible add for {} ignored", n.store_path);
-                    unhold_tx(tx, origin, &n.store_path)?;
-                }
-            }
-            Some(proto::event::Op::Remove(path)) => unhold_tx(tx, origin, path)?,
-            None => {}
-        }
-        Ok(())
-    }
-
-    /// Upsert the narinfo row (merging signatures) and point `origin`'s holding at it.
-    fn hold_tx(&self, tx: &Connection, origin: &str, n: &proto::Narinfo) -> Result<()> {
-        let hash_part = n
-            .store_path
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .get(..32)
-            .unwrap_or("")
-            .to_owned();
-        let refs = n.references.join(" ");
-        let existing: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT id, sigs FROM narinfos WHERE store_path = ?1 AND nar_hash = ?2",
-                params![n.store_path, n.nar_hash],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let id = match existing {
-            Some((id, sigs)) => {
-                // Merge signatures: different origins may have retained different sig sets.
-                let mut set: Vec<&str> = sigs.split_whitespace().collect();
-                for s in &n.sigs {
-                    if !set.contains(&s.as_str()) {
-                        set.push(s);
-                    }
-                }
-                tx.execute(
-                    "UPDATE narinfos SET sigs = ?2 WHERE id = ?1",
-                    params![id, set.join(" ")],
-                )?;
-                id
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO narinfos (hash_part, store_path, nar_hash, nar_size, refs, ca, sigs)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        hash_part,
-                        n.store_path,
-                        n.nar_hash,
-                        n.nar_size as i64,
-                        refs,
-                        n.ca,
-                        n.sigs.join(" ")
-                    ],
-                )?;
-                tx.last_insert_rowid()
-            }
-        };
-        // LWW per (origin, path): displace any prior holding of this path.
-        let prior: Option<i64> = tx
-            .query_row(
-                "SELECT narinfo FROM holders WHERE origin = ?1 AND store_path = ?2",
-                params![origin, n.store_path],
-                |r| r.get(0),
-            )
-            .optional()?;
+    /// Remint our self generation strictly above `floor` — the self-clock-regression recovery.
+    /// Triggered from the pull side when a peer reports a FUTURE for our own origin (cache loss
+    /// with a backwards wall clock; a restored disk image; a WAL reverted by power loss): the
+    /// mesh remembers seqs we no longer own, so we must move to a fresh generation and let
+    /// snapshots re-teach everyone. Journal and holdings stay — content is still correct, only
+    /// the (generation, seq) namespace moves.
+    pub fn bump_self_generation(&self, floor: u64) -> Result<u64> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        let g = nanos.max(floor.saturating_add(1));
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO holders (origin, store_path, narinfo) VALUES (?1, ?2, ?3)",
-            params![origin, n.store_path, id],
+            "UPDATE meta SET value = ?1 WHERE key = 'self_generation'",
+            [g.to_string()],
         )?;
-        if let Some(old) = prior {
-            if old != id {
-                gc_if_orphaned_tx(tx, old)?;
-            }
-        }
-        Ok(())
+        tx.execute(
+            "UPDATE origins SET generation = ?2 WHERE name = ?1",
+            params![self.self_name, g as i64],
+        )?;
+        tx.commit()?;
+        Ok(g)
     }
 
     /// The exporting node's half: diff our Nix db against our indexed self-holdings and emit
     /// add/remove events to our own journal. Feasibility is checked HERE, by the exporter, per
     /// the design: only CA or trusted-signed rows leave this node. Returns events emitted.
+    ///
+    /// Three-phase so the write lock is held only for the actual writes: the self origin has
+    /// exactly one writer (the own-db loop; tests call this inline), so the held-snapshot
+    /// cannot go stale between phases.
     pub fn sync_own_db(&self, db: &StoreDb) -> Result<usize> {
-        // Snapshot the Nix db first (its own lock), THEN take ours.
-        let live: HashSet<String> = db.all_paths()?.into_iter().collect();
         let candidates = db.feasible_candidates()?;
 
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        let held: HashMap<String, (Vec<u8>, String)> = tx
-            .prepare(
+        // Phase 1: snapshot what we currently export (brief lock).
+        let held: HashMap<String, (Vec<u8>, String)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare_cached(
                 "SELECT h.store_path, n.nar_hash, n.sigs FROM holders h
                  JOIN narinfos n ON n.id = h.narinfo WHERE h.origin = ?1",
-            )?
-            .query_map([&self.self_name], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
-            .collect::<rusqlite::Result<_>>()?;
+            )?;
+            let held = stmt
+                .query_map([&self.self_name], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+                .collect::<rusqlite::Result<_>>()?;
+            held
+        };
 
+        // Phase 2: diff, with the ed25519 verifies for changed rows done lock-free.
+        let mut adds: Vec<proto::Narinfo> = Vec::new();
+        let mut kept: HashSet<&str> = HashSet::with_capacity(candidates.len());
+        for info in &candidates {
+            let n = pathinfo_to_proto(info, &db.store_dir);
+            let changed = match held.get(&info.path) {
+                Some((hash, sigs)) => {
+                    // Sig comparison is SUBSET, not equality: peers holding the same
+                    // (path, narhash) merge their sig sets into the shared row (hold_tx), so
+                    // the stored set can be a strict superset of ours forever — an equality
+                    // check would re-emit such paths on every diff, and since every emission
+                    // hints the mesh and every application re-hints, the whole mesh would spin
+                    // on pull/hint churn with unbounded journal growth.
+                    let stored: HashSet<&str> = sigs.split_whitespace().collect();
+                    hash != &n.nar_hash.to_vec()
+                        || n.sigs.iter().any(|s| !stored.contains(s.as_str()))
+                }
+                None => true,
+            };
+            if !changed {
+                kept.insert(info.path.as_str());
+                continue;
+            }
+            // Feasibility (with its ed25519 verify) only for changed rows: unchanged rows were
+            // already vetted when first exported.
+            if self.feasible(&n) {
+                kept.insert(info.path.as_str());
+                adds.push(n);
+            }
+        }
+        // Anything held but no longer exportable gets a Remove: GC'd paths, but also paths
+        // whose row REGRESSED — rebuilt in place without a signature, or changed to something
+        // the anchor no longer covers. A stale index entry would send peers chasing bytes we
+        // cannot serve, and each such fetch burns a failure streak before nix falls back.
+        let removes: Vec<String> =
+            held.keys().filter(|p| !kept.contains(p.as_str())).cloned().collect();
+        if adds.is_empty() && removes.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 3: write everything in one transaction.
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let mut seq: u64 = tx
             .query_row("SELECT seq FROM origins WHERE name = ?1", [&self.self_name], |r| {
                 r.get::<_, i64>(0).map(|s| s as u64)
             })?;
         let mut emitted = 0usize;
-        let emit = |tx: &Connection, e: proto::Event| -> Result<()> {
+        let mut emit = |tx: &Connection, e: proto::Event| -> Result<()> {
             tx.execute(
                 "INSERT INTO journal (origin, seq, event) VALUES (?1, ?2, ?3)",
                 params![self.self_name, e.seq as i64, e.encode_to_vec()],
             )?;
-            self.apply_op_tx(tx, &self.self_name, &e)?;
+            apply_op_tx(tx, &self.self_name, &e, true)?;
+            emitted += 1;
             Ok(())
         };
-
-        for info in &candidates {
-            let n = pathinfo_to_proto(info, &db.store_dir);
-            let changed = match held.get(&info.path) {
-                Some((hash, sigs)) => {
-                    hash != &n.nar_hash.to_vec()
-                        || sigs.split_whitespace().collect::<HashSet<_>>()
-                            != n.sigs.iter().map(String::as_str).collect::<HashSet<_>>()
-                }
-                None => true,
-            };
-            // Feasibility (with its ed25519 verify) only for changed rows: unchanged rows were
-            // already vetted when first exported.
-            if changed && self.feasible(&n) {
-                seq += 1;
-                emitted += 1;
-                emit(&tx, proto::Event { seq, op: Some(proto::event::Op::Add(n)) })?;
-            }
+        for n in adds {
+            seq += 1;
+            emit(&tx, proto::Event { seq, op: Some(proto::event::Op::Add(n)) })?;
         }
-        for path in held.keys() {
-            if !live.contains(path) {
-                seq += 1;
-                emitted += 1;
-                emit(
-                    &tx,
-                    proto::Event { seq, op: Some(proto::event::Op::Remove(path.clone())) },
-                )?;
-            }
+        for path in removes {
+            seq += 1;
+            emit(&tx, proto::Event { seq, op: Some(proto::event::Op::Remove(path)) })?;
         }
-        if emitted > 0 {
-            tx.execute(
-                "UPDATE origins SET seq = ?2 WHERE name = ?1",
-                params![self.self_name, seq as i64],
-            )?;
-        }
+        tx.execute(
+            "UPDATE origins SET seq = ?2 WHERE name = ?1",
+            params![self.self_name, seq as i64],
+        )?;
         tx.commit()?;
         Ok(emitted)
     }
@@ -569,15 +649,18 @@ impl Index {
     /// Compact journals: to the minimum watermark across all configured peers (the ack rule),
     /// with the size backstop so a straggler cannot pin retention forever.
     pub fn compact(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let origins: Vec<(String, i64, i64)> = conn
+        let mut conn = self.conn.lock().unwrap();
+        // One transaction: a crash between the journal DELETE and the tail_seq UPDATE would
+        // otherwise leave a silent gap that costs the next requester a wasted round.
+        let tx = conn.transaction()?;
+        let origins: Vec<(String, i64, i64)> = tx
             .prepare("SELECT name, seq, tail_seq FROM origins")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         for (origin, seq, tail) in origins {
             let mut floor: i64 = seq;
             for peer in &self.peer_names {
-                let w: Option<i64> = conn
+                let w: Option<i64> = tx
                     .query_row(
                         "SELECT seq FROM watermarks WHERE peer = ?1 AND origin = ?2",
                         params![peer, origin],
@@ -589,16 +672,17 @@ impl Index {
             // Backstop: never retain more than JOURNAL_BACKSTOP events regardless of acks.
             floor = floor.max(seq - (JOURNAL_BACKSTOP as i64).min(seq));
             if floor > tail {
-                conn.execute(
+                tx.execute(
                     "DELETE FROM journal WHERE origin = ?1 AND seq <= ?2",
                     params![origin, floor],
                 )?;
-                conn.execute(
+                tx.execute(
                     "UPDATE origins SET tail_seq = ?2 WHERE name = ?1",
                     params![origin, floor],
                 )?;
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -609,7 +693,7 @@ impl Index {
 
     /// Lookup by narhash (NAR requests after a proxy restart included — the index persists).
     pub fn lookup_nar_hash(&self, nar_hash: &[u8; 32]) -> Result<Vec<Found>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader.lock().unwrap();
         let ids: Vec<i64> = conn
             .prepare_cached("SELECT id FROM narinfos WHERE nar_hash = ?1")?
             .query_map(params![&nar_hash[..]], |r| r.get(0))?
@@ -618,7 +702,7 @@ impl Index {
     }
 
     fn lookup(&self, sql: &str, key: &str) -> Result<Vec<Found>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader.lock().unwrap();
         let ids: Vec<i64> = conn
             .prepare_cached(sql)?
             .query_map([key], |r| r.get(0))?
@@ -629,8 +713,9 @@ impl Index {
     fn found_from_ids(&self, conn: &Connection, ids: &[i64]) -> Result<Vec<Found>> {
         let mut out = Vec::new();
         for &id in ids {
-            let n: proto::Narinfo = conn.query_row(
+            let n: proto::Narinfo = conn.prepare_cached(
                 "SELECT store_path, nar_hash, nar_size, refs, ca, sigs FROM narinfos WHERE id = ?1",
+            )?.query_row(
                 [id],
                 |r| {
                     Ok(proto::Narinfo {
@@ -773,9 +858,8 @@ impl Index {
     }
 
     /// (generation, seq) of an origin as we know it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn origin_clock(&self, origin: &str) -> Result<(u64, u64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader.lock().unwrap();
         let (g, s): (i64, i64) = conn.query_row(
             "SELECT generation, seq FROM origins WHERE name = ?1",
             [origin],
@@ -806,6 +890,97 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Fold one journal event into the tables. `feasible` is the caller's PRE-COMPUTED verdict for
+/// add events (the ed25519 verify happens outside the write lock); removes ignore it.
+fn apply_op_tx(tx: &Connection, origin: &str, e: &proto::Event, feasible: bool) -> Result<()> {
+    match &e.op {
+        Some(proto::event::Op::Add(n)) => {
+            if feasible {
+                hold_tx(tx, origin, n)?;
+            } else {
+                // Journaled verbatim for faithful relay, but never enters our tables.
+                debug!("origin {origin}: infeasible add for {} ignored", n.store_path);
+                unhold_tx(tx, origin, &n.store_path)?;
+            }
+        }
+        Some(proto::event::Op::Remove(path)) => unhold_tx(tx, origin, path)?,
+        None => {}
+    }
+    Ok(())
+}
+
+/// Upsert the narinfo row (merging signatures) and point `origin`'s holding at it.
+fn hold_tx(tx: &Connection, origin: &str, n: &proto::Narinfo) -> Result<()> {
+    let hash_part = n
+        .store_path
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .get(..32)
+        .unwrap_or("")
+        .to_owned();
+    let refs = n.references.join(" ");
+    let existing: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT id, sigs FROM narinfos WHERE store_path = ?1 AND nar_hash = ?2",
+            params![n.store_path, n.nar_hash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let id = match existing {
+        Some((id, sigs)) => {
+            // Merge signatures: different origins may have retained different sig sets.
+            // (The own-db differ compares by SUBSET for exactly this reason — the merged
+            // set never shrinks back to any one origin's view.)
+            let mut set: Vec<&str> = sigs.split_whitespace().collect();
+            for s in &n.sigs {
+                if !set.contains(&s.as_str()) {
+                    set.push(s);
+                }
+            }
+            tx.execute(
+                "UPDATE narinfos SET sigs = ?2 WHERE id = ?1",
+                params![id, set.join(" ")],
+            )?;
+            id
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO narinfos (hash_part, store_path, nar_hash, nar_size, refs, ca, sigs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    hash_part,
+                    n.store_path,
+                    n.nar_hash,
+                    n.nar_size as i64,
+                    refs,
+                    n.ca,
+                    n.sigs.join(" ")
+                ],
+            )?;
+            tx.last_insert_rowid()
+        }
+    };
+    // LWW per (origin, path): displace any prior holding of this path.
+    let prior: Option<i64> = tx
+        .query_row(
+            "SELECT narinfo FROM holders WHERE origin = ?1 AND store_path = ?2",
+            params![origin, n.store_path],
+            |r| r.get(0),
+        )
+        .optional()?;
+    tx.execute(
+        "INSERT OR REPLACE INTO holders (origin, store_path, narinfo) VALUES (?1, ?2, ?3)",
+        params![origin, n.store_path, id],
+    )?;
+    if let Some(old) = prior {
+        if old != id {
+            gc_if_orphaned_tx(tx, old)?;
+        }
+    }
+    Ok(())
 }
 
 /// Drop a holder edge and orphan-GC the narinfo it pointed at.
@@ -1114,6 +1289,181 @@ mod tests {
         let (w, _, _) = b.load_mw(&renamed).unwrap().unwrap();
         assert_eq!(w.len(), 2);
         assert!((w[1] - 1.0).abs() < 1e-9, "unknown peer must start fresh");
+    }
+
+    /// A fake store with one CA path, plus the (db_path, StoreDb, path) handles tests need.
+    fn own_store(dir: &std::path::Path) -> (std::path::PathBuf, crate::db::StoreDb, String) {
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let p = format!("{}/{}-pkg", store.display(), "7".repeat(32));
+        let db_path = crate::db::tests::fake_db(
+            dir,
+            &[(&p, [7u8; 32], 10, Some("fixed:r:sha256:x"))],
+        );
+        let db = crate::db::StoreDb::open(&db_path, store.to_str().unwrap()).unwrap();
+        (db_path, db, p)
+    }
+
+    #[test]
+    fn merged_peer_sigs_do_not_reemit_our_own_paths() {
+        // hold_tx merges sig sets into the shared (path, narhash) row; the differ must compare
+        // by SUBSET or every diff re-exports the path forever — a mesh-wide hint/pull livelock.
+        let dir = tempfile::tempdir().unwrap();
+        let (_db_path, db, path) = own_store(dir.path());
+        let a = idx(dir.path(), "a", &["b"]);
+        assert_eq!(a.sync_own_db(&db).unwrap(), 1);
+        // Peer b holds the same (path, hash) with an extra signature: merged into the row.
+        let n = proto::Narinfo {
+            store_path: path.clone(),
+            nar_hash: vec![7u8; 32],
+            nar_size: 10,
+            references: vec![],
+            ca: "fixed:r:sha256:x".into(),
+            sigs: vec!["some-cache-1:AAAA".into()],
+        };
+        a.apply_suffix("b", 1, &[add(1, n)]).unwrap();
+        // The differ sees a strict superset of its own sigs: NOT a change.
+        assert_eq!(a.sync_own_db(&db).unwrap(), 0, "sig merge must not re-emit");
+        assert_eq!(a.journal_len("a"), 1);
+    }
+
+    #[test]
+    fn feasibility_regression_emits_a_remove() {
+        // A path rebuilt in place without CA/sigs must leave the mesh index, or peers chase
+        // bytes we no longer serve.
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, db, path) = own_store(dir.path());
+        let a = idx(dir.path(), "a", &["b"]);
+        assert_eq!(a.sync_own_db(&db).unwrap(), 1);
+        assert_eq!(a.lookup_hash_part(&"7".repeat(32)).unwrap().len(), 1);
+        crate::db::tests::clear_feasibility(&db_path, &path);
+        assert_eq!(a.sync_own_db(&db).unwrap(), 1, "regression must emit a Remove");
+        assert!(a.lookup_hash_part(&"7".repeat(32)).unwrap().is_empty());
+        assert_eq!(a.sync_own_db(&db).unwrap(), 0, "…exactly once");
+    }
+
+    #[test]
+    fn respond_defers_origins_past_the_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let x = idx(dir.path(), "x", &["a", "b", "c"]);
+        x.apply_suffix("a", 1, &[add(1, ni("-pa", 1))]).unwrap();
+        x.apply_suffix("b", 1, &[add(1, ni("-pb", 2))]).unwrap();
+        // A zero-clock requester with a 1-byte budget: the first data-bearing origin ships,
+        // the second is deferred as an empty truncated suffix.
+        let c = idx(dir.path(), "c", &["x", "a", "b"]);
+        let req = proto::SyncRequest { requester: "c".into(), have: c.clock_vector().unwrap() };
+        let ups = x.respond_budgeted(&req, 1).unwrap();
+        // Only a/b matter: x's own origin is an empty snapshot that costs no budget.
+        let snapshots = ups
+            .iter()
+            .filter(|u| u.origin != "x")
+            .filter(|u| matches!(u.body, Some(proto::origin_update::Body::Snapshot(_))))
+            .count();
+        let deferred: Vec<_> = ups
+            .iter()
+            .filter(|u| {
+                u.truncated
+                    && matches!(&u.body,
+                        Some(proto::origin_update::Body::Suffix(s)) if s.events.is_empty())
+            })
+            .collect();
+        assert_eq!(snapshots, 1, "exactly one origin fits the budget: {ups:?}");
+        assert_eq!(deferred.len(), 1, "the other must be deferred, not dropped: {ups:?}");
+        // The deferral round-trips: applying it changes nothing but flags another round, and
+        // an unbudgeted follow-up delivers the rest.
+        let d = deferred[0];
+        assert!(matches!(
+            c.apply_suffix(&d.origin, d.generation, &[]).unwrap(),
+            Apply::Applied(0)
+        ));
+        for u in &ups {
+            if let Some(proto::origin_update::Body::Snapshot(s)) = &u.body {
+                c.apply_snapshot(&u.origin, u.generation, u.seq, &s.held).unwrap();
+            }
+        }
+        let req = proto::SyncRequest { requester: "c".into(), have: c.clock_vector().unwrap() };
+        let ups = x.respond_budgeted(&req, usize::MAX).unwrap();
+        for u in &ups {
+            match &u.body {
+                Some(proto::origin_update::Body::Snapshot(s)) => {
+                    c.apply_snapshot(&u.origin, u.generation, u.seq, &s.held).unwrap();
+                }
+                Some(proto::origin_update::Body::Suffix(s)) => {
+                    c.apply_suffix(&u.origin, u.generation, &s.events).unwrap();
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(c.count_narinfos(), 2, "both origins' rows arrive within two rounds");
+    }
+
+    #[test]
+    fn a_stale_snapshot_cannot_regress_a_newer_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = idx(dir.path(), "b", &["a"]);
+        b.apply_suffix("a", 1, &[add(1, ni("-p", 1)), add(2, ni("-q", 2))]).unwrap();
+        // A lagging relay's snapshot at seq 1 arrives late (concurrent-pull race): ignored.
+        assert_eq!(b.apply_snapshot("a", 1, 1, &[ni("-p", 1)]).unwrap(), 0);
+        assert_eq!(b.count_narinfos(), 2);
+        assert_eq!(b.origin_clock("a").unwrap(), (1, 2));
+        // A HIGHER generation still replaces wholesale, whatever its seq.
+        assert_eq!(b.apply_snapshot("a", 2, 1, &[ni("-r", 3)]).unwrap(), 1);
+        assert_eq!(b.count_narinfos(), 1);
+    }
+
+    #[test]
+    fn self_generation_remints_strictly_above_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = idx(dir.path(), "b", &["a"]);
+        let (g0, _) = b.origin_clock("b").unwrap();
+        // The mesh remembers a future generation for us (e.g. our clock went backwards).
+        let new = b.bump_self_generation(u64::MAX - 1).unwrap();
+        assert_eq!(new, u64::MAX, "must exceed the floor even past the wall clock");
+        assert!(new > g0);
+        assert_eq!(b.origin_clock("b").unwrap().0, new);
+        // …and it persists: a reopen keeps the reminted generation.
+        drop(b);
+        let b = idx(dir.path(), "b", &["a"]);
+        assert_eq!(b.origin_clock("b").unwrap().0, new);
+    }
+
+    #[test]
+    fn a_changed_trust_anchor_resets_peer_origin_clocks() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let b = idx(dir.path(), "b", &["a"]);
+            b.apply_suffix("a", 1, &[add(1, ni("-p", 1))]).unwrap();
+            assert_eq!(b.origin_clock("a").unwrap(), (1, 1));
+        }
+        // Reopen with the same (empty) anchor: nothing moves.
+        {
+            let b = idx(dir.path(), "b", &["a"]);
+            assert_eq!(b.origin_clock("a").unwrap(), (1, 1));
+        }
+        // Reopen with a DIFFERENT anchor: peer clocks zero so the next pulls resync from
+        // snapshots (events skipped as infeasible under the old anchor are unrecoverable
+        // from a clock that already covers them). Existing rows stay until then.
+        let kp = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new([9u8; 32]));
+        let pk = format!(
+            "k-1:{}",
+            {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(*kp.pk)
+            }
+        );
+        let peers: Vec<String> = vec!["a".into()];
+        let b = Index::open(
+            &dir.path().join("cache-b"),
+            "b",
+            &peers,
+            crate::sig::TrustedKeys::parse(&[pk]),
+        )
+        .unwrap();
+        assert_eq!(b.origin_clock("a").unwrap(), (0, 0));
+        assert_eq!(b.journal_len("a"), 0);
+        assert_eq!(b.count_narinfos(), 1, "rows persist; snapshots will wipe-replace them");
+        // Our own clock is untouched — the differ re-exports newly-feasible paths itself.
+        assert!(b.origin_clock("b").unwrap().0 > 0);
     }
 
     #[test]

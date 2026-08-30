@@ -147,11 +147,23 @@ origin's history is totally ordered, "peer P saw deletion N" collapses to "P's w
   data); pulls that insert nothing re-hint nobody, so cascades terminate exactly at
   convergence. Local change → mesh-wide visibility is ~one hint round.
 * **Compaction to the minimum watermark** across the (fixed, configured) peer set — with a size
-  backstop so one dead peer can't pin journals forever. Stragglers, newcomers, and anyone whose
-  watermark predates the retained tail land on the **snapshot** path, the single recovery
-  mechanism that also serves first contact and cache loss (a node that loses /var/cache mints a
-  new GENERATION; peers detect it and resync from snapshot — regenerated sequence numbers never
-  alias old ones).
+  backstop so one dead peer can't pin journals forever, and it also runs after pulls so a
+  consume-only node (no serve listener, so it never receives a sync request) compacts too.
+  Stragglers, newcomers, and anyone whose watermark predates the retained tail land on the
+  **snapshot** path, the single recovery mechanism that also serves first contact and cache loss
+  (a node that loses /var/cache mints a new GENERATION; peers detect it and resync from snapshot
+  — regenerated sequence numbers never alias old ones; the reverse direction, OUR clock
+  regressing behind what the mesh remembers, is detected on pull and answered by reminting).
+* **Responses are byte-budgeted**: a response carrying several origins' snapshots (first contact
+  with a mature mesh) defers whole origins past the budget as empty truncated suffixes — the
+  puller's truncated loop collects them over successive rounds, so no response can outgrow the
+  puller's hard caps. One origin's snapshot is never split; a single origin must stay under the
+  raw cap (~600k paths — far past any real node).
+* **The differ compares signatures by subset, not equality**: peers holding the same
+  (path, narhash) merge their sig sets into the shared row, so the stored set can be a strict
+  superset of the local Nix db's forever — an equality check would re-export such paths on every
+  diff and spin the whole mesh on hint/pull churn. Paths that regress (rebuilt in place without
+  a signature, feasibility lost) are Removed, not left stale.
 * **Origin identity is the node `name`**: config-declared, mesh-wide unique, validated at
   runtime against sync responses. The origin universe is exactly {self} ∪ configured peers;
   anything else is rejected, and origins that leave the config are reaped — including their
@@ -364,23 +376,46 @@ persistently corrupt peer therefore degrades paths it holds until removed from c
 
 ### Failure semantics, consolidated
 
-* Hard errors only (refused / reset / 5xx / dead bodies) count toward the per-peer circuit
-  breaker: `breaker_failures` consecutive → down for `breaker_cooldown` → half-open probe. Down
-  peers leave stripe sets and sync scheduling. Breakers handle *dead*; MW weights handle *slow*;
-  the two are deliberately separate mechanisms.
+* Hard errors (refused / reset / 5xx / dead bodies) AND chunk-deadline timeouts count toward the
+  per-peer circuit breaker: `breaker_failures` consecutive → down for `breaker_cooldown` →
+  half-open probe. The deadline strike matters: a black-holing peer (accepts TCP, never answers)
+  produces no transport error at all, and without it such a peer would stay "available" forever.
+  Down peers leave stripe sets, source selection, and hint fan-outs. Breakers handle *dead*; MW
+  weights handle *slow*; the two are deliberately separate mechanisms.
+* **Do no harm — the fast-404 contract**: the proxy is nix's FIRST substituter, so anything it
+  cannot serve right now must be an instant 404 (nix falls through), never a slow error. Unknown
+  path → indexed local miss. Known path, every holder breaker-open → 404 at narinfo time (and at
+  nar time), not a committed 200 that coasts to the stall watchdog; tier restriction is computed
+  over LIVE holders, so a dead tier-1 peer never masks a live tier-2 one. Index read errors →
+  404-with-log (a 500 makes nix retry with backoff). Roaming epochs 404 oversized paths. The one
+  deliberate residual: all holders dying MID-transfer costs that one transfer up to
+  `stall_timeout` — the 200 is already committed.
 * Transfer give-up: byte-progress stall (`stall_timeout`, default 60 s — generous enough to ride
   out cellular radio handoffs; liveness is wire BYTES as they arrive, so a chunk that takes
   longer than the timeout on a slow-but-alive link never false-fires), a consecutive-failure
   streak (bytes prove the link is alive, but a peer can stream bytes that never become completed
   chunks — 30 chunk failures with no completion anywhere aborts, and any completion resets it),
-  plus the optional `min_bandwidth` floor with its roaming epoch. Everything else is nix's own
+  plus the optional `min_bandwidth` floor with its roaming epoch. Chunk deadlines are 8× the
+  expected duration (clamped 10–300 s) — and a fixed 20 s for a peer with no rate sample, below
+  the default stall timeout, so a black hole holding the emission frontier is evicted (and
+  struck) long before the watchdog would kill a transfer the other holders could finish.
+  Oversized requeues are re-carved at the current chunk size. Everything else is nix's own
   `fallback` behavior.
 * Index staleness: a holder that GC'd seconds ago still appears until its events sync — the
   transfer fails over to other holders or aborts cleanly (the GC-race semantics). A fresh add
   not yet synced is a fast local 404; hints make that window seconds. A fresh node serves 404s
   until its first snapshots land, which is indistinguishable from having booted later.
-* All-peers-down: lookups still answer instantly from the index; transfers fail cleanly; sync
-  retries on its timer. nix proceeds to other substituters or builds.
+* All-peers-down: lookups answer instantly from the index — 404 while breakers are open, 200
+  again on recovery; sync retries on its timer. nix proceeds to other substituters or builds.
+* Self-state loss is self-healing in both directions: a lost cache mints a fresh generation
+  (peers snapshot-resync us), and the REVERSE regression — a restored disk image, a WAL reverted
+  by power loss (mitigated by `synchronous=FULL`), a backwards clock at generation mint — is
+  detected on the next pull (a peer reports a future for our own origin) and answered by
+  reminting the generation above the future the mesh remembers.
+* A changed trust anchor at startup zeroes every peer origin's clock: events skipped as
+  infeasible under the old anchor live in their origins' journals, not ours, so only full
+  snapshots can resurrect them. Our own origin needs nothing — the differ re-exports
+  newly-feasible paths by itself.
 
 ## Configuration
 

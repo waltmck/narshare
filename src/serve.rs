@@ -78,7 +78,15 @@ pub struct ServeState {
     nar_negative: Mutex<LruCache<[u8; 32], Instant>>,
     /// Bounds concurrent buffered chunk-encode jobs (m4).
     encode_sem: tokio::sync::Semaphore,
+    /// A separate lane for SMALL spans: tokio's semaphore is FIFO, so a 50 KB NAR's single
+    /// chunk would otherwise queue behind up to eight 16 MiB encodes — exactly the
+    /// many-small-concurrent-fetches case a nixpkgs rebuild produces. Same permit count;
+    /// bounded extra memory (permits × SMALL_ENCODE_SPAN).
+    encode_sem_small: tokio::sync::Semaphore,
 }
+
+/// Spans at or below this use the small-encode lane.
+const SMALL_ENCODE_SPAN: u64 = 1 << 20;
 
 struct NarCache {
     lru: LruCache<[u8; 32], Arc<NarEntry>>,
@@ -141,6 +149,7 @@ impl ServeState {
                 NonZeroUsize::new(NAR_NEGATIVE_ENTRIES).unwrap(),
             )),
             encode_sem: tokio::sync::Semaphore::new(encode_permits()),
+            encode_sem_small: tokio::sync::Semaphore::new(encode_permits()),
         })
     }
 }
@@ -343,7 +352,12 @@ async fn get_nar(
                 // observe_encoding) steps down when queue+encode dominates a chunk's service
                 // time, which is what actually drains an overloaded pool.
                 let waited = std::time::Instant::now();
-                let _permit = st.encode_sem.acquire().await.expect("semaphore closed");
+                let sem = if end - start <= SMALL_ENCODE_SPAN {
+                    &st.encode_sem_small
+                } else {
+                    &st.encode_sem
+                };
+                let _permit = sem.acquire().await.expect("semaphore closed");
                 let wait = waited.elapsed();
                 return match encode_span(&st, &table, start, end, level).await {
                     Ok((frame, read_d, enc_d)) => Response::builder()

@@ -36,7 +36,22 @@ pub struct PathInfo {
 pub struct StoreDb {
     conn: Mutex<Connection>,
     pub store_dir: String,
+    /// Lazily built narhash → store-path map (see by_nar_hash): the hash column is unindexed
+    /// in Nix's schema and narshare must not write Nix's database, so without this every
+    /// first-time NAR request pays a full ValidPaths scan — a nixpkgs rebuild pulling hundreds
+    /// of small NARs from this node would serialize hundreds of scans on one connection.
+    nar_index: Mutex<Option<NarIndex>>,
 }
+
+struct NarIndex {
+    built: std::time::Instant,
+    map: std::collections::HashMap<[u8; 32], String>,
+}
+
+/// How long a built narhash map is trusted before a MISS forces a rebuild. Staleness only
+/// delays lookups of paths registered since the build, and misses fall back to a direct scan
+/// anyway, so this is purely a rebuild-rate bound.
+const NAR_INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Parse the ValidPaths.hash column: "sha256:" + (base16 | nix32).
 fn parse_hash_column(h: &str) -> Result<[u8; 32]> {
@@ -64,7 +79,11 @@ impl StoreDb {
             .context("nix db schema mismatch (ValidPaths columns)")?;
         conn.prepare("SELECT referrer, reference FROM Refs LIMIT 0")
             .context("nix db schema mismatch (Refs columns)")?;
-        Ok(Self { conn: Mutex::new(conn), store_dir: store_dir.trim_end_matches('/').to_owned() })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            store_dir: store_dir.trim_end_matches('/').to_owned(),
+            nar_index: Mutex::new(None),
+        })
     }
 
     #[allow(clippy::too_many_arguments)] // one row's columns, unpacked positionally
@@ -135,16 +154,6 @@ impl StoreDb {
         .transpose()
     }
 
-    /// Every valid store path — the mesh-index differ's view of what we currently hold.
-    pub fn all_paths(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT path FROM ValidPaths")?;
-        let v = stmt
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(v)
-    }
-
     /// Rows that could be mesh-feasible (CA, or carrying signatures), with references — the
     /// candidate set the index differ exports from. Signature validity is the caller's check.
     pub fn feasible_candidates(&self) -> Result<Vec<PathInfo>> {
@@ -180,9 +189,82 @@ impl StoreDb {
         Ok(out)
     }
 
-    /// Look up by NAR hash (nar request). The hash column is unindexed, so this scans; callers
-    /// cache the result per narhash, and one scan per NAR transfer is noise next to the transfer.
+    /// Look up by NAR hash (nar request — the hot path of every fetch a peer makes from us).
+    /// The hash column is unindexed in Nix's schema and narshare never writes Nix's database,
+    /// so exact-hash queries are full ValidPaths scans; the in-memory map turns the steady
+    /// state into one scan per TTL instead of one per distinct NAR. Correctness never depends
+    /// on the map: a map miss falls back to the direct scan (a just-registered path must not
+    /// 404 behind a stale map), and a map hit is re-verified against the row's actual hash
+    /// (the path may have been re-registered with different content since the build).
     pub fn by_nar_hash(&self, nar_hash: &[u8; 32]) -> Result<Option<PathInfo>> {
+        if let Some(path) = self.nar_index_lookup(nar_hash)? {
+            if let Some(info) = self.by_path(&path)? {
+                if &info.nar_hash == nar_hash {
+                    return Ok(Some(info));
+                }
+            }
+        }
+        self.by_nar_hash_scan(nar_hash)
+    }
+
+    /// Consult the narhash map: hits never rebuild; a miss on a stale map rebuilds once (so a
+    /// burst of first-time lookups after a fresh closure lands pays one scan, not hundreds).
+    fn nar_index_lookup(&self, nar_hash: &[u8; 32]) -> Result<Option<String>> {
+        let mut guard = self.nar_index.lock().unwrap();
+        if let Some(ix) = guard.as_ref() {
+            if let Some(p) = ix.map.get(nar_hash) {
+                return Ok(Some(p.clone()));
+            }
+            if ix.built.elapsed() <= NAR_INDEX_TTL {
+                return Ok(None); // fresh miss; the caller's scan fallback settles it
+            }
+        }
+        let map = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare_cached("SELECT path, hash FROM ValidPaths")?;
+            let mut map = std::collections::HashMap::new();
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(0)?;
+                let hash: String = row.get(1)?;
+                if let Ok(h) = parse_hash_column(&hash) {
+                    map.insert(h, path);
+                }
+            }
+            map
+        };
+        let found = map.get(nar_hash).cloned();
+        *guard = Some(NarIndex { built: std::time::Instant::now(), map });
+        Ok(found)
+    }
+
+    /// Look up by exact store path (indexed: ValidPaths.path is UNIQUE).
+    fn by_path(&self, path: &str) -> Result<Option<PathInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, path, hash, narSize, deriver, sigs, ca FROM ValidPaths \
+             WHERE path = ?1",
+        )?;
+        let row = stmt
+            .query_row([path], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .optional()?;
+        row.map(|(id, path, hash, sz, drv, sigs, ca)| {
+            Self::info_from_row(&conn, id, path, hash, sz, drv, sigs, ca)
+        })
+        .transpose()
+    }
+
+    fn by_nar_hash_scan(&self, nar_hash: &[u8; 32]) -> Result<Option<PathInfo>> {
         let b16 = format!("sha256:{}", hex::encode(nar_hash));
         let b32 = format!("sha256:{}", nixbase32::encode(nar_hash));
         let conn = self.conn.lock().unwrap();
@@ -257,6 +339,16 @@ pub mod tests {
         let conn = Connection::open(db).unwrap();
         conn.execute("UPDATE ValidPaths SET sigs = ?2 WHERE path = ?1", rusqlite::params![path, sigs])
             .unwrap();
+    }
+
+    /// Simulate an in-place rebuild that lost feasibility: strip the row's CA and sigs.
+    pub fn clear_feasibility(db: &Path, path: &str) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute(
+            "UPDATE ValidPaths SET sigs = NULL, ca = NULL WHERE path = ?1",
+            [path],
+        )
+        .unwrap();
     }
 
     /// Simulate a GC: drop a row from the fake db.

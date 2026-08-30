@@ -74,6 +74,20 @@ async fn run(cfg: config::Config) -> Result<()> {
         }
         info!("shutting down");
         let _ = shutdown_tx.send(());
+        // Graceful shutdown drains in-flight connections with no deadline of its own, and one
+        // peer mid-download (or a hung sync request) would otherwise hold the process until
+        // systemd's SIGKILL — and tokio's registered handlers would swallow every further
+        // signal. Bound the drain, and honor an impatient second signal immediately. State is
+        // safe either way: the weight saver flushes on the shutdown edge, sqlite is
+        // transactional, and everything else is re-learnable from the mesh.
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("second signal: exiting now"),
+            _ = term.recv() => info!("second signal: exiting now"),
+            _ = tokio::time::sleep(Duration::from_secs(20)) => {
+                info!("drain deadline reached: exiting");
+            }
+        }
+        std::process::exit(0);
     });
 
     // The mesh trust anchor and the replicated index — shared by every role.

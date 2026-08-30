@@ -96,6 +96,28 @@ impl TrustedKeys {
         Ok(Self::parse(&entries))
     }
 
+    /// A stable digest of the key set (order-independent). The index stores it so a CHANGED
+    /// anchor at startup can force a full peer resync: events applied under the old anchor may
+    /// have been skipped as infeasible, and those rows would otherwise stay missing until their
+    /// origin happened to re-export them.
+    pub fn anchor_digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut entries: Vec<String> = self
+            .keys
+            .iter()
+            .map(|(name, pk)| {
+                format!("{name}:{}", base64::engine::general_purpose::STANDARD.encode(**pk))
+            })
+            .collect();
+        entries.sort();
+        let mut h = Sha256::new();
+        for e in &entries {
+            h.update(e.as_bytes());
+            h.update(b"\n");
+        }
+        hex::encode(h.finalize())
+    }
+
     /// Does any of this narinfo's signatures verify under any trusted key? Key names must match
     /// AND the ed25519 signature must check out over the fingerprint — a name alone is
     /// spoofable, and a corrupt signature would only be rejected by nix after the whole

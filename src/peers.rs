@@ -40,13 +40,13 @@ async fn read_capped_progress(
     cap: usize,
     progress: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<Bytes> {
-    if let Some(len) = resp.content_length() {
-        if len > cap as u64 {
-            bail!("response Content-Length {len} exceeds cap {cap}");
-        }
-    }
+    let hint = match resp.content_length() {
+        Some(len) if len > cap as u64 => bail!("response Content-Length {len} exceeds cap {cap}"),
+        Some(len) => len as usize,
+        None => 0,
+    };
     let mut stream = resp.bytes_stream();
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(hint);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("reading response body")?;
         if buf.len() + chunk.len() > cap {
@@ -208,7 +208,7 @@ impl Peers {
                 Ok(out)
             })
             .await
-            .expect("decode task panicked")?;
+            .map_err(|e| anyhow::anyhow!("sync decode task died: {e}"))??;
             proto::SyncResponse::decode(&raw[..]).context("bad sync response proto")
         };
         match tokio::time::timeout(SYNC_TIMEOUT, exchange).await {
@@ -385,7 +385,7 @@ impl Peers {
                 Ok((out, t0.elapsed()))
             })
             .await
-            .expect("decode task panicked")?;
+            .map_err(|e| anyhow::anyhow!("peer {}: decode task died: {e}", self.list[peer_idx].name))??;
             (Bytes::from(raw), decode)
         } else {
             (body, Duration::ZERO)

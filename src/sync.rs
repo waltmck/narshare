@@ -113,9 +113,31 @@ impl Sync {
             }
             let mut truncated = false;
             for up in resp.origins {
-                if up.origin == self.index.self_name || !self.index.is_known_origin(&up.origin)
-                {
-                    continue; // only we author our own set; unknown origins are rejected
+                if up.origin == self.index.self_name {
+                    // Only we author our own set — but a peer reporting a FUTURE for it means
+                    // our self-clock regressed (cache restored from an image, WAL reverted by
+                    // power loss, a backwards wall clock at generation mint): the mesh
+                    // remembers seqs we no longer own, and anything we now publish under them
+                    // would be silently ignored ("up to date") or mis-applied. Remint our
+                    // generation above theirs; their next pulls snapshot-resync us cleanly.
+                    let (g, s) = self.index.origin_clock(&self.index.self_name)?;
+                    if up.generation > g || (up.generation == g && up.seq > s) {
+                        warn!(
+                            "peer {} knows a future of our own origin (gen {} seq {} vs our \
+                             gen {g} seq {s}): self-clock regression — reminting generation",
+                            self.peers.list[idx].name, up.generation, up.seq
+                        );
+                        let index = self.index.clone();
+                        let floor = up.generation;
+                        tokio::task::spawn_blocking(move || index.bump_self_generation(floor))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("bump task died: {e}"))??;
+                        self.hint_peers();
+                    }
+                    continue;
+                }
+                if !self.index.is_known_origin(&up.origin) {
+                    continue; // unknown origins are rejected
                 }
                 let index = self.index.clone();
                 let origin = up.origin.clone();
@@ -129,10 +151,11 @@ impl Sync {
                                 Apply::Applied(n) => Ok((n > 0, up.truncated)),
                                 Apply::NeedSnapshot => {
                                     // Shouldn't happen against a consistent responder (it
-                                    // decides suffix-vs-snapshot from OUR clock); recover on a
-                                    // later pull rather than looping here.
+                                    // decides suffix-vs-snapshot from OUR clock); keep the
+                                    // truncated flag — a budget-deferred origin arrives as an
+                                    // empty truncated suffix and must trigger the next round.
                                     warn!("origin {origin}: suffix did not connect to our state");
-                                    Ok((false, false))
+                                    Ok((false, up.truncated))
                                 }
                             }
                         }
@@ -145,13 +168,21 @@ impl Sync {
                     }
                 })
                 .await
-                .expect("apply task panicked")?;
+                .map_err(|e| anyhow::anyhow!("apply task died: {e}"))??;
                 changed_any |= out.0;
                 truncated |= out.1;
             }
             if !truncated {
                 break;
             }
+        }
+        if changed_any {
+            // Compaction rides sync REQUESTS elsewhere (handle_sync), but a consume-only node
+            // never receives one — without this its relayed journals would grow forever.
+            let index = self.index.clone();
+            tokio::task::spawn_blocking(move || index.compact())
+                .await
+                .map_err(|e| anyhow::anyhow!("compact task died: {e}"))??;
         }
         Ok(changed_any)
     }
@@ -223,8 +254,13 @@ impl Sync {
                     if msg.is_none() { return; }
                     // Leading edge, CONCURRENT fan-out: a dead peer's 5 s hint timeout must
                     // not delay anyone else's. Repeats queued meanwhile coalesce into the
-                    // channel's single slot and trigger one more (cheap) round.
+                    // channel's single slot and trigger one more (cheap) round. Breaker-open
+                    // peers are skipped — a hint is an optimization, not a probe; they catch
+                    // up on their own sync timer once they recover.
                     for idx in 0..self.peers.list.len() {
+                        if !self.peers.list[idx].available() {
+                            continue;
+                        }
                         let peers = self.peers.clone();
                         let from = self.index.self_name.clone();
                         tokio::spawn(async move { peers.hint(idx, &from).await });
@@ -259,6 +295,7 @@ impl Sync {
         if events.is_none() {
             info!("mesh index: inotify unavailable; polling every {OWN_DB_INTERVAL:?}");
         }
+        let mut err_streak = 0u32;
         loop {
             match self.export_own_db().await {
                 Ok(n) if n > 0 => {
@@ -274,21 +311,40 @@ impl Sync {
             tokio::select! {
                 _ = shutdown.changed() => return,
                 _ = tokio::time::sleep(OWN_DB_INTERVAL) => {}
-                _ = async {
-                    if let Some(s) = events.as_mut() {
-                        use tokio_stream::StreamExt as _;
-                        let _ = s.next().await;
-                    } else {
-                        std::future::pending::<()>().await;
+                item = async {
+                    match events.as_mut() {
+                        Some(s) => {
+                            use tokio_stream::StreamExt as _;
+                            s.next().await
+                        }
+                        None => std::future::pending().await,
                     }
                 } => {
+                    // A dead or ended stream must not become a hot loop of instant wakeups —
+                    // fall back to the timer, which the loop already supports.
+                    match &item {
+                        None => {
+                            warn!("mesh index: inotify stream ended; polling every {OWN_DB_INTERVAL:?}");
+                            events = None;
+                            continue;
+                        }
+                        Some(Err(_)) => {
+                            err_streak += 1;
+                            if err_streak >= 3 {
+                                warn!("mesh index: inotify erroring persistently; polling every {OWN_DB_INTERVAL:?}");
+                                events = None;
+                                continue;
+                            }
+                        }
+                        Some(Ok(_)) => err_streak = 0,
+                    }
                     if let Some(s) = events.as_mut() {
                         use tokio_stream::StreamExt as _;
                         let deadline = tokio::time::Instant::now() + BURST_MAX;
                         while tokio::time::Instant::now() < deadline {
                             match tokio::time::timeout(BURST_QUIET, s.next()).await {
-                                Ok(Some(_)) => continue, // still bursting
-                                _ => break,              // quiet — go diff
+                                Ok(Some(Ok(_))) => continue, // still bursting
+                                _ => break,                  // quiet or erroring — go diff
                             }
                         }
                     }
@@ -323,7 +379,7 @@ async fn handle_sync(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> Response
         Ok(z)
     })
     .await
-    .expect("sync respond task panicked");
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("sync respond task died: {e}")));
     match out {
         Ok(z) => (
             [(header::CONTENT_TYPE, "application/x-narshare-sync")],

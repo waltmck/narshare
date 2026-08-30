@@ -199,6 +199,10 @@ pub struct FetchCtx {
     net: Vec<Mutex<PeerNet>>,
     encodings: Vec<String>,
     pub stats: Stats,
+    /// Pinged whenever a stream slot frees anywhere, so a capacity-starved transfer relaunches
+    /// immediately instead of polling — the many-small-fetches case would otherwise queue in
+    /// 200 ms quanta behind one big transfer that structurally reacquires its own slots.
+    slot_freed: tokio::sync::Notify,
     roaming_until: Mutex<Option<Instant>>,
     cfg_chunk_max: u64,
     cfg_window: u64,
@@ -219,6 +223,7 @@ impl FetchCtx {
                 .collect(),
             encodings: peer_cfgs.iter().map(|p| p.encoding.clone()).collect(),
             stats: Stats::default(),
+            slot_freed: tokio::sync::Notify::new(),
             roaming_until: Mutex::new(None),
             cfg_chunk_max: cfg.chunk_max.0.max(CHUNK_MIN),
             cfg_window: cfg.window_bytes.0.max(CHUNK_MIN * 4),
@@ -302,8 +307,19 @@ impl FetchCtx {
 
     /// Per-chunk soft deadline: generous multiple of the expected duration, so one hung stream
     /// requeues without killing the transfer (the global stall watchdog remains authoritative).
+    ///
+    /// A peer with NO goodput sample gets a short fixed bound instead: the seed chunk sized in
+    /// the dark divided by a made-up floor rate would exceed the default stall timeout, and a
+    /// black-holing peer (accepts TCP, never answers) holding the emission frontier that long
+    /// starves the window until the watchdog kills a transfer other peers could finish. 20 s is
+    /// enough for the 4 MiB seed on any link ≥ ~200 KB/s; a slower honest link loses one partial
+    /// chunk, gets its rate seeded from the wire progress (see the failure arm), and continues
+    /// with completable carves.
     fn chunk_deadline(&self, peer: usize, len: u64) -> Duration {
-        let r = self.rate_of(peer).max(64.0 * 1024.0);
+        let r = self.rate_of(peer);
+        if r <= 0.0 {
+            return Duration::from_secs(20);
+        }
         Duration::from_secs_f64((8.0 * len as f64 / r).clamp(10.0, 300.0))
     }
 
@@ -460,6 +476,8 @@ struct Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         self.st.fetch.limits[self.peer].release();
+        // Wake every capacity-starved transfer; they race try_pick and losers re-register.
+        self.st.fetch.slot_freed.notify_waiters();
     }
 }
 
@@ -761,6 +779,14 @@ pub async fn run_transfer(
         // them here is a no-op.
         while workers.try_join_next().is_some() {}
 
+        // Register interest in slot releases BEFORE probing for capacity: a slot freed between a
+        // failed try_pick below and the select cannot then be missed (enable() is the documented
+        // Notify pattern for exactly this race).
+        let notified = ctx.slot_freed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let mut starved = false;
+
         // Launch whatever the window and the per-peer budgets allow right now.
         loop {
             let gated = retry_gate.is_some_and(|g| Instant::now() < g);
@@ -790,11 +816,25 @@ pub async fn run_transfer(
             }
             let avail: Vec<usize> =
                 peer_ids.iter().copied().filter(|&p| st.peers.list[p].available()).collect();
-            let Some((peer, slot)) = try_pick(&st, &avail) else { break };
+            let Some((peer, slot)) = try_pick(&st, &avail) else {
+                // Live peers exist but every stream slot is taken (likely by other transfers):
+                // wait for a release, not a timer.
+                starved = !avail.is_empty();
+                break;
+            };
             let len = match queued_len {
                 Some(l) => {
                     requeue.pop();
-                    l
+                    // Re-carve an oversized requeue to the CURRENT chunk size: the original
+                    // carve may predate the link (a seed that outran a thin link, a rate that
+                    // collapsed), and re-flying it whole would just die on its deadline again.
+                    let cs = ctx.chunk_size(peer);
+                    if l > cs.saturating_mul(2) {
+                        requeue.push(Reverse((off + cs, l - cs)));
+                        cs
+                    } else {
+                        l
+                    }
                 }
                 None => {
                     let room = ranges[range_i].1 - range_pos;
@@ -818,7 +858,16 @@ pub async fn run_transfer(
                 .await
                 {
                     Ok(r) => r,
-                    Err(_) => Err(anyhow::anyhow!("chunk deadline ({deadline:?}) exceeded")),
+                    Err(_) => {
+                        // A deadline death is transport-indistinguishable from a black hole
+                        // (accepts TCP, never answers): without a strike, such a peer would
+                        // stay "available" forever — the breaker's only other probe is the
+                        // 60 s sync loop. Honest-slow peers eat at most a couple of strikes
+                        // before their seeded rate makes carves completable, and any delivered
+                        // chunk resets the count.
+                        stc.peers.strike(peer);
+                        Err(anyhow::anyhow!("chunk deadline ({deadline:?}) exceeded"))
+                    }
                 };
                 drop(slot); // free the stream slot before reporting, so relaunch sees capacity
                 let _ = dtx.send(Done { off, len, peer, elapsed: started.elapsed(), result }).await;
@@ -848,10 +897,20 @@ pub async fn run_transfer(
                 let Some(done) = done else { return };
                 match done.result {
                     Ok(chunk) => {
-                        ctx.pool.record_success(done.peer, done.len, done.elapsed);
-                        ctx.record_rate(done.peer, done.len, done.elapsed);
-                        ctx.observe_encoding(done.peer, done.elapsed, &chunk);
+                        // Sub-CHUNK_MIN chunks (whole small NARs, range tails) are latency-
+                        // dominated: their "goodput" is mostly RTT plus the peer's encode-pool
+                        // wait, and folding them into the rate EWMA / MW losses / the encoding
+                        // controller lets a burst of small fetches demolish state that big
+                        // transfers spent time learning. Real carved chunks are always
+                        // ≥ CHUNK_MIN, so this only mutes the noise.
+                        if done.len >= CHUNK_MIN {
+                            ctx.pool.record_success(done.peer, done.len, done.elapsed);
+                            ctx.record_rate(done.peer, done.len, done.elapsed);
+                            ctx.observe_encoding(done.peer, done.elapsed, &chunk);
+                        }
                         ctx.limits[done.peer].observe(true, done.len);
+                        // An epoch close may have RAISED the limit — capacity without a release.
+                        ctx.slot_freed.notify_waiters();
                         remote_fetched += done.len;
                         ctx.stats.remote_bytes.fetch_add(done.len, Ordering::Relaxed);
                         ctx.stats.wire_bytes.fetch_add(chunk.wire, Ordering::Relaxed);
@@ -953,6 +1012,8 @@ pub async fn run_transfer(
                 }
                 retry_gate = None; // the gate expired: relaunch requeued work
             }
+            // A stream slot freed somewhere (any transfer, any peer): re-run the launch loop.
+            _ = &mut notified, if starved => {}
         }
     }
 }
@@ -1016,6 +1077,18 @@ mod tests {
             encoding: encoding.into(),
         }];
         FetchCtx::new(&peers, &pcfg)
+    }
+
+    #[test]
+    fn unrated_peer_deadline_stays_below_the_default_stall_timeout() {
+        let ctx = ctx_with("auto");
+        // No rate sample: a black-holing peer must be evicted from the emission frontier well
+        // before the 60 s stall watchdog would kill the whole transfer.
+        assert_eq!(ctx.chunk_deadline(0, CHUNK_SEED), Duration::from_secs(20));
+        // With a rate, the deadline is 8× the expected duration, clamped to [10, 300] s.
+        ctx.set_rate(0, 4e6);
+        assert_eq!(ctx.chunk_deadline(0, 1 << 20), Duration::from_secs(10));
+        assert_eq!(ctx.chunk_deadline(0, 512 << 20), Duration::from_secs(300));
     }
 
     #[test]

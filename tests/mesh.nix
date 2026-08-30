@@ -395,6 +395,128 @@ in
     print("[bench] failover: completed via beta+noisy after alpha died mid-transfer")
 
     # =====================================================================================
+    # Resilience battery.
+    # =====================================================================================
+
+    # --- (a) Many small concurrent fetches alongside a big transfer -----------------------
+    # The nixpkgs-rebuild shape: a burst of small NARs must stay low-latency while one big
+    # transfer occupies stream slots (slot wake-ups + the serve-side small-encode lane).
+    small_hashes = []
+    for i in range(24):
+        for m in (alpha, beta):
+            m.succeed(f"seq -f 'narshare-small-{i}-%.0f' 1 4000 > /tmp/small-{i}")
+        p = alpha.succeed(f"nix-store --add /tmp/small-{i}").strip()
+        assert beta.succeed(f"nix-store --add /tmp/small-{i}").strip() == p
+        small_hashes.append(
+            alpha.succeed(f"nix-store -q --hash {p}").strip().split(":", 1)[1]
+        )
+        if i == 23:
+            last_hp = p.removeprefix("/nix/store/")[:32]
+    wait_narinfo(client, last_hp, 200)
+    client.succeed("rm -f /tmp/big-rc")
+    client.succeed(
+        f"( curl -sf -o /tmp/big.nar {nar_url}; echo $? > /tmp/big-rc ) >/dev/null 2>&1 &"
+    )
+    urls = " ".join(f"http://127.0.0.1:5051/nar/{h}.nar" for h in small_hashes)
+    t_small = float(client.succeed(
+        "t0=$(date +%s.%N); "
+        f"printf '%s\\n' {urls} | xargs -P 12 -I@ curl -sf -o /dev/null @ && "
+        "t1=$(date +%s.%N) && echo \"$t1 $t0\" | awk '{print $1-$2}'"
+    ).strip())
+    client.wait_until_succeeds("test -f /tmp/big-rc", timeout=120)
+    assert client.succeed("cat /tmp/big-rc").strip() == "0"
+    assert client.succeed("sha256sum /tmp/big.nar").split()[0] == sha_hex
+    assert t_small < 30, f"24 small NARs took {t_small:.1f}s under a concurrent big transfer"
+    print(f"[bench] 24 small NARs (x12 parallel, big transfer running): {t_small:.2f}s")
+
+    # --- (b) SIGSTOP black hole: accepts TCP, never answers ------------------------------
+    # The nastiest failure mode: alpha's kernel completes handshakes while the daemon is
+    # frozen. Chunk deadlines must strike it out of the transfer; the survivors finish.
+    # (alpha is shaped down so the fetch is guaranteed to still be running at the freeze.)
+    alpha.succeed("tc qdisc replace dev eth1 root netem rate 60mbit delay 5ms")
+    client.succeed("rm -f /tmp/bh-rc /tmp/bh.nar")
+    client.succeed(
+        f"( curl -sf -o /tmp/bh.nar {nar_url}; echo $? > /tmp/bh-rc ) >/dev/null 2>&1 &"
+    )
+    time.sleep(1.0)
+    t0 = time.time()
+    alpha.succeed("kill -STOP $(systemctl show -p MainPID --value narshare.service)")
+    client.wait_until_succeeds("test -f /tmp/bh-rc", timeout=90)
+    bh_secs = time.time() - t0
+    assert client.succeed("cat /tmp/bh-rc").strip() == "0"
+    assert client.succeed("sha256sum /tmp/bh.nar").split()[0] == sha_hex
+    print(f"[bench] black-holed holder mid-transfer: finished via survivors in {bh_secs:.1f}s")
+    # A FRESH transfer while alpha is still frozen must also complete, time-bounded.
+    t0 = time.time()
+    client.succeed(f"curl -sf --max-time 90 -o /tmp/bh2.nar {nar_url}")
+    assert client.succeed("sha256sum /tmp/bh2.nar").split()[0] == sha_hex
+    print(f"[bench] fresh transfer, holder still frozen: {time.time() - t0:.1f}s")
+    alpha.succeed("kill -CONT $(systemctl show -p MainPID --value narshare.service)")
+    alpha.succeed("tc qdisc del dev eth1 root")
+    alpha.wait_until_succeeds("curl -sf http://127.0.0.1:5051/nix-cache-info >/dev/null")
+
+    # --- (c) All holders dead: the narinfo must 404 FAST (do no harm) --------------------
+    # bhp/bnar32 is held only by beta. Kill beta, burn its breaker with one failed body,
+    # then the metadata itself must go 404 — nix falls straight through to its other
+    # substituters instead of stalling out per path.
+    beta.succeed("systemctl stop narshare.service")
+    # --max-time 3: the breaker opens within ~0.5s of the first refused chunks, and the 404
+    # must be probed while it is still open (15s cooldown), not after the half-open point.
+    client.fail(f"curl -sf --max-time 3 -o /dev/null http://127.0.0.1:5051/nar/{bnar32}.nar")
+    t404 = float(client.succeed(
+        f"t0=$(date +%s.%N); code=$(curl -s -o /dev/null -w '%{{http_code}}' "
+        f"http://127.0.0.1:5051/{bhp}.narinfo); t1=$(date +%s.%N); "
+        f"[ \"$code\" = 404 ] && echo \"$t1 $t0\" | awk '{{print $1-$2}}'"
+    ).strip())
+    assert t404 < 1.0, f"all-holders-dead narinfo took {t404:.2f}s (want instant 404)"
+    print(f"[conv] all-holders-dead narinfo: 404 in {t404 * 1000:.0f}ms")
+    beta.succeed("systemctl start narshare.service")
+    beta.wait_until_succeeds("curl -sf http://127.0.0.1:5051/nix-cache-info >/dev/null")
+    wait_narinfo(client, bhp, 200, timeout=45)  # breaker cooldown + ambient sync probe
+    client.succeed(f"curl -sf --max-time 60 -o /dev/null http://127.0.0.1:5051/nar/{bnar32}.nar")
+    print("[conv] holder recovery: breaker closed, path serves again")
+
+    # --- (d) Link degrades mid-transfer ---------------------------------------------------
+    # alpha's fast link collapses to 1 Mbit while a striped transfer runs: MW re-weights the
+    # stripe onto beta+noisy and the transfer still completes in bounded time.
+    # (pre-shaped for the same reason as (b): the collapse must land mid-transfer.)
+    alpha.succeed("tc qdisc replace dev eth1 root netem rate 60mbit delay 5ms")
+    client.succeed("rm -f /tmp/dg-rc /tmp/dg.nar")
+    client.succeed(
+        f"( curl -sf -o /tmp/dg.nar {nar_url}; echo $? > /tmp/dg-rc ) >/dev/null 2>&1 &"
+    )
+    time.sleep(1.0)
+    t0 = time.time()
+    alpha.succeed("tc qdisc replace dev eth1 root netem rate 1mbit delay 100ms limit 1000")
+    client.wait_until_succeeds("test -f /tmp/dg-rc", timeout=120)
+    assert client.succeed("cat /tmp/dg-rc").strip() == "0"
+    assert client.succeed("sha256sum /tmp/dg.nar").split()[0] == sha_hex
+    print(f"[bench] link collapsed to 1 Mbit mid-transfer: finished in {time.time() - t0:.1f}s")
+    alpha.succeed("tc qdisc del dev eth1 root")
+
+    # --- (e) Flapping holder under sequential fetch load ----------------------------------
+    # noisy restarts three times while the client pulls the shared NAR back to back: every
+    # fetch must succeed (multi-holder paths ride out a flapping peer).
+    client.succeed("rm -f /tmp/flap-rc")
+    client.succeed(
+        f"( for i in 1 2 3 4 5 6; do curl -sf -o /tmp/flap.nar {nar_url} || "
+        "{ echo fail > /tmp/flap-rc; exit 1; }; done; echo ok > /tmp/flap-rc ) "
+        ">/dev/null 2>&1 &"
+    )
+    for _ in range(3):
+        noisy.succeed("systemctl restart narshare.service")
+        time.sleep(2)
+    client.wait_until_succeeds("test -f /tmp/flap-rc", timeout=240)
+    assert client.succeed("cat /tmp/flap-rc").strip() == "ok"
+    assert client.succeed("sha256sum /tmp/flap.nar").split()[0] == sha_hex
+    print("[conv] six back-to-back fetches survived three holder restarts")
+    # The mesh still converges after the chaos: one more write on each holder lands.
+    for m, seed in ((alpha, "post-chaos-a"), (beta, "post-chaos-b"), (noisy, "post-chaos-n")):
+        _, chp = add_fixture(m, seed)
+        wait_narinfo(client, chp, 200, timeout=90)
+    print("[conv] mesh fully convergent after the resilience battery")
+
+    # =====================================================================================
     # Bounded CPU / bounded IO on a holder, judged with scratch proxies pinned to alpha:
     # "xauto" (closed-loop encoding, fresh under throttle) vs "xpinned" (zstd:19 control).
     # =====================================================================================

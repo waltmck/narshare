@@ -85,7 +85,7 @@ impl ProxyState {
                         index.save_mw(&names, &weights, best_rate, avg_loss)
                     })
                     .await
-                    .expect("weight saver task panicked");
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("save task died: {e}")));
                     if let Err(e) = res {
                         tracing::warn!("could not persist MW weights: {e:#}");
                     }
@@ -98,8 +98,15 @@ impl ProxyState {
     }
 
     /// Fetchable sources for a found narinfo: holders that are configured peers (never self —
-    /// nix checked its own store before asking us), restricted to the lowest tier present
-    /// (higher tiers are only consulted when no lower-tier peer holds the path).
+    /// nix checked its own store before asking us) whose breaker is not open RIGHT NOW,
+    /// restricted to the lowest tier present among those (higher tiers are only consulted when
+    /// no lower-tier peer can serve the path).
+    ///
+    /// Filtering breaker-open holders here — before any 200 is committed — is the "do no harm"
+    /// gate: all-holders-dead becomes an instant 404 (nix falls through to its other
+    /// substituters) instead of a transfer that coasts to the stall timeout, and a live tier-2
+    /// holder covers for a dead tier-1 one. Recovery is ambient: breakers half-open after the
+    /// cooldown, and the sync loops probe every peer regardless.
     fn sources_of(&self, found: &Found) -> Vec<(usize, String)> {
         let url = format!("nar/{}.nar", nixbase32::encode(&found.info.nar_hash));
         let mut v: Vec<(usize, String)> = found
@@ -107,6 +114,7 @@ impl ProxyState {
             .iter()
             .filter(|h| **h != self.index.self_name)
             .filter_map(|h| self.peers.idx_of(h))
+            .filter(|i| self.peers.list[*i].available())
             .map(|i| (i, url.clone()))
             .collect();
         if let Some(min_tier) = v.iter().map(|(i, _)| self.peers.list[*i].tier).min() {
@@ -145,8 +153,11 @@ async fn get_narinfo(State(st): State<Arc<ProxyState>>, UrlPath(file): UrlPath<S
         match tokio::task::spawn_blocking(move || index.lookup_hash_part(&hp)).await.unwrap() {
             Ok(rows) => rows,
             Err(e) => {
-                error!("index lookup: {e:#}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "index error\n").into_response();
+                // The index is disposable state and this substituter is consulted FIRST: a 500
+                // makes nix retry with backoff, a 404 falls through to its other substituters
+                // instantly. Log loudly, degrade to a miss.
+                error!("index lookup failed (answering 404): {e:#}");
+                return StatusCode::NOT_FOUND.into_response();
             }
         }
     };
@@ -193,8 +204,8 @@ async fn get_nar(
         {
             Ok(rows) => rows,
             Err(e) => {
-                error!("index lookup: {e:#}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "index error\n").into_response();
+                error!("index lookup failed (answering 404): {e:#}");
+                return StatusCode::NOT_FOUND.into_response();
             }
         }
     };
@@ -528,6 +539,39 @@ mod tests {
         let nar9 = crate::nixbase32::encode(&[9u8; 32]);
         let miss = http.get(format!("{}/nar/{nar9}.nar", client.url)).send().await.unwrap();
         assert_eq!(miss.status(), 404);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn breaker_open_holders_yield_fast_404s_until_recovery() {
+        // "Do no harm": when every holder of a path is breaker-open, both the narinfo and the
+        // nar must 404 instantly — nix falls through to its other substituters — instead of
+        // committing a 200 and coasting to the stall timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let (store_dir, db_path, _nar_size, nar_hash) = fake_store(dir.path());
+        let node =
+            spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let client = spawn_client(
+            "c",
+            &[("a", &node.url)],
+            "breaker_failures = 1\nbreaker_cooldown = \"300ms\"",
+            TrustedKeys::none(),
+        )
+        .await;
+        client.sync_all().await;
+        let http = reqwest::Client::new();
+        let url = format!("{}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo", client.url);
+        assert_eq!(http.get(&url).send().await.unwrap().status(), 200);
+
+        client.state.peers.strike(0); // the only holder trips its breaker
+        assert_eq!(http.get(&url).send().await.unwrap().status(), 404);
+        let nar32 = crate::nixbase32::encode(&nar_hash);
+        let nar =
+            http.get(format!("{}/nar/{nar32}.nar", client.url)).send().await.unwrap();
+        assert_eq!(nar.status(), 404);
+
+        // Cooldown elapsed: half-open counts as available, the path serves again.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(http.get(&url).send().await.unwrap().status(), 200);
     }
 
     #[tokio::test(flavor = "multi_thread")]
