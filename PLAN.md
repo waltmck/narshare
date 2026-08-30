@@ -25,7 +25,11 @@ consuming Nix validates the hash on ingestion. narshare carries no signing keys;
 refuses to relay narinfos *without* a `CA:` field (`ca_only`), so it structurally cannot become a
 channel for unsigned input-addressed paths even if a client misconfigures `trusted-public-keys`.
 Manifests and segment hashes are *efficiency* metadata, not trust: a lying manifest produces a stream
-that fails the final NarHash check, same as any corruption. (The serve side passes through whatever
+that fails the final NarHash check, same as any corruption. The integrity contract is deliberately
+one-sided: **a transfer that completes is correct**; availability against a peer serving wrong
+bytes is NOT guaranteed — corruption is detected once, at the end of a transfer, without
+attribution, because adjudicating which of two disagreeing sources is right is impossible short
+of hashing the whole stream. (The serve side passes through whatever
 `Sig:`/`CA:` the local db has — it is a faithful cache.)
 
 Scope decisions (settled):
@@ -293,9 +297,15 @@ Per NAR fetch:
    pool now prefers). Streaming SHA-256 of the emitted body is checked against `NarHash` at the
    end; mismatch aborts the response mid-stream so the client records a clean transfer failure.
 
-Per-segment blake3 gives what flat striping couldn't: **corruption attribution**. A segment that
-fails its hash is refetched from a different peer and the origin peer takes a loss-1 observation
-(and a log line naming it).
+Segment hashes are dedup KEYS, deliberately not verified against fetched bytes. (Per-segment
+verification with peer attribution was built, then removed: a manifest can lie as easily as a
+byte server, so a hash mismatch cannot say WHO is wrong — verification could only misattribute
+blame to honest byte servers while the manifest's supplier went untracked. Refusing to adjudicate
+is the honest design.) The one guarantee is the NarHash gate above plus nix's own CA validation:
+a completed transfer is correct. Transport failures (refused/reset/timeout) remain fully
+attributed through breakers and MW losses — only content-level blame is unknowable. A
+persistently corrupt peer therefore degrades paths it holds until removed from config; nix's
+`fallback` (ultimately the FOD builder) is the availability backstop.
 
 ### Failure semantics, consolidated
 
@@ -465,8 +475,9 @@ the module.
   below-floor transfer aborts after the grace and oversized lookups 404 for the epoch; with the
   floor unset (default), nothing ever aborts for slowness.
 * **M5 — manifests + intra-transfer dedup.** Manifest sink on the NAR walk, in-memory manifest LRU,
-  reconstruction planner (replay-under-budget / remote), per-segment blake3 verification +
-  attribution, manifest endpoint + graceful degradation to M4 striping. Acceptance: a synthetic
+  reconstruction planner (replay-under-budget / remote), segment hashes as dedup keys
+  (per-segment verification was built, then deliberately removed — see the reconstruction
+  section), manifest endpoint + graceful degradation to M4 striping. Acceptance: a synthetic
   tree of repeated blobs transfers each distinct blob once; the serve side's first-request manifest
   hashing overlaps sanely with concurrent plain serving.
 * **M5.5 — the two-extremes run.** Perf validation on the real pair (server ⇄ desktop, 10 GbE):

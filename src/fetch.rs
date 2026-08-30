@@ -3,9 +3,13 @@
 //!
 //! With a manifest (M5), the plan knows the tree: framing literals are synthesized locally and
 //! never fetched; file segments are fetched once per distinct blake3 across all holding peers and
-//! *replayed* at later occurrences under a bounded retention budget (dedup.rs); every fetched
-//! segment is blake3-verified before emission, giving per-peer corruption attribution. Without a
-//! manifest the plan degrades to one unverified span — exactly the M4 behavior.
+//! *replayed* at later occurrences under a bounded retention budget (dedup.rs). Segment hashes
+//! are dedup KEYS only — fetched bytes are deliberately NOT verified against them: when two
+//! sources disagree about a chunk, adjudication is impossible short of hashing the complete
+//! stream (a manifest can lie as easily as a byte server), so the contract is exactly one
+//! guarantee — a transfer that COMPLETES is correct (the streaming NarHash gate below, plus
+//! nix's own CA validation) — and availability against a peer serving wrong bytes is explicitly
+//! not guaranteed. Without a manifest the plan degrades to one span — exactly the M4 behavior.
 //!
 //! Engine shape adapted from propnix pin/engine.rs (same author): a queue, not a retry ladder
 //! (failures requeue at the lowest offset and re-consult the MW pool); liveness by byte progress,
@@ -42,6 +46,8 @@ const EPOCH: Duration = Duration::from_secs(1);
 const ROAMING_EPOCH: Duration = Duration::from_secs(600);
 /// Transfers below this skip the manifest roundtrip — not worth it.
 const MANIFEST_MIN: u64 = 4 << 20;
+// (There is deliberately no per-segment verification and no segment retry budget: see the
+// module doc — corruption is detected once, at the NarHash gate, without attribution.)
 /// Fetch ranges are merged across non-fetch gaps (framing lits, tiny replay holes) up to this
 /// size. An HTTP chunk request costs ~milliseconds regardless of size, so a tree of many small
 /// files would otherwise fragment the range space at every file boundary into sub-chunk
@@ -51,10 +57,6 @@ const MANIFEST_MIN: u64 = 4 << 20;
 /// file, ≤0.01% wire overhead on real trees. Dedup survives: replay holes are segment-sized
 /// (≥4 MiB from narshare peers), far above this threshold.
 const RANGE_MERGE_GAP: u64 = 64 << 10;
-/// A segment failing verification is refetched at most this many times before the transfer
-/// aborts (an incorrect manifest, or peers that persistently return the wrong bytes).
-const SEG_RETRIES: u32 = 3;
-
 #[derive(Default)]
 pub struct Stats {
     /// Uncompressed NAR bytes fetched from peers.
@@ -326,8 +328,9 @@ impl FetchCtx {
 enum SpanExec {
     /// Framing bytes synthesized locally.
     Lit { lit_off: usize, len: u64 },
-    /// Bytes fetched from peers; verified per-segment when a manifest hash is known.
-    Fetch { len: u64, verify: Option<[u8; 32]>, retain: Option<(usize, usize)> },
+    /// Bytes fetched from peers, emitted as they stream in; buffered whole only when later
+    /// occurrences will replay them.
+    Fetch { len: u64, retain: Option<(usize, usize)> },
     /// A later occurrence of a retained segment.
     Replay { unique: usize, len: u64 },
 }
@@ -342,7 +345,7 @@ struct Plan {
 
 fn fallback_plan(start: u64, end: u64) -> Plan {
     Plan {
-        spans: vec![(start, SpanExec::Fetch { len: end - start, verify: None, retain: None })],
+        spans: vec![(start, SpanExec::Fetch { len: end - start, retain: None })],
         lits: Bytes::new(),
         ranges: vec![(start, end - start)],
     }
@@ -359,12 +362,14 @@ fn manifest_plan(m: &Manifest, info: &RemoteNarinfo, budget: u64, window: u64) -
         anyhow::bail!("manifest NarSize {} != narinfo {}", layout.nar_size, info.nar_size);
     }
 
-    // Dedup plan over the segment occurrences, in NAR order. Two guards on the peer-supplied manifest:
-    //   * No span may exceed the fetch window, or it could never be fully buffered for
-    //     verification and every transfer would stall out (data-path #2).
+    // Dedup plan over the segment occurrences, in NAR order. The hashes are dedup KEYS, not
+    // checked against fetched bytes (see the module doc). Two guards on the peer-supplied
+    // manifest keep the DATA PATH sound regardless of what it claims:
+    //   * No span may exceed the fetch window — a RETAINED span must be assembled whole for
+    //     replay, and one bigger than the window could never be, stalling every transfer out.
     //   * A given segment hash must have ONE length across all its occurrences, or replay would
-    //     emit the wrong number of bytes and desync the stream past the NarHash gate (data-path
-    //     #1). Reject rather than fall back — a manifest this inconsistent cannot be relied on.
+    //     emit the wrong number of bytes and desync emission from the layout. Reject rather
+    //     than fall back — a manifest this inconsistent cannot be relied on.
     let mut keys = Vec::new();
     let mut sizes = Vec::new();
     let mut len_of: HashMap<[u8; 32], u64> = HashMap::new();
@@ -394,7 +399,7 @@ fn manifest_plan(m: &Manifest, info: &RemoteNarinfo, budget: u64, window: u64) -
             SpanKind::Lit { lit_off } => {
                 spans.push((span.nar_off, SpanExec::Lit { lit_off: *lit_off, len: span.len }))
             }
-            SpanKind::Segment { hash } => {
+            SpanKind::Segment { .. } => {
                 let step = steps[seg_i];
                 seg_i += 1;
                 match step {
@@ -403,7 +408,6 @@ fn manifest_plan(m: &Manifest, info: &RemoteNarinfo, budget: u64, window: u64) -
                             span.nar_off,
                             SpanExec::Fetch {
                                 len: span.len,
-                                verify: Some(*hash),
                                 retain: (retain_for > 0).then_some((unique, retain_for)),
                             },
                         ));
@@ -456,7 +460,6 @@ impl Drop for Slot {
 enum Pump {
     NeedData,
     Finished,
-    Refetch(u64, u64),
     Abort(String),
 }
 
@@ -475,7 +478,6 @@ struct Emitter {
     hasher: Sha256,
     buffered: BTreeMap<u64, Bytes>,
     held: HashMap<usize, (Bytes, usize)>,
-    retries: HashMap<u64, u32>,
 }
 
 impl Emitter {
@@ -526,8 +528,8 @@ impl Emitter {
                     self.emit(out, bytes).await?;
                     self.span_i += 1;
                 }
-                SpanExec::Fetch { len, verify: None, .. } => {
-                    // Streaming span (no per-segment hash): emit any contiguous prefix.
+                SpanExec::Fetch { len, retain: None } => {
+                    // Plain span: emit any contiguous prefix as it streams in.
                     let len = *len;
                     while self.span_emitted < len {
                         let want = len - self.span_emitted;
@@ -542,36 +544,21 @@ impl Emitter {
                     self.span_emitted = 0;
                     self.span_i += 1;
                 }
-                SpanExec::Fetch { len, verify: Some(hash), retain } => {
-                    let (len, hash, retain) = (*len, *hash, *retain);
+                SpanExec::Fetch { len, retain: Some((unique, retain_for)) } => {
+                    // Retained span: assembled whole so later occurrences can replay it.
+                    let (len, unique, retain_for) = (*len, *unique, *retain_for);
                     let Some(slices) = take_span(&mut self.buffered, off, off + len) else {
                         return Ok(Pump::NeedData);
                     };
-                    let mut h = blake3::Hasher::new();
+                    // Copy retained bytes OUT of the wire chunks: a Bytes slice would pin its
+                    // whole source chunk's allocation for the retention lifetime, letting real
+                    // memory exceed dedup_budget_bytes by up to chunk_size/segment_size. One
+                    // memcpy per RETAINED segment only.
+                    let mut owned = Vec::with_capacity(len as usize);
                     for b in &slices {
-                        h.update(b);
+                        owned.extend_from_slice(b);
                     }
-                    if h.finalize().as_bytes() != &hash {
-                        let n = self.retries.entry(off).or_insert(0);
-                        *n += 1;
-                        if *n > SEG_RETRIES {
-                            return Ok(Pump::Abort(format!(
-                                "segment @{off} failed verification {SEG_RETRIES} times"
-                            )));
-                        }
-                        return Ok(Pump::Refetch(off, len));
-                    }
-                    if let Some((unique, retain_for)) = retain {
-                        // Copy retained bytes OUT of the wire chunks: a Bytes slice would pin its
-                        // whole source chunk's allocation for the retention lifetime, letting real
-                        // memory exceed dedup_budget_bytes by up to chunk_size/segment_size. One
-                        // memcpy per RETAINED segment only.
-                        let mut owned = Vec::with_capacity(len as usize);
-                        for b in &slices {
-                            owned.extend_from_slice(b);
-                        }
-                        self.held.insert(unique, (Bytes::from(owned), retain_for));
-                    }
+                    self.held.insert(unique, (Bytes::from(owned), retain_for));
                     for b in slices {
                         self.emit(out, b).await?;
                     }
@@ -729,7 +716,6 @@ pub async fn run_transfer(
         hasher: Sha256::new(),
         buffered: BTreeMap::new(),
         held: HashMap::new(),
-        retries: HashMap::new(),
     };
 
     let (done_tx, mut done_rx) = mpsc::channel::<Done>(256);
@@ -738,8 +724,6 @@ pub async fn run_transfer(
     // Carving cursor over the fetch ranges.
     let mut range_i = 0usize;
     let mut range_pos = 0u64;
-    // Which peer supplied which bytes, for verification blame. Pruned as emission advances.
-    let mut origin: Vec<(u64, u64, usize)> = Vec::new();
     let mut last_progress = Instant::now();
     let mut retry_gate: Option<Instant> = None;
     // Bytes actually pulled from the network for THIS transfer (excludes local lits and replays),
@@ -751,11 +735,6 @@ pub async fn run_transfer(
         Err(()) => return,
         Ok(Pump::Finished) => return,
         Ok(Pump::NeedData) => {}
-        Ok(Pump::Refetch(off, len)) => {
-            ctx.stats.requeues.fetch_add(1, Ordering::Relaxed);
-            requeue.push(Reverse((off, len)));
-            retry_gate = Some(Instant::now() + Duration::from_millis(100));
-        }
         Ok(Pump::Abort(msg)) => {
             let _ = out.send(Err(std::io::Error::other(msg))).await;
             return;
@@ -864,31 +843,12 @@ pub async fn run_transfer(
                         ctx.stats.remote_bytes.fetch_add(done.len, Ordering::Relaxed);
                         ctx.stats.wire_bytes.fetch_add(chunk.wire, Ordering::Relaxed);
                         em.buffered.insert(done.off, chunk.bytes);
-                        origin.push((done.off, done.len, done.peer));
                         last_progress = Instant::now();
 
                         match em.pump(&out, &ctx.stats).await {
                             Err(()) => { workers.abort_all(); return; }
                             Ok(Pump::Finished) => return,
                             Ok(Pump::NeedData) => {}
-                            Ok(Pump::Refetch(off, len)) => {
-                                // Blame every peer whose bytes overlapped the bad segment, then
-                                // drop those attributions: the refetch gets fresh origin entries,
-                                // so a second failure blames only the replacement's supplier.
-                                for &(o, l, p) in &origin {
-                                    if o < off + len && o + l > off {
-                                        warn!(
-                                            "segment @{off} of {} failed blake3; blaming peer {}",
-                                            info.store_path, st.peers.list[p].name
-                                        );
-                                        ctx.pool.record_failure(p);
-                                    }
-                                }
-                                origin.retain(|&(o, l, _)| !(o < off + len && o + l > off));
-                                ctx.stats.requeues.fetch_add(1, Ordering::Relaxed);
-                                requeue.push(Reverse((off, len)));
-                                retry_gate = Some(Instant::now() + Duration::from_millis(100));
-                            }
                             Ok(Pump::Abort(msg)) => {
                                 warn!("aborting transfer of {}: {msg}", info.store_path);
                                 let _ = out.send(Err(std::io::Error::other(msg))).await;
@@ -896,7 +856,6 @@ pub async fn run_transfer(
                                 return;
                             }
                         }
-                        origin.retain(|&(o, l, _)| o + l > em.emit_pos);
                         // Merged-gap bytes (RANGE_MERGE_GAP) are fetched but never consumed —
                         // lits and replays emit from local data — so drop whatever the emitter
                         // has fully passed, or those fragments would sit in the map forever.

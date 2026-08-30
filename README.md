@@ -50,8 +50,9 @@ or use the bundled NixOS module (`nixosModules.narshare`), which wires that up v
 Milestones M0–M5 of PLAN.md are implemented and tested: serve side (seek-table NARs, ranges,
 io_uring + always-O_DIRECT reads, chunk-encoding, manifests), proxy side (hedged/coalesced/tiered
 lookup fan-out, circuit breakers, striped multi-peer fetch under multiplicative weights and a
-per-peer concurrency governor, per-segment blake3 verification with peer attribution,
-intra-transfer dedup, byte-progress stall + `min_bandwidth` roaming), restart recovery, and the
+per-peer concurrency governor, intra-transfer dedup keyed by manifest segment hashes — completed
+transfers are verified solely by the streaming NarHash gate; content-level peer attribution is
+deliberately out of scope — byte-progress stall + `min_bandwidth` roaming), restart recovery, and the
 M7 mesh VM suite (below). Remaining: observability (M6) and the two-extremes perf run (M5.5).
 
 ## Testing

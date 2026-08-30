@@ -41,9 +41,9 @@ that ceiling.)
 
 | path | goodput |
 |---|---|
-| direct serve, full NAR (stock-client path) | **1.18–1.22 GB/s** |
-| proxy, ranged (unverified striping) | **1.31 GB/s** |
-| proxy, full (manifest: dedup + blake3 verify + NarHash) | **0.67–0.76 GB/s** |
+| direct serve, full NAR (stock-client path) | **1.18–1.29 GB/s** |
+| proxy, ranged (no NarHash gate) | **1.30–1.31 GB/s** |
+| proxy, full — the real substitution path (manifest dedup + NarHash) | **1.12 GB/s** |
 
 Three ceilings were found and removed to get here (each was measured, not guessed):
 
@@ -59,10 +59,15 @@ Three ceilings were found and removed to get here (each was measured, not guesse
    (RANGE_MERGE_GAP): 4 ranges, ≤0.01% wire overhead, replay holes (≥ segment size) unmerged
    so dedup is untouched.
 
-The verified path's remaining gap to the ranged path is the emitter's serial stage — blake3
-verify + SHA-256 + copy on one task (~1.1 GB/s combined) — which on a real pair is the client's
-only significant load; parallelizing verification is the next lever if the hardware run needs
-it. The slow-link half of M5.5 (tc netem, 500 kbit / 300 ms) and the real 10 GbE pair remain.
+A fourth ceiling was removed on trust-model grounds rather than measurement: per-segment blake3
+verification (which cost the emitter a second serial hash pass, capping the full path at
+~0.75 GB/s) was dropped entirely — segment hashes cannot adjudicate disagreeing sources, so
+they are dedup keys only and the contract is "a completed transfer is correct" (see PLAN.md's
+reconstruction section). The full path's remaining ~14% gap to the ranged path is the NarHash
+SHA-256 gate, the design's acknowledged serial ceiling (~2.4 GB/s hardware). These numbers put
+the real substitution path at 10 GbE line rate with ONE machine running both ends plus the
+client; the real pair splits that CPU. The hardware pair run and the slow-link half of M5.5
+(tc netem, 500 kbit / 300 ms) remain.
 
 ## Per-chunk framing: compression ratio given up vs one continuous context
 
