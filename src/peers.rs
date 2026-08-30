@@ -84,6 +84,16 @@ pub struct Peer {
 struct Health {
     strikes: u32,
     open_until: Option<Instant>,
+    /// Cumulative open transitions — survives recovery, so tests and monitoring can attribute
+    /// "the breaker did fire during that scenario" after the fact.
+    opens: u64,
+}
+
+/// Point-in-time breaker view for the status endpoint.
+pub struct BreakerStatus {
+    pub strikes: u32,
+    pub open_ms_remaining: Option<u64>,
+    pub opens_total: u64,
 }
 
 impl Peer {
@@ -108,11 +118,27 @@ impl Peer {
         let mut h = self.health.lock().unwrap();
         h.strikes = h.strikes.saturating_add(1);
         if h.strikes >= threshold {
+            if h.open_until.is_none_or(|until| Instant::now() >= until) {
+                h.opens += 1; // a fresh open (or a half-open probe failing), not an extension
+            }
             h.open_until = Some(Instant::now() + cooldown);
             warn!(
                 "peer {name}: breaker open for {cooldown:?} ({} strikes)",
                 h.strikes
             );
+        }
+    }
+
+    pub fn breaker_status(&self) -> BreakerStatus {
+        let h = self.health.lock().unwrap();
+        let now = Instant::now();
+        BreakerStatus {
+            strikes: h.strikes,
+            open_ms_remaining: h
+                .open_until
+                .filter(|&u| u > now)
+                .map(|u| (u - now).as_millis() as u64),
+            opens_total: h.opens,
         }
     }
 }

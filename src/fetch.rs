@@ -75,6 +75,35 @@ pub struct Stats {
     pub lit_bytes: AtomicU64,
     /// Chunk-level failures that were requeued.
     pub requeues: AtomicU64,
+
+    // Transfer outcomes. Every run_transfer exit increments exactly one terminal counter, so
+    // `started - Σ(terminal)` is the live-transfer gauge — the status endpoint's leak check.
+    pub transfers_started: AtomicU64,
+    pub transfers_completed: AtomicU64,
+    pub aborts_stall: AtomicU64,
+    pub aborts_streak: AtomicU64,
+    pub aborts_min_bandwidth: AtomicU64,
+    pub aborts_hash_mismatch: AtomicU64,
+    /// Plan-integrity aborts (inconsistent manifest, replay bugs) — should stay 0.
+    pub aborts_other: AtomicU64,
+    /// The downstream (nix) hung up mid-transfer; not our failure.
+    pub clients_gone: AtomicU64,
+    /// Transfers that ran from a manifest plan (vs plain striping).
+    pub manifest_plans: AtomicU64,
+}
+
+impl Stats {
+    pub fn active_transfers(&self) -> u64 {
+        let started = self.transfers_started.load(Ordering::Relaxed);
+        let ended = self.transfers_completed.load(Ordering::Relaxed)
+            + self.aborts_stall.load(Ordering::Relaxed)
+            + self.aborts_streak.load(Ordering::Relaxed)
+            + self.aborts_min_bandwidth.load(Ordering::Relaxed)
+            + self.aborts_hash_mismatch.load(Ordering::Relaxed)
+            + self.aborts_other.load(Ordering::Relaxed)
+            + self.clients_gone.load(Ordering::Relaxed);
+        started.saturating_sub(ended)
+    }
 }
 
 /// Per-peer dynamic stream budget, sized by the governor.
@@ -130,6 +159,11 @@ impl PeerLimit {
     fn has_idle_capacity(&self) -> bool {
         let s = self.state.lock().unwrap();
         s.inflight < s.limit
+    }
+
+    fn snapshot(&self) -> (usize, usize) {
+        let s = self.state.lock().unwrap();
+        (s.inflight, s.limit)
     }
 
     /// Fold a completion into the current epoch; close the epoch when it has run long enough.
@@ -327,6 +361,23 @@ impl FetchCtx {
         *self.roaming_until.lock().unwrap() = Some(Instant::now() + ROAMING_EPOCH);
     }
 
+    /// Point-in-time adaptive state for the status endpoint:
+    /// (per-stream rate B/s, auto zstd level, streams in flight, stream limit).
+    pub fn peer_net_status(&self, peer: usize) -> (f64, i32, usize, usize) {
+        let net = self.net[peer].lock().unwrap();
+        let (inflight, limit) = self.limits[peer].snapshot();
+        (net.rate, net.level, inflight, limit)
+    }
+
+    pub fn roaming_ms_remaining(&self) -> Option<u64> {
+        let now = Instant::now();
+        self.roaming_until
+            .lock()
+            .unwrap()
+            .filter(|&u| u > now)
+            .map(|u| (u - now).as_millis() as u64)
+    }
+
     /// While a roaming epoch is active, paths bigger than the floor×grace bound are refused at
     /// lookup time — exactly the ones a `min_bandwidth` abort would forfeit anyway.
     pub fn refuses_while_roaming(&self, nar_size: u64) -> bool {
@@ -487,6 +538,23 @@ enum Pump {
     Abort(String),
 }
 
+/// Why emission stopped dead (as opposed to a Pump::Abort, which is a plan-integrity verdict).
+enum EmitEnd {
+    /// The downstream receiver hung up.
+    ClientGone,
+    /// The reconstructed stream failed the NarHash gate (already reported downstream).
+    HashMismatch,
+}
+
+impl Stats {
+    fn count_emit_end(&self, end: &EmitEnd) {
+        match end {
+            EmitEnd::ClientGone => self.clients_gone.fetch_add(1, Ordering::Relaxed),
+            EmitEnd::HashMismatch => self.aborts_hash_mismatch.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+}
+
 /// Emission state: walks the plan in order, consuming buffered fetched bytes, synthesizing
 /// literals, verifying + retaining segments, replaying duplicates, hashing the whole stream.
 struct Emitter {
@@ -511,7 +579,7 @@ impl Emitter {
         &mut self,
         out: &mpsc::Sender<std::io::Result<Bytes>>,
         stats: &Stats,
-    ) -> Result<Pump, ()> {
+    ) -> Result<Pump, EmitEnd> {
         loop {
             if self.span_i >= self.spans.len() {
                 return Ok(Pump::Finished);
@@ -593,12 +661,13 @@ impl Emitter {
     }
 
     /// Send one piece downstream, hashing, with the final bytes of a full transfer withheld
-    /// until the NarHash verifies. Err(()) = client went away or hash mismatch (already reported).
+    /// until the NarHash verifies. Err distinguishes the two dead ends (already reported
+    /// downstream where applicable) so the caller can attribute the outcome.
     async fn emit(
         &mut self,
         out: &mpsc::Sender<std::io::Result<Bytes>>,
         b: Bytes,
-    ) -> Result<(), ()> {
+    ) -> Result<(), EmitEnd> {
         if self.full {
             self.hasher.update(&b);
             if self.emit_pos + b.len() as u64 == self.end {
@@ -606,12 +675,12 @@ impl Emitter {
                 if got[..] != self.nar_hash {
                     warn!("NarHash mismatch on reconstruction — aborting stream");
                     let _ = out.send(Err(std::io::Error::other("NarHash mismatch"))).await;
-                    return Err(());
+                    return Err(EmitEnd::HashMismatch);
                 }
             }
         }
         self.emit_pos += b.len() as u64;
-        out.send(Ok(b)).await.map_err(|_| ())
+        out.send(Ok(b)).await.map_err(|_| EmitEnd::ClientGone)
     }
 }
 
@@ -698,6 +767,7 @@ pub async fn run_transfer(
     out: mpsc::Sender<std::io::Result<Bytes>>,
 ) {
     let ctx = &st.fetch;
+    ctx.stats.transfers_started.fetch_add(1, Ordering::Relaxed);
     let t0 = Instant::now();
     let peer_ids: Vec<usize> = sources.iter().map(|(p, _)| *p).collect();
     let url_of: HashMap<usize, String> = sources.into_iter().collect();
@@ -714,6 +784,7 @@ pub async fn run_transfer(
                         p.spans.len(),
                         p.ranges.len()
                     );
+                    ctx.stats.manifest_plans.fetch_add(1, Ordering::Relaxed);
                     p
                 }
                 Err(e) => {
@@ -769,10 +840,17 @@ pub async fn run_transfer(
 
     // Emit whatever needs no data at all (lits-first layouts, pure-replay tails).
     match em.pump(&out, &ctx.stats).await {
-        Err(()) => return,
-        Ok(Pump::Finished) => return,
+        Err(end) => {
+            ctx.stats.count_emit_end(&end);
+            return;
+        }
+        Ok(Pump::Finished) => {
+            ctx.stats.transfers_completed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         Ok(Pump::NeedData) => {}
         Ok(Pump::Abort(msg)) => {
+            ctx.stats.aborts_other.fetch_add(1, Ordering::Relaxed);
             let _ = out.send(Err(std::io::Error::other(msg))).await;
             return;
         }
@@ -909,7 +987,11 @@ pub async fn run_transfer(
         let stall_at = tokio::time::Instant::from_std(wake);
         tokio::select! {
             done = done_rx.recv() => {
-                let Some(done) = done else { return };
+                let Some(done) = done else {
+                    // Unreachable (we hold a sender), but keep the outcome accounting airtight.
+                    ctx.stats.aborts_other.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
                 inflight.remove(&done.off);
                 match done.result {
                     Ok(chunk) => {
@@ -936,11 +1018,19 @@ pub async fn run_transfer(
                         failure_streak = 0;
 
                         match em.pump(&out, &ctx.stats).await {
-                            Err(()) => { workers.abort_all(); return; }
-                            Ok(Pump::Finished) => return,
+                            Err(end) => {
+                                ctx.stats.count_emit_end(&end);
+                                workers.abort_all();
+                                return;
+                            }
+                            Ok(Pump::Finished) => {
+                                ctx.stats.transfers_completed.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
                             Ok(Pump::NeedData) => {}
                             Ok(Pump::Abort(msg)) => {
                                 warn!("aborting transfer of {}: {msg}", info.store_path);
+                                ctx.stats.aborts_other.fetch_add(1, Ordering::Relaxed);
                                 let _ = out.send(Err(std::io::Error::other(msg))).await;
                                 workers.abort_all();
                                 return;
@@ -969,6 +1059,7 @@ pub async fn run_transfer(
                                     info.store_path
                                 );
                                 ctx.set_roaming();
+                                ctx.stats.aborts_min_bandwidth.fetch_add(1, Ordering::Relaxed);
                                 let _ = out
                                     .send(Err(std::io::Error::other("below min_bandwidth")))
                                     .await;
@@ -1001,6 +1092,7 @@ pub async fn run_transfer(
                                  failures with no completion",
                                 info.store_path
                             );
+                            ctx.stats.aborts_streak.fetch_add(1, Ordering::Relaxed);
                             let _ = out
                                 .send(Err(std::io::Error::other("peers failing persistently")))
                                 .await;
@@ -1028,6 +1120,7 @@ pub async fn run_transfer(
                         "transfer of {} stalled ({:?} without progress)",
                         info.store_path, ctx.cfg_stall
                     );
+                    ctx.stats.aborts_stall.fetch_add(1, Ordering::Relaxed);
                     let _ = out.send(Err(std::io::Error::other("transfer stalled"))).await;
                     workers.abort_all();
                     return;

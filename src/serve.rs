@@ -83,6 +83,20 @@ pub struct ServeState {
     /// many-small-concurrent-fetches case a nixpkgs rebuild produces. Same permit count;
     /// bounded extra memory (permits × SMALL_ENCODE_SPAN).
     encode_sem_small: tokio::sync::Semaphore,
+    pub stats: ServeStats,
+}
+
+/// Cumulative serve-side counters for the status endpoint.
+#[derive(Default)]
+pub struct ServeStats {
+    pub narinfo_requests: std::sync::atomic::AtomicU64,
+    pub nar_requests: std::sync::atomic::AtomicU64,
+    pub nar_misses: std::sync::atomic::AtomicU64,
+    pub manifest_requests: std::sync::atomic::AtomicU64,
+    pub chunks_encoded: std::sync::atomic::AtomicU64,
+    /// Total time chunk requests spent WAITING for an encode permit — the serve side's
+    /// CPU-saturation signal (it is also folded per-chunk into x-narshare-encode-us).
+    pub encode_wait_us: std::sync::atomic::AtomicU64,
 }
 
 /// Spans at or below this use the small-encode lane.
@@ -150,7 +164,13 @@ impl ServeState {
             )),
             encode_sem: tokio::sync::Semaphore::new(encode_permits()),
             encode_sem_small: tokio::sync::Semaphore::new(encode_permits()),
+            stats: ServeStats::default(),
         })
+    }
+
+    /// (big-lane permits free, small-lane permits free) — for the status endpoint.
+    pub fn encode_permits_free(&self) -> (usize, usize) {
+        (self.encode_sem.available_permits(), self.encode_sem_small.available_permits())
     }
 }
 
@@ -169,6 +189,7 @@ pub fn router(state: Arc<ServeState>) -> Router {
 /// and disconnect (axum cancels their handlers) — the result must land in the cache anyway so a
 /// later transfer finds it, instead of every retry restarting the read from scratch.
 async fn get_manifest(State(st): State<Arc<ServeState>>, UrlPath(hash): UrlPath<String>) -> Response {
+    st.stats.manifest_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some(nar_hash) = nixbase32::decode(&hash, 32).map(|v| <[u8; 32]>::try_from(v).unwrap())
     else {
         return StatusCode::NOT_FOUND.into_response();
@@ -273,6 +294,7 @@ async fn cache_info(State(st): State<Arc<ServeState>>) -> Response {
 }
 
 async fn get_narinfo(State(st): State<Arc<ServeState>>, UrlPath(file): UrlPath<String>) -> Response {
+    st.stats.narinfo_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some(hash_part) = file.strip_suffix(".narinfo").map(str::to_owned) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -306,9 +328,13 @@ async fn get_nar(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
+    st.stats.nar_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let entry = match nar_entry(&st, nar_hash).await {
         Ok(Some(e)) => e,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => {
+            st.stats.nar_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return StatusCode::NOT_FOUND.into_response();
+        }
         Err(e) => return err500("nar lookup", e),
     };
     let table = match seek_table(&st, nar_hash, &entry).await {
@@ -359,6 +385,10 @@ async fn get_nar(
                 };
                 let _permit = sem.acquire().await.expect("semaphore closed");
                 let wait = waited.elapsed();
+                st.stats.chunks_encoded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                st.stats
+                    .encode_wait_us
+                    .fetch_add(wait.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 return match encode_span(&st, &table, start, end, level).await {
                     Ok((frame, read_d, enc_d)) => Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)

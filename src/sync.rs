@@ -54,6 +54,22 @@ pub struct Sync {
     kick_rxs: std::sync::Mutex<Vec<Option<mpsc::Receiver<()>>>>,
     hint_tx: mpsc::Sender<()>,
     hint_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+    pub stats: SyncStats,
+}
+
+/// Cumulative sync-subsystem counters for the status endpoint.
+#[derive(Default)]
+pub struct SyncStats {
+    pub pulls_ok: std::sync::atomic::AtomicU64,
+    pub pulls_err: std::sync::atomic::AtomicU64,
+    pub suffix_events_applied: std::sync::atomic::AtomicU64,
+    pub snapshots_applied: std::sync::atomic::AtomicU64,
+    pub self_generation_bumps: std::sync::atomic::AtomicU64,
+    pub hints_received: std::sync::atomic::AtomicU64,
+    pub hint_rounds_sent: std::sync::atomic::AtomicU64,
+    pub exports: std::sync::atomic::AtomicU64,
+    pub export_events: std::sync::atomic::AtomicU64,
+    pub sync_requests_served: std::sync::atomic::AtomicU64,
 }
 
 impl Sync {
@@ -81,6 +97,7 @@ impl Sync {
             kick_rxs: std::sync::Mutex::new(kick_rxs),
             hint_tx,
             hint_rx: std::sync::Mutex::new(Some(hint_rx)),
+            stats: SyncStats::default(),
         })
     }
 
@@ -94,6 +111,17 @@ impl Sync {
     /// One full sync with a peer: pull journal suffixes / snapshots for every origin until
     /// nothing is truncated. Returns whether anything changed locally.
     pub async fn pull_from(&self, idx: usize) -> Result<bool> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let r = self.pull_from_inner(idx).await;
+        match &r {
+            Ok(_) => self.stats.pulls_ok.fetch_add(1, Relaxed),
+            Err(_) => self.stats.pulls_err.fetch_add(1, Relaxed),
+        };
+        r
+    }
+
+    async fn pull_from_inner(&self, idx: usize) -> Result<bool> {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut changed_any = false;
         for _ in 0..MAX_ROUNDS {
             let req = proto::SyncRequest {
@@ -132,6 +160,7 @@ impl Sync {
                         tokio::task::spawn_blocking(move || index.bump_self_generation(floor))
                             .await
                             .map_err(|e| anyhow::anyhow!("bump task died: {e}"))??;
+                        self.stats.self_generation_bumps.fetch_add(1, Relaxed);
                         self.hint_peers();
                     }
                     continue;
@@ -141,21 +170,22 @@ impl Sync {
                 }
                 let index = self.index.clone();
                 let origin = up.origin.clone();
-                let out = tokio::task::spawn_blocking(move || -> Result<(bool, bool)> {
+                // (changed, truncated, suffix events applied, snapshot applied)
+                let out = tokio::task::spawn_blocking(move || -> Result<(bool, bool, u64, bool)> {
                     match up.body {
                         None | Some(proto::origin_update::Body::UpToDate(_)) => {
-                            Ok((false, false))
+                            Ok((false, false, 0, false))
                         }
                         Some(proto::origin_update::Body::Suffix(sfx)) => {
                             match index.apply_suffix(&origin, up.generation, &sfx.events)? {
-                                Apply::Applied(n) => Ok((n > 0, up.truncated)),
+                                Apply::Applied(n) => Ok((n > 0, up.truncated, n as u64, false)),
                                 Apply::NeedSnapshot => {
                                     // Shouldn't happen against a consistent responder (it
                                     // decides suffix-vs-snapshot from OUR clock); keep the
                                     // truncated flag — a budget-deferred origin arrives as an
                                     // empty truncated suffix and must trigger the next round.
                                     warn!("origin {origin}: suffix did not connect to our state");
-                                    Ok((false, up.truncated))
+                                    Ok((false, up.truncated, 0, false))
                                 }
                             }
                         }
@@ -163,7 +193,7 @@ impl Sync {
                             let n =
                                 index.apply_snapshot(&origin, up.generation, up.seq, &snap.held)?;
                             debug!("origin {origin}: snapshot applied ({n} rows)");
-                            Ok((true, false))
+                            Ok((true, false, 0, true))
                         }
                     }
                 })
@@ -171,6 +201,10 @@ impl Sync {
                 .map_err(|e| anyhow::anyhow!("apply task died: {e}"))??;
                 changed_any |= out.0;
                 truncated |= out.1;
+                self.stats.suffix_events_applied.fetch_add(out.2, Relaxed);
+                if out.3 {
+                    self.stats.snapshots_applied.fetch_add(1, Relaxed);
+                }
             }
             if !truncated {
                 break;
@@ -191,9 +225,15 @@ impl Sync {
     pub async fn export_own_db(&self) -> Result<usize> {
         let Some(db) = self.db.clone() else { return Ok(0) };
         let index = self.index.clone();
-        tokio::task::spawn_blocking(move || index.sync_own_db(&db))
+        let n = tokio::task::spawn_blocking(move || index.sync_own_db(&db))
             .await
-            .expect("differ task panicked")
+            .map_err(|e| anyhow::anyhow!("differ task died: {e}"))??;
+        if n > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.stats.exports.fetch_add(1, Relaxed);
+            self.stats.export_events.fetch_add(n as u64, Relaxed);
+        }
+        Ok(n)
     }
 
     /// Nudge every peer to pull from us (debounced by the hint loop).
@@ -257,6 +297,9 @@ impl Sync {
                     // channel's single slot and trigger one more (cheap) round. Breaker-open
                     // peers are skipped — a hint is an optimization, not a probe; they catch
                     // up on their own sync timer once they recover.
+                    self.stats
+                        .hint_rounds_sent
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     for idx in 0..self.peers.list.len() {
                         if !self.peers.list[idx].available() {
                             continue;
@@ -381,11 +424,14 @@ async fn handle_sync(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> Response
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("sync respond task died: {e}")));
     match out {
-        Ok(z) => (
-            [(header::CONTENT_TYPE, "application/x-narshare-sync")],
-            z,
-        )
-            .into_response(),
+        Ok(z) => {
+            s.stats.sync_requests_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (
+                [(header::CONTENT_TYPE, "application/x-narshare-sync")],
+                z,
+            )
+                .into_response()
+        }
         Err(e) => {
             warn!("sync response failed: {e:#}");
             (StatusCode::INTERNAL_SERVER_ERROR, "sync failed\n").into_response()
@@ -401,6 +447,7 @@ async fn handle_hint(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> StatusCo
         return StatusCode::BAD_REQUEST;
     };
     if let Some(idx) = s.peers.idx_of(&hint.from) {
+        s.stats.hints_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = s.kicks[idx].try_send(());
     }
     StatusCode::OK

@@ -612,9 +612,13 @@ the module.
   validation via `tc netem` on a veth pair (500 kbit / 300 ms RTT): transfer completes, stall never
   false-fires, auto-encoding lands at high zstd. `[io] concurrency`, chunk targets, and encoding
   tiers swept and recorded in `docs/perf.md` so the defaults are measured, not guessed.
-* **M6 — observability.** `tracing` spans per fetch; `/metrics` (per-peer weight, goodput, governor
-  operating point, breaker state, replay/remote byte split, index size + sync watermarks — the
-  fun dashboard).
+* **M6 — observability.** DONE: `GET /narshare/v1/status` on both listeners — one JSON document,
+  strictly machine-ingestible (no HTML/JS): per-peer MW weight / goodput / governor operating
+  point / breaker state (incl. cumulative opens), transfer outcomes attributed per mechanism
+  (completed, stall, streak, min_bandwidth, hash_mismatch, client-gone) with an active-transfer
+  leak gauge, replay/remote/lit byte split, per-origin index clocks + journal/holding sizes +
+  watermarks, and sync/serve counters. `index.origins[*].{generation,seq}` doubles as the
+  convergence identity the VM suite asserts across nodes.
 * **M8 — the replicated mesh index.** Feasible-narinfo catalog with holder tracking, per-origin
   journals with watermark-ack compaction and snapshot recovery, generations, hint+pull
   propagation (transitive), inotify-triggered own-db export, /var/cache/narshare persistence,

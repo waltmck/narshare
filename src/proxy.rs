@@ -347,8 +347,17 @@ mod tests {
                 .unwrap(),
         );
         let s = sync::Sync::new(index.clone(), peers, Some(db.clone()), None);
+        let status = crate::status::router(Arc::new(crate::status::StatusCtx {
+            name: name.to_owned(),
+            started: Instant::now(),
+            index: index.clone(),
+            proxy: None,
+            sync: Some(s.clone()),
+            serve: Some(serve_state.clone()),
+        }));
         let (url, handle) =
-            spawn_router_killable(serve::router(serve_state).merge(s.router())).await;
+            spawn_router_killable(serve::router(serve_state).merge(s.router()).merge(status))
+                .await;
         TestNode { url, index, db, handle, _dir: dir }
     }
 
@@ -407,7 +416,15 @@ mod tests {
             &cfg.peers,
             toml::from_str(&format!("listen = \"127.0.0.1:0\"\n{extra}")).unwrap(),
         );
-        let url = spawn_router(router(state.clone())).await;
+        let status = crate::status::router(Arc::new(crate::status::StatusCtx {
+            name: name.to_owned(),
+            started: Instant::now(),
+            index: index.clone(),
+            proxy: Some(state.clone()),
+            sync: Some(s.clone()),
+            serve: None,
+        }));
+        let url = spawn_router(router(state.clone()).merge(status)).await;
         TestClient { url, state, sync: s, index, dir }
     }
 
@@ -539,6 +556,82 @@ mod tests {
         let nar9 = crate::nixbase32::encode(&[9u8; 32]);
         let miss = http.get(format!("{}/nar/{nar9}.nar", client.url)).send().await.unwrap();
         assert_eq!(miss.status(), 404);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_endpoint_reports_the_whole_story() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store_dir, db_path, nar_size, nar_hash) = fake_store(dir.path());
+        let node =
+            spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let client = spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
+        client.sync_all().await;
+        let http = reqwest::Client::new();
+        let nar32 = crate::nixbase32::encode(&nar_hash);
+        let body = http
+            .get(format!("{}/nar/{nar32}.nar", client.url))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(body.len() as u64, nar_size);
+
+        let fetch_status = |url: String| {
+            let http = http.clone();
+            async move {
+                let text =
+                    http.get(format!("{url}/narshare/v1/status")).send().await.unwrap();
+                assert_eq!(
+                    text.headers()[reqwest::header::CONTENT_TYPE],
+                    "application/json"
+                );
+                serde_json::from_str::<serde_json::Value>(&text.text().await.unwrap()).unwrap()
+            }
+        };
+        // The completed-counter increment races the last body byte by a hair: poll briefly.
+        let mut st = fetch_status(client.url.clone()).await;
+        for _ in 0..50 {
+            if st["proxy"]["transfers"]["active"] == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            st = fetch_status(client.url.clone()).await;
+        }
+        assert_eq!(st["name"], "c");
+        let t = &st["proxy"]["transfers"];
+        assert_eq!(t["active"], 0, "no leaked transfers: {t}");
+        assert_eq!(t["completed"], 1);
+        assert_eq!(t["aborted"]["stall"], 0);
+        let peer = &st["proxy"]["peers"][0];
+        assert_eq!(peer["name"], "a");
+        assert_eq!(peer["available"], true);
+        assert_eq!(peer["breaker"]["opens_total"], 0);
+        assert!(st["proxy"]["bytes"]["remote"].as_u64().unwrap() >= nar_size);
+        assert!(st["sync"]["pulls_ok"].as_u64().unwrap() >= 1);
+        assert!(st["sync"]["snapshots_applied"].as_u64().unwrap() >= 1, "first contact");
+        assert!(st["serve"].is_null(), "a proxy-only node reports no serve section");
+
+        // The holder's view: serve counters moved, sync requests were served, and the index
+        // identity (per-origin generation/seq) agrees exactly with the client's — the
+        // convergence check the VM suite leans on.
+        let ns = fetch_status(node.url.clone()).await;
+        assert!(ns["serve"]["nar_requests"].as_u64().unwrap() >= 1);
+        assert!(ns["sync"]["sync_requests_served"].as_u64().unwrap() >= 1);
+        let find = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+            v["index"]["origins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let (ca, na) = (find(&st, "a"), find(&ns, "a"));
+        assert_eq!(ca["generation"], na["generation"]);
+        assert_eq!(ca["seq"], na["seq"]);
+        assert_eq!(st["index"]["narinfos"], ns["index"]["narinfos"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -14,6 +14,7 @@ mod pool;
 mod proxy;
 mod serve;
 mod sig;
+mod status;
 mod sync;
 
 use anyhow::{Context, Result};
@@ -137,7 +138,7 @@ async fn run(cfg: config::Config) -> Result<()> {
             .await
             .with_context(|| format!("binding serve listener {listen}"))?;
         info!("serving {store_dir} as a binary cache on http://{listen}");
-        serve_parts = Some((listener, serve::router(state)));
+        serve_parts = Some((listener, state));
     }
 
     // The sync subsystem exists whenever there are peers; its endpoints ride the serve
@@ -146,7 +147,33 @@ async fn run(cfg: config::Config) -> Result<()> {
         .as_ref()
         .map(|p| sync::Sync::new(idx.clone(), p.clone(), serve_db.clone(), nix_db_dir.clone()));
 
-    if let Some((listener, mut router)) = serve_parts {
+    let mut proxy_parts = None;
+    if let Some(pcfg) = cfg.proxy {
+        let listen = pcfg.listen;
+        let peers = peers.clone().context("[proxy] requires [[peers]]")?;
+        let n = peers.list.len();
+        let state = proxy::ProxyState::new(peers, idx.clone(), &cfg.peers, pcfg);
+        state.spawn_weight_saver(shutdown_rx.clone());
+        let listener = tokio::net::TcpListener::bind(listen)
+            .await
+            .with_context(|| format!("binding proxy listener {listen}"))?;
+        info!("proxying the mesh index over {n} peer(s) as a substituter on http://{listen}");
+        proxy_parts = Some((listener, state));
+    }
+
+    // The status endpoint rides BOTH listeners: loopback via the proxy, mesh-visible via
+    // serve (the mesh is the trust boundary; peers reading each other's state is a feature).
+    let status_ctx = Arc::new(status::StatusCtx {
+        name: cfg.name.clone(),
+        started: std::time::Instant::now(),
+        index: idx.clone(),
+        proxy: proxy_parts.as_ref().map(|(_, st)| st.clone()),
+        sync: sync_ctx.clone(),
+        serve: serve_parts.as_ref().map(|(_, st)| st.clone()),
+    });
+
+    if let Some((listener, state)) = serve_parts {
+        let mut router = serve::router(state).merge(status::router(status_ctx.clone()));
         if let Some(s) = &sync_ctx {
             router = router.merge(s.router());
         }
@@ -161,19 +188,11 @@ async fn run(cfg: config::Config) -> Result<()> {
         });
     }
 
-    if let Some(pcfg) = cfg.proxy {
-        let listen = pcfg.listen;
-        let peers = peers.clone().context("[proxy] requires [[peers]]")?;
-        let n = peers.list.len();
-        let state = proxy::ProxyState::new(peers, idx.clone(), &cfg.peers, pcfg);
-        state.spawn_weight_saver(shutdown_rx.clone());
-        let listener = tokio::net::TcpListener::bind(listen)
-            .await
-            .with_context(|| format!("binding proxy listener {listen}"))?;
-        info!("proxying the mesh index over {n} peer(s) as a substituter on http://{listen}");
+    if let Some((listener, state)) = proxy_parts {
+        let router = proxy::router(state).merge(status::router(status_ctx.clone()));
         let mut rx = shutdown_rx.clone();
         tasks.spawn(async move {
-            axum::serve(listener, proxy::router(state))
+            axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     let _ = rx.changed().await;
                 })

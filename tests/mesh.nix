@@ -156,9 +156,57 @@ in
   };
 
   testScript = ''
+    import json
     import time
 
     results = []
+
+    # ---- observability helpers (the /narshare/v1/status endpoint) ----------------------
+    def status(machine):
+        return json.loads(
+            machine.succeed("curl -sf http://127.0.0.1:5051/narshare/v1/status")
+        )
+
+    CORE = ("alpha", "beta", "noisy", "client")
+
+    def identity(machine):
+        """The convergence identity: per-origin (generation, seq) plus the narinfo count.
+        Two fully synced nodes must agree EXACTLY."""
+        st = status(machine)
+        clocks = {
+            o["name"]: (o["generation"], o["seq"])
+            for o in st["index"]["origins"]
+            if o["name"] in CORE
+        }
+        return clocks, st["index"]["narinfos"]
+
+    def wait_converged(machines, timeout=120, tag=""):
+        deadline = time.time() + timeout
+        while True:
+            ids = [identity(m) for m in machines]
+            if all(i == ids[0] for i in ids[1:]):
+                print(f"[status] {tag}: mesh convergent — {ids[0][1]} narinfos, "
+                      f"clocks {ids[0][0]}")
+                return
+            if time.time() > deadline:
+                raise AssertionError(f"{tag}: mesh did not converge: {ids}")
+            time.sleep(3)
+
+    def tsnap(machine):
+        """(transfer counters, per-peer breaker opens) for before/after delta assertions."""
+        p = status(machine)["proxy"]
+        return p["transfers"], {q["name"]: q["breaker"]["opens_total"] for q in p["peers"]}
+
+    def wait_no_active_transfers(machines, timeout=150):
+        deadline = time.time() + timeout
+        while True:
+            active = {m.name: status(m)["proxy"]["transfers"]["active"] for m in machines}
+            if all(v == 0 for v in active.values()):
+                print("[status] no leaked transfers anywhere")
+                return
+            if time.time() > deadline:
+                raise AssertionError(f"leaked transfers: {active}")
+            time.sleep(3)
 
     def rx_bytes(iface):
         return int(client.succeed(f"cat /sys/class/net/{iface}/statistics/rx_bytes").strip())
@@ -254,6 +302,9 @@ in
     assert f"URL: nar/{nar32}.nar" in ni, ni
     # A miss is a free local 404 — no peer sees it.
     assert narinfo_code(client, "c" * 32) == "404"
+    # The strong form of convergence: every node's per-origin clocks and narinfo counts agree
+    # exactly (via the status endpoint), not just one sampled narinfo.
+    wait_converged([alpha, beta, noisy, client], tag="initial")
 
     # =====================================================================================
     # Data plane over the converged index.
@@ -413,6 +464,7 @@ in
         if i == 23:
             last_hp = p.removeprefix("/nix/store/")[:32]
     wait_narinfo(client, last_hp, 200)
+    pre_t, _ = tsnap(client)
     client.succeed("rm -f /tmp/big-rc")
     client.succeed(
         f"( curl -sf -o /tmp/big.nar {nar_url}; echo $? > /tmp/big-rc ) >/dev/null 2>&1 &"
@@ -428,12 +480,18 @@ in
     assert client.succeed("sha256sum /tmp/big.nar").split()[0] == sha_hex
     assert t_small < 30, f"24 small NARs took {t_small:.1f}s under a concurrent big transfer"
     print(f"[bench] 24 small NARs (x12 parallel, big transfer running): {t_small:.2f}s")
+    # Attribution: exactly 25 clean completions (24 small + 1 big), zero aborts of any kind.
+    post_t, _ = tsnap(client)
+    assert post_t["completed"] - pre_t["completed"] == 25, (pre_t, post_t)
+    for k, v in post_t["aborted"].items():
+        assert v == pre_t["aborted"][k], f"unexpected {k} abort during parallel smalls"
 
     # --- (b) SIGSTOP black hole: accepts TCP, never answers ------------------------------
     # The nastiest failure mode: alpha's kernel completes handshakes while the daemon is
     # frozen. Chunk deadlines must strike it out of the transfer; the survivors finish.
     # (alpha is shaped down so the fetch is guaranteed to still be running at the freeze.)
     alpha.succeed("tc qdisc replace dev eth1 root netem rate 60mbit delay 5ms")
+    pre_t, pre_b = tsnap(client)
     client.succeed("rm -f /tmp/bh-rc /tmp/bh.nar")
     client.succeed(
         f"( curl -sf -o /tmp/bh.nar {nar_url}; echo $? > /tmp/bh-rc ) >/dev/null 2>&1 &"
@@ -451,6 +509,16 @@ in
     client.succeed(f"curl -sf --max-time 90 -o /tmp/bh2.nar {nar_url}")
     assert client.succeed("sha256sum /tmp/bh2.nar").split()[0] == sha_hex
     print(f"[bench] fresh transfer, holder still frozen: {time.time() - t0:.1f}s")
+    # Attribution: both fetches completed cleanly — no stall or streak fired; the black hole
+    # was ridden out by the survivors. (The breaker may or may not have opened: hung chunks
+    # strike only if they REACH their deadlines, and a transfer that finishes first reaps them
+    # without a verdict — a black hole that never blocked anyone needs no striking. The
+    # deterministic breaker-opens coverage is the hard-dead-holder scenario below.)
+    post_t, post_b = tsnap(client)
+    assert post_t["completed"] - pre_t["completed"] == 2, (pre_t, post_t)
+    assert post_t["aborted"]["stall"] == pre_t["aborted"]["stall"], "no stall abort"
+    assert post_t["aborted"]["streak"] == pre_t["aborted"]["streak"], "no streak abort"
+    print(f"[status] frozen-holder breaker opens delta: {post_b['alpha'] - pre_b['alpha']}")
     alpha.succeed("kill -CONT $(systemctl show -p MainPID --value narshare.service)")
     alpha.succeed("tc qdisc del dev eth1 root")
     alpha.wait_until_succeeds("curl -sf http://127.0.0.1:5051/nix-cache-info >/dev/null")
@@ -460,9 +528,12 @@ in
     # then the metadata itself must go 404 — nix falls straight through to its other
     # substituters instead of stalling out per path.
     beta.succeed("systemctl stop narshare.service")
+    _, pre_b = tsnap(client)
     # --max-time 3: the breaker opens within ~0.5s of the first refused chunks, and the 404
     # must be probed while it is still open (15s cooldown), not after the half-open point.
     client.fail(f"curl -sf --max-time 3 -o /dev/null http://127.0.0.1:5051/nar/{bnar32}.nar")
+    _, post_b = tsnap(client)
+    assert post_b["beta"] > pre_b["beta"], "the dead holder's breaker must have opened"
     t404 = float(client.succeed(
         f"t0=$(date +%s.%N); code=$(curl -s -o /dev/null -w '%{{http_code}}' "
         f"http://127.0.0.1:5051/{bhp}.narinfo); t1=$(date +%s.%N); "
@@ -514,7 +585,88 @@ in
     for m, seed in ((alpha, "post-chaos-a"), (beta, "post-chaos-b"), (noisy, "post-chaos-n")):
         _, chp = add_fixture(m, seed)
         wait_narinfo(client, chp, 200, timeout=90)
-    print("[conv] mesh fully convergent after the resilience battery")
+    wait_converged([alpha, beta, noisy, client], tag="post-chaos")
+
+    # --- (f) SIGKILL a holder mid-transfer: unclean death + sqlite WAL recovery -----------
+    # No graceful shutdown, no final flush: the survivors finish the stripe, and the killed
+    # node must come back with the SAME generation (an unclean death is not cache loss).
+    pre_gen = {o["name"]: o["generation"] for o in status(beta)["index"]["origins"]}["beta"]
+    client.succeed("rm -f /tmp/sk-rc /tmp/sk.nar")
+    client.succeed(
+        f"( curl -sf -o /tmp/sk.nar {nar_url}; echo $? > /tmp/sk-rc ) >/dev/null 2>&1 &"
+    )
+    time.sleep(0.7)
+    beta.succeed("systemctl kill -s KILL narshare.service")
+    client.wait_until_succeeds("test -f /tmp/sk-rc", timeout=120)
+    assert client.succeed("cat /tmp/sk-rc").strip() == "0"
+    assert client.succeed("sha256sum /tmp/sk.nar").split()[0] == sha_hex
+    beta.succeed("systemctl start narshare.service")
+    beta.wait_until_succeeds("curl -sf http://127.0.0.1:5051/nix-cache-info >/dev/null")
+    post_gen = {o["name"]: o["generation"] for o in status(beta)["index"]["origins"]}["beta"]
+    assert post_gen == pre_gen, "unclean death is not cache loss: the WAL must recover"
+    print("[conv] SIGKILL'd holder recovered its index intact (same generation)")
+
+    # --- (g) Total isolation: the client loses every link; the mesh moves on; rejoin heals
+    for dev in ("eth1", "eth2", "eth3"):
+        client.succeed(f"ip link set {dev} down")
+    _, iso_hp = add_fixture(alpha, "iso-while-client-dark")
+    time.sleep(3)  # let the hints for it fail against the dark client
+    assert narinfo_code(client, iso_hp) == "404", "an isolated client cannot know new paths"
+    for dev in ("eth1", "eth2", "eth3"):
+        client.succeed(f"ip link set {dev} up")
+    client.wait_until_succeeds("ping -c1 -W2 192.168.1.10")
+    # The hints were lost while dark, so this bounds RECONVERGENCE BY TIMER (60s) + breaker
+    # recovery on both sides.
+    wait_narinfo(client, iso_hp, 200, timeout=120)
+    wait_converged([alpha, beta, noisy, client], tag="post-isolation")
+    print("[conv] fully isolated client rejoined and caught up on the sync timer")
+
+    # --- (h) Cache restored from a backup: the self-clock regression must be detected -----
+    # beta's /var/cache is snapshotted, TWO more paths are exported (mesh sees seq+2), then
+    # the old cache is restored and one of the two is deleted from the store. However the
+    # restart interleaves, beta's clock ends up numerically BEHIND what the mesh remembers
+    # for its origin — the next pull must detect that future, remint beta's generation, and
+    # snapshots must reteach everyone (the deleted path vanishes mesh-wide, the kept one
+    # stays served).
+    beta.succeed("systemctl stop narshare.service")
+    # DynamicUser makes /var/cache/narshare a symlink into /var/cache/private — back up the
+    # REAL directory, or the "restore" silently round-trips a symlink and tests nothing.
+    beta.succeed(
+        "rm -rf /tmp/cache-bk && cp -a \"$(readlink -f /var/cache/narshare)\" /tmp/cache-bk"
+    )
+    beta.succeed("systemctl start narshare.service")
+    beta.wait_until_succeeds("curl -sf http://127.0.0.1:5051/nix-cache-info >/dev/null")
+    p1_path, p1_hp = add_fixture(beta, "restore-p1")
+    p2_path, p2_hp = add_fixture(beta, "restore-p2")
+    wait_narinfo(client, p2_hp, 200)
+    wait_narinfo(client, p1_hp, 200)
+    gen_recorded = {o["name"]: o["generation"] for o in status(beta)["index"]["origins"]}["beta"]
+    beta.succeed("systemctl stop narshare.service")
+    beta.succeed(
+        "D=\"$(readlink -f /var/cache/narshare)\" && rm -rf \"$D\" && cp -a /tmp/cache-bk \"$D\""
+    )
+    beta.succeed(f"nix-store --delete {p1_path}")
+    beta.succeed("systemctl start narshare.service")
+    beta.wait_until_succeeds("curl -sf http://127.0.0.1:5051/nix-cache-info >/dev/null")
+    beta.wait_until_succeeds(
+        "curl -sf http://127.0.0.1:5051/narshare/v1/status | "
+        "jq -e '.sync.self_generation_bumps >= 1' >/dev/null",
+        timeout=90,
+    )
+    gen_after = {o["name"]: o["generation"] for o in status(beta)["index"]["origins"]}["beta"]
+    assert gen_after > gen_recorded, "the reminted generation must move forward"
+    wait_narinfo(client, p2_hp, 200, timeout=120)   # survives under the new generation
+    wait_narinfo(client, p1_hp, 404, timeout=120)   # wiped by the snapshot resync
+    wait_converged([alpha, beta, noisy, client], tag="post-restore")
+    print("[conv] restored cache detected its clock regression and reminted its generation")
+
+    # --- (i) add/GC churn: rapid flip-flop converges to the final state -------------------
+    for _ in range(4):
+        ch_path, ch_hp = add_fixture(noisy, "churn")
+        noisy.succeed(f"nix-store --delete {ch_path}")
+    wait_narinfo(client, ch_hp, 404, timeout=90)
+    wait_converged([alpha, beta, noisy, client], tag="post-churn")
+    print("[conv] rapid add/GC churn converged to the final (deleted) state")
 
     # =====================================================================================
     # Bounded CPU / bounded IO on a holder, judged with scratch proxies pinned to alpha:
@@ -581,6 +733,28 @@ in
     assert io_secs > 3.0, f"disk throttle did not bite ({io_secs:.1f}s)"
     assert io_secs < 60, f"IO-bound transfer took {io_secs:.1f}s"
     client.succeed("kill $(cat /tmp/xpinned.pid /tmp/xauto.pid) 2>/dev/null || true")
+
+    # =====================================================================================
+    # Final invariants, via the status endpoint: nothing leaked, nothing insane.
+    # =====================================================================================
+    wait_no_active_transfers([alpha, beta, noisy, client])
+    for m in (alpha, beta, noisy, client):
+        st = status(m)
+        for p in st["proxy"]["peers"]:
+            w = p["mw_weight"]
+            assert 0.0 < w <= 1.0, f"{m.name}: MW weight out of range: {p}"
+        for o in st["index"]["origins"]:
+            assert o["journal_len"] <= max(o["seq"], 1), f"{m.name}: journal exceeds history: {o}"
+        assert st["proxy"]["transfers"]["aborted"]["other"] == 0, (
+            f"{m.name}: plan-integrity aborts must never fire: {st['proxy']['transfers']}"
+        )
+        journals = ", ".join(
+            o["name"] + ":" + str(o["journal_len"]) for o in st["index"]["origins"]
+        )
+        print(
+            f"[status] {m.name}: narinfos={st['index']['narinfos']} "
+            f"transfers={st['proxy']['transfers']} journals=[{journals}]"
+        )
 
     # --- results ---
     print("")

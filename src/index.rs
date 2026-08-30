@@ -857,6 +857,53 @@ impl Index {
         }
     }
 
+    /// Full introspection for the status endpoint: per-origin clocks, journal and holding
+    /// sizes, narinfo total, watermarks. Read-only connection, one consistent snapshot.
+    pub fn status(&self) -> Result<serde_json::Value> {
+        let conn = self.reader.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let journal: HashMap<String, i64> = tx
+            .prepare_cached("SELECT origin, COUNT(*) FROM journal GROUP BY origin")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let holdings: HashMap<String, i64> = tx
+            .prepare_cached("SELECT origin, COUNT(*) FROM holders GROUP BY origin")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let origins: Vec<serde_json::Value> = tx
+            .prepare_cached("SELECT name, generation, seq, tail_seq FROM origins ORDER BY name")?
+            .query_map([], |r| {
+                let name: String = r.get(0)?;
+                Ok(serde_json::json!({
+                    "name": name.clone(),
+                    "generation": r.get::<_, i64>(1)? as u64,
+                    "seq": r.get::<_, i64>(2)? as u64,
+                    "tail_seq": r.get::<_, i64>(3)? as u64,
+                    "journal_len": journal.get(&name).copied().unwrap_or(0),
+                    "holdings": holdings.get(&name).copied().unwrap_or(0),
+                }))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let narinfos: i64 =
+            tx.query_row("SELECT COUNT(*) FROM narinfos", [], |r| r.get(0))?;
+        let watermarks: Vec<serde_json::Value> = tx
+            .prepare_cached("SELECT peer, origin, seq FROM watermarks ORDER BY peer, origin")?
+            .query_map([], |r| {
+                Ok(serde_json::json!({
+                    "peer": r.get::<_, String>(0)?,
+                    "origin": r.get::<_, String>(1)?,
+                    "seq": r.get::<_, i64>(2)? as u64,
+                }))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(serde_json::json!({
+            "self": self.self_name,
+            "narinfos": narinfos,
+            "origins": origins,
+            "watermarks": watermarks,
+        }))
+    }
+
     /// (generation, seq) of an origin as we know it.
     pub fn origin_clock(&self, origin: &str) -> Result<(u64, u64)> {
         let conn = self.reader.lock().unwrap();
