@@ -1157,22 +1157,34 @@ pub async fn run_transfer(
     }
 }
 
-/// Weighted sample among peers with spare stream budget: a few MW draws with rejection, then a
-/// linear fallback so capacity is never left idle by unlucky sampling. The returned Slot releases
-/// the stream budget on drop, however the worker ends.
+/// One weighted draw from the MW pool CONDITIONED on capacity: the support is exactly the
+/// available holders with a free stream slot, weights renormalized over that set (pick_among's
+/// restriction). This is the distribution the old rejection-sampling loop (four draws, then a
+/// weight-blind index-biased linear fallback) only approximated — computed directly it needs
+/// no fallback, and it is work-conserving by construction: None means no holder has capacity
+/// at all. Note the deliberate policy this makes visible: when only a slow peer has free
+/// slots, it gets the chunk with probability 1 — the saturation behavior is a work-conservation
+/// choice, not a sampling artifact (see docs/regret.md for the measured cost at extreme skew).
+///
+/// The acquire can lose a race with a concurrent transfer taking the last slot between the
+/// capacity scan and try_acquire; retrying the (cheap) scan settles it, and a lost race means
+/// someone else made progress, so the bounded retry cannot strand capacity.
+///
+/// The returned Slot releases the stream budget on drop, however the worker ends.
 fn try_pick(st: &Arc<crate::proxy::ProxyState>, avail: &[usize]) -> Option<(usize, Slot)> {
     let ctx = &st.fetch;
-    for _ in 0..4 {
-        let p = ctx.pool.pick_among(avail)?;
+    for _ in 0..3 {
+        let with_capacity: Vec<usize> = avail
+            .iter()
+            .copied()
+            .filter(|&p| ctx.limits[p].has_idle_capacity())
+            .collect();
+        let p = ctx.pool.pick_among(&with_capacity)?;
         if ctx.limits[p].try_acquire() {
             return Some((p, Slot { st: st.clone(), peer: p }));
         }
     }
-    avail
-        .iter()
-        .copied()
-        .find(|&p| ctx.limits[p].try_acquire())
-        .map(|p| (p, Slot { st: st.clone(), peer: p }))
+    None
 }
 
 #[cfg(test)]

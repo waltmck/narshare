@@ -57,14 +57,16 @@ One 32 MiB NAR striped across both peers; oracles are "fast peer alone" and "cap
 | 64:1 (64/1 MB/s) | **4.0 MB/s** | 64 | 65 | 25.0% | **+7.96 s** |
 
 Reading: this is where the real regret lives, and it is not a weights problem. The MW share of
-the slow peer is tiny, but `try_pick`'s **work-conserving slot fallback** hands the slow peer a
-chunk whenever the fast peer's stream slots are momentarily full — which, mid-transfer, is
-always. The slow peer therefore holds its ~2 slots continuously (25% byte share at BOTH skews —
-an in-flight-time share, decoupled from capacity share), and because delivery to nix is
-in-order, its 2-second chunks repeatedly gate the emission frontier. At 4:1 that costs ~nothing
-(+0.10 s); at 64:1 the transfer completes **16× slower than ignoring the slow peer entirely**.
-The VM suite's shaped-topology numbers show the same signature (striping across the 20 Mbit
-peer vs the fast peer alone).
+the slow peer is tiny, but selection is **work-conserving** — `try_pick` samples the weights
+*conditioned on free stream capacity*, so whenever the fast peer's slots are momentarily full
+(mid-transfer: always), the conditional support collapses to the slow peer and it gets the
+chunk with probability 1. The slow peer therefore holds its ~2 slots continuously (25% byte
+share at BOTH skews — an in-flight-time share, decoupled from capacity share), and because
+delivery to nix is in-order, its 2-second chunks repeatedly gate the emission frontier. At 4:1
+that costs ~nothing (+0.10 s); at 64:1 the transfer completes **16× slower than ignoring the
+slow peer entirely**. The VM suite's shaped-topology numbers show the same signature (striping
+across the 20 Mbit peer vs the fast peer alone). This is a POLICY cost, not a mechanism bug:
+work conservation itself is what feeds the straggler.
 
 ## Verdict and the open fix
 
