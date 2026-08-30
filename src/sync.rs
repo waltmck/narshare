@@ -33,10 +33,12 @@ use tracing::{debug, info, warn};
 const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Own-db diff cadence when inotify is unavailable (and the safety-net re-scan besides).
 const OWN_DB_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-/// Quiet time after an inotify burst before diffing (a closure registration is many rows).
-const OWN_DB_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(2000);
-/// Outbound hint debounce.
-const HINT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Burst coalescing for db events, LEADING-edge: the first event triggers a diff after at most
+/// this much quiet — the single-add case pays ~100 ms, not a fixed debounce.
+const BURST_QUIET: std::time::Duration = std::time::Duration::from_millis(100);
+/// …and a long registration burst (a big closure is thousands of rows over many seconds) still
+/// gets a diff at least this often, so the first paths of the burst don't wait for its end.
+const BURST_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 /// Sync request body cap (a clock vector is tiny).
 const REQUEST_CAP: usize = 1 << 20;
 /// Truncated-suffix pull rounds before giving up until the next trigger.
@@ -201,8 +203,8 @@ impl Sync {
                 _ = shutdown.changed() => return,
                 _ = tokio::time::sleep(SYNC_INTERVAL) => {}
                 Some(()) = kick.recv() => {
-                    // Let a hint burst settle into one pull.
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    // Pull immediately; queued repeats coalesce (an up-to-date pull is <1 KB,
+                    // so an extra round costs nothing).
                     while kick.try_recv().is_ok() {}
                 }
             }
@@ -219,10 +221,13 @@ impl Sync {
                 _ = shutdown.changed() => return,
                 msg = rx.recv() => {
                     if msg.is_none() { return; }
-                    tokio::time::sleep(HINT_DEBOUNCE).await;
-                    while rx.try_recv().is_ok() {}
+                    // Leading edge, CONCURRENT fan-out: a dead peer's 5 s hint timeout must
+                    // not delay anyone else's. Repeats queued meanwhile coalesce into the
+                    // channel's single slot and trigger one more (cheap) round.
                     for idx in 0..self.peers.list.len() {
-                        self.peers.hint(idx, &self.index.self_name).await;
+                        let peers = self.peers.clone();
+                        let from = self.index.self_name.clone();
+                        tokio::spawn(async move { peers.hint(idx, &from).await });
                     }
                 }
             }
@@ -263,7 +268,9 @@ impl Sync {
                 Ok(_) => {}
                 Err(e) => warn!("mesh index: own-db diff failed: {e:#}"),
             }
-            // Wait for the next trigger, then let the burst go quiet.
+            // Wait for the next trigger. On an event, coalesce the burst LEADING-edge: diff
+            // after at most BURST_QUIET of silence, but never later than BURST_MAX — a single
+            // add pays ~100 ms while a long registration burst still diffs about once a second.
             tokio::select! {
                 _ = shutdown.changed() => return,
                 _ = tokio::time::sleep(OWN_DB_INTERVAL) => {}
@@ -275,13 +282,15 @@ impl Sync {
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    tokio::time::sleep(OWN_DB_DEBOUNCE).await;
                     if let Some(s) = events.as_mut() {
                         use tokio_stream::StreamExt as _;
-                        while let Ok(Some(_)) =
-                            tokio::time::timeout(std::time::Duration::from_millis(1), s.next())
-                                .await
-                        {}
+                        let deadline = tokio::time::Instant::now() + BURST_MAX;
+                        while tokio::time::Instant::now() < deadline {
+                            match tokio::time::timeout(BURST_QUIET, s.next()).await {
+                                Ok(Some(_)) => continue, // still bursting
+                                _ => break,              // quiet — go diff
+                            }
+                        }
                     }
                 }
             }

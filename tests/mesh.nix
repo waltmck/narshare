@@ -229,13 +229,23 @@ in
     # Reactive convergence: a path registered on every holder reaches the client's local
     # index through inotify → differ → hint → pull, with no lookup traffic at all.
     # =====================================================================================
-    t0 = time.monotonic()
     for m in (alpha, beta, noisy):
         add_fixture(m, "shared")
     path, hp = add_fixture(alpha, "shared")  # same content, same path (already added: no-op)
     nar32, nar_size, sha_hex = nar_meta(alpha, path)
     wait_narinfo(client, hp, 200)
-    print(f"[conv] shared fixture visible on client {time.monotonic() - t0:.1f}s after add")
+    # Measure the add→visible latency precisely with a FRESH single-holder path: poll INSIDE
+    # the client at 50 ms granularity (the test driver's own polling is 1 s-quantized).
+    _, lat_hp = add_fixture(alpha, "latency-probe")
+    elapsed = float(
+        client.succeed(
+            "t0=$(date +%s.%N); for i in $(seq 1 600); do "
+            f"[ \"$(curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:5051/{lat_hp}.narinfo)\" = 200 ] && break; "
+            "sleep 0.05; done; t1=$(date +%s.%N); echo \"$t1 $t0\" | awk '{print $1-$2}'"
+        ).strip()
+    )
+    assert elapsed < 30, f"convergence took {elapsed}s"
+    print(f"[conv] add on alpha -> visible on client in {elapsed:.2f}s")
     # …and holder-to-holder over the backbone.
     wait_narinfo(beta, hp, 200)
     # The narinfo itself: CA passthrough, canonical URL.
