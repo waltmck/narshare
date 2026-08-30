@@ -42,6 +42,15 @@ const EPOCH: Duration = Duration::from_secs(1);
 const ROAMING_EPOCH: Duration = Duration::from_secs(600);
 /// Transfers below this skip the manifest roundtrip — not worth it.
 const MANIFEST_MIN: u64 = 4 << 20;
+/// Fetch ranges are merged across non-fetch gaps (framing lits, tiny replay holes) up to this
+/// size. An HTTP chunk request costs ~milliseconds regardless of size, so a tree of many small
+/// files would otherwise fragment the range space at every file boundary into sub-chunk
+/// requests (Hollow Knight: 1754 ranges for 4331 spans, measured) and cap throughput on request
+/// overhead. Gap bytes are fetched and simply never emitted — lits and replays emit from local
+/// data, and the transfer loop prunes passed buffer entries — which costs ~200 B of framing per
+/// file, ≤0.01% wire overhead on real trees. Dedup survives: replay holes are segment-sized
+/// (≥4 MiB from narshare peers), far above this threshold.
+const RANGE_MERGE_GAP: u64 = 64 << 10;
 /// A segment failing verification is refetched at most this many times before the transfer
 /// aborts (an incorrect manifest, or peers that persistently return the wrong bytes).
 const SEG_RETRIES: u32 = 3;
@@ -398,9 +407,14 @@ fn manifest_plan(m: &Manifest, info: &RemoteNarinfo, budget: u64, window: u64) -
                                 retain: (retain_for > 0).then_some((unique, retain_for)),
                             },
                         ));
-                        // Coalesce adjacent fetch ranges.
+                        // Coalesce adjacent fetch ranges, bridging small non-fetch gaps.
                         match ranges.last_mut() {
-                            Some((o, l)) if *o + *l == span.nar_off => *l += span.len,
+                            Some((o, l))
+                                if span.nar_off >= *o + *l
+                                    && span.nar_off - (*o + *l) <= RANGE_MERGE_GAP =>
+                            {
+                                *l = span.nar_off + span.len - *o;
+                            }
                             _ => ranges.push((span.nar_off, span.len)),
                         }
                     }
@@ -883,6 +897,16 @@ pub async fn run_transfer(
                             }
                         }
                         origin.retain(|&(o, l, _)| o + l > em.emit_pos);
+                        // Merged-gap bytes (RANGE_MERGE_GAP) are fetched but never consumed —
+                        // lits and replays emit from local data — so drop whatever the emitter
+                        // has fully passed, or those fragments would sit in the map forever.
+                        while let Some((&k, b)) = em.buffered.first_key_value() {
+                            if k + b.len() as u64 <= em.emit_pos {
+                                em.buffered.remove(&k);
+                            } else {
+                                break;
+                            }
+                        }
 
                         // The give-up floor: alive but hopeless forfeits to the builder. Measured
                         // on bytes actually pulled from the NETWORK (not local lits/replays), so a

@@ -33,6 +33,9 @@ use tracing::{debug, error, info_span, warn};
 
 /// Emission granularity for file spans; also the per-send unit for literals.
 const READ_CHUNK: u64 = 256 * 1024;
+/// Reads in flight per streaming response (each ≤ READ_CHUNK): the response-internal queue
+/// depth. 16 × 256 KiB = 4 MiB in flight per response.
+const READ_AHEAD: usize = 16;
 /// Largest span the chunk-encoding path will buffer for compression (proxies chunk well below
 /// this; anything bigger falls back to the raw stream).
 const MAX_ENCODED_SPAN: u64 = 64 << 20;
@@ -452,6 +455,70 @@ async fn seek_table(
         .cloned()
 }
 
+/// One ready-to-emit unit of a range response, in NAR order.
+enum PieceDesc {
+    Lit(Bytes),
+    Read { path: Arc<std::path::PathBuf>, off: u64, len: u64 },
+}
+
+/// Walks [start, end) of a seek table as READ_CHUNK-sized pieces.
+struct Pieces<'a> {
+    table: &'a SeekTable,
+    i: usize,
+    start: u64,
+    end: u64,
+    /// Remaining part of the file slice currently being cut into READ_CHUNK pieces.
+    file: Option<(Arc<std::path::PathBuf>, u64, u64)>,
+}
+
+impl<'a> Pieces<'a> {
+    fn new(table: &'a SeekTable, start: u64, end: u64) -> Self {
+        Self { table, i: table.first_seg(start), start, end, file: None }
+    }
+}
+
+impl Iterator for Pieces<'_> {
+    type Item = PieceDesc;
+    fn next(&mut self) -> Option<PieceDesc> {
+        if let Some((path, off, len)) = self.file.take() {
+            let n = len.min(READ_CHUNK);
+            if len > n {
+                self.file = Some((path.clone(), off + n, len - n));
+            }
+            return Some(PieceDesc::Read { path, off, len: n });
+        }
+        let slice = self.table.seg_slice(self.i, self.start, self.end)?;
+        self.i += 1;
+        match slice {
+            Slice::Lit(b) => Some(PieceDesc::Lit(b)),
+            Slice::File { path, off, len } => {
+                self.file = Some((path, off, len));
+                self.next()
+            }
+        }
+    }
+}
+
+/// A piece either ready (framing) or being read concurrently.
+enum Fetched {
+    Lit(Bytes),
+    Read(tokio::task::JoinHandle<Result<Bytes>>),
+}
+
+fn start_piece(reader: &SegmentReader, d: PieceDesc) -> Fetched {
+    match d {
+        PieceDesc::Lit(b) => Fetched::Lit(b),
+        PieceDesc::Read { path, off, len } => {
+            let r = reader.clone();
+            Fetched::Read(tokio::spawn(async move { r.read(path, off, len as usize).await }))
+        }
+    }
+}
+
+/// Stream [start, end) in order with READ_AHEAD reads in flight. Per-op latency through the io
+/// pool is milliseconds-scale, so a serial read loop caps a response at queue depth 1 (~150 MB/s
+/// measured against a >3 GB/s disk path); queue depth must come from WITHIN a response, not only
+/// from concurrent requests. Ordering is preserved by awaiting in submission order.
 async fn emit(
     table: Arc<SeekTable>,
     reader: SegmentReader,
@@ -459,38 +526,36 @@ async fn emit(
     end: u64,
     tx: mpsc::Sender<std::io::Result<Bytes>>,
 ) {
-    let mut i = table.first_seg(start);
-    while let Some(slice) = table.seg_slice(i, start, end) {
-        i += 1;
-        match slice {
-            Slice::Lit(b) => {
+    let mut pieces = Pieces::new(&table, start, end);
+    let mut q: std::collections::VecDeque<Fetched> = std::collections::VecDeque::new();
+    loop {
+        while q.len() < READ_AHEAD {
+            let Some(d) = pieces.next() else { break };
+            q.push_back(start_piece(&reader, d));
+        }
+        let Some(next) = q.pop_front() else { return };
+        let res = match next {
+            Fetched::Lit(b) => Ok(b),
+            Fetched::Read(h) => h.await.expect("read task panicked"),
+        };
+        match res {
+            Ok(b) => {
                 if tx.send(Ok(b)).await.is_err() {
-                    return; // client went away
+                    break; // client went away
                 }
             }
-            Slice::File { path, off, len } => {
-                let mut off = off;
-                let mut remaining = len;
-                while remaining > 0 {
-                    let n = remaining.min(READ_CHUNK);
-                    match reader.read(path.clone(), off, n as usize).await {
-                        Ok(b) => {
-                            if tx.send(Ok(b)).await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            // GC'd or corrupted mid-stream: abort the response so the client sees
-                            // a transfer failure rather than short/garbage data.
-                            warn!("aborting NAR stream: {e:#}");
-                            let _ = tx.send(Err(std::io::Error::other(format!("{e:#}")))).await;
-                            return;
-                        }
-                    }
-                    off += n;
-                    remaining -= n;
-                }
+            Err(e) => {
+                // GC'd or corrupted mid-stream: abort the response so the client sees a
+                // transfer failure rather than short/garbage data.
+                warn!("aborting NAR stream: {e:#}");
+                let _ = tx.send(Err(std::io::Error::other(format!("{e:#}")))).await;
+                break;
             }
+        }
+    }
+    for p in q {
+        if let Fetched::Read(h) = p {
+            h.abort();
         }
     }
 }
@@ -554,22 +619,16 @@ async fn encode_span(
     level: i32,
 ) -> Result<(Vec<u8>, Duration, Duration)> {
     let t0 = Instant::now();
+    // All reads in flight at once (the span is bounded by MAX_ENCODED_SPAN, so ≤256 pieces);
+    // the io pool's own semaphore is the actual concurrency bound. Assembled in order.
+    let started: Vec<Fetched> =
+        Pieces::new(table, start, end).map(|d| start_piece(&st.reader, d)).collect();
     let mut raw = Vec::with_capacity((end - start) as usize);
-    let mut i = table.first_seg(start);
-    while let Some(slice) = table.seg_slice(i, start, end) {
-        i += 1;
-        match slice {
-            Slice::Lit(b) => raw.extend_from_slice(&b),
-            Slice::File { path, off, len } => {
-                let mut o = off;
-                let mut remaining = len;
-                while remaining > 0 {
-                    let n = remaining.min(READ_CHUNK);
-                    let b = st.reader.read(path.clone(), o, n as usize).await?;
-                    raw.extend_from_slice(&b);
-                    o += n;
-                    remaining -= n;
-                }
+    for p in started {
+        match p {
+            Fetched::Lit(b) => raw.extend_from_slice(&b),
+            Fetched::Read(h) => {
+                raw.extend_from_slice(&h.await.expect("read task panicked")?)
             }
         }
     }

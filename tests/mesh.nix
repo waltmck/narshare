@@ -89,7 +89,7 @@ let
     # hello must be IN the system closure: paths referenced only by the test script are
     # readable over 9p but not registered in the VM's Nix db, and the ca_only-gate test
     # needs the holders to actually serve its narinfo.
-    environment.systemPackages = [ pkgs.curl pkgs.ethtool fixtureGen hello ];
+    environment.systemPackages = [ pkgs.curl pkgs.ethtool pkgs.iperf3 pkgs.jq fixtureGen hello ];
   };
 
   holder = vlan: ip: {
@@ -184,6 +184,15 @@ in
     client.succeed("tc qdisc replace dev eth3 root netem delay 25ms 5ms loss 0.5% 25%")
     for ip in ("192.168.1.10", "192.168.2.10", "192.168.3.10"):
         client.succeed(f"ping -c1 -W5 {ip}")
+
+    # Raw fabric baseline: what the "fast" vlan actually provides. QEMU socket networking is
+    # nowhere near 10 GbE, so every absolute number this suite prints must be read against THIS
+    # ceiling — 10 GbE-class software validation lives in the loopback bench (docs/perf.md).
+    alpha.succeed("iperf3 -s >/dev/null 2>&1 & echo $! > /tmp/iperf.pid")
+    client.wait_until_succeeds("iperf3 -c 192.168.1.10 -t 3 -J > /tmp/iperf.json", timeout=30)
+    bps = float(client.succeed("jq .end.sum_received.bits_per_second /tmp/iperf.json").strip())
+    print(f"[bench] raw fast-link TCP (iperf3): {bps / 1e9:.2f} Gbit/s")
+    alpha.succeed("kill $(cat /tmp/iperf.pid)")
 
     # --- fixture: identical content on every holder => identical CA store path ---
     paths = set()

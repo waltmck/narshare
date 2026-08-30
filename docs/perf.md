@@ -29,6 +29,41 @@ headroom from a single file at queue depth 64, before any striping.
 `backend = "auto"` (uring when available) stands as the default. Cold-NVMe and end-to-end
 numbers land here at M5.5.
 
+## M5.5, fast half: 10 GbE-class goodput over loopback
+
+**Setup**: walt-laptop serving its real store; serve + proxy in one process, peered over
+127.0.0.1 (test.toml shape). Loopback is far faster than 10 GbE, so this measures the SOFTWARE
+ceiling; it is also conservative — one machine runs both ends plus the client, where a real
+10 GbE pair splits that CPU. Fetches of the Hollow Knight NAR (5.24 GB, ZFS zstd ~5:1 on disk),
+`curl -o /dev/null`, warm runs. (The VM mesh suite cannot measure this: its QEMU fabric tops out
+at single-digit Gbit/s — it now prints its own iperf3 baseline so its numbers are read against
+that ceiling.)
+
+| path | goodput |
+|---|---|
+| direct serve, full NAR (stock-client path) | **1.18–1.22 GB/s** |
+| proxy, ranged (unverified striping) | **1.31 GB/s** |
+| proxy, full (manifest: dedup + blake3 verify + NarHash) | **0.67–0.76 GB/s** |
+
+Three ceilings were found and removed to get here (each was measured, not guessed):
+
+1. **Serial reads per response** (~143 MB/s): `emit`/`encode_span` issued their 256 KiB reads
+   one at a time — queue depth 1 per response against a >3 GB/s disk path with ~ms per-op
+   latency. Fixed: READ_AHEAD-deep pipelining within every response (8.5× on direct serving).
+2. **Soft SHA-256** (~260 MB/s): the `sha2` crate does not use the ARMv8 SHA-2 crypto
+   extensions without the `asm` feature; the NarHash gate is serial on the emit path, so its
+   speed is a whole-transfer ceiling. Fixed: `sha2/asm` (~2.4 GB/s, matching `openssl speed`).
+3. **Fetch-range fragmentation** (~410 MB/s): the manifest plan's fetchable ranges broke at
+   every file's framing lits — 1754 ranges on Hollow Knight's ~1750-file tree, degenerating
+   16 MiB chunks into per-file requests. Fixed: ranges merge across ≤64 KiB non-fetch gaps
+   (RANGE_MERGE_GAP): 4 ranges, ≤0.01% wire overhead, replay holes (≥ segment size) unmerged
+   so dedup is untouched.
+
+The verified path's remaining gap to the ranged path is the emitter's serial stage — blake3
+verify + SHA-256 + copy on one task (~1.1 GB/s combined) — which on a real pair is the client's
+only significant load; parallelizing verification is the next lever if the hardware run needs
+it. The slow-link half of M5.5 (tc netem, 500 kbit / 300 ms) and the real 10 GbE pair remain.
+
 ## Per-chunk framing: compression ratio given up vs one continuous context
 
 **Setup**: walt-laptop, Hollow Knight (`hollow-knight-linux`, 5.24 GB NAR — Unity assets: mixed
