@@ -264,10 +264,13 @@ const ENC_STEP_DOWN: i32 = 2;
 /// …climb by 1 near the knee, and faster while compression has lots of slack.
 const ENC_STEP_UP: i32 = 1;
 const ENC_STEP_UP_FAST: i32 = 3;
-/// Climb while enc/transfer is below this; the knee sits where they are comparable.
+/// Climb while enc/transfer (serial peers) or enc/elapsed (pipelined peers) is below this; the
+/// knee sits where they are comparable.
 const ENC_CLIMB_BELOW: f64 = 0.5;
-/// "Lots of slack": enc/transfer below this takes the fast step.
+/// "Lots of slack": below this takes the fast step.
 const ENC_SLACK: f64 = 0.1;
+/// Pipelined peers: a stage whose busy fraction of elapsed exceeds this IS the bottleneck.
+const ENC_SATURATED: f64 = 0.85;
 /// Open-loop fallback for peers that predate the timing headers: goodput-tiered
 /// (tier's upper rate bound in B/s, zstd level) — spend CPU where the link is thin.
 const ENC_TIERS: &[(f64, i32)] = &[(4e6, 19), (4e7, 9), (4e8, 3), (f64::INFINITY, 1)];
@@ -401,7 +404,27 @@ impl FetchCtx {
         let enc = c.srv_encode.as_secs_f64();
         let read = c.srv_read.as_secs_f64();
         let decode = c.decode.as_secs_f64();
-        // Wire + RTT: whatever the peer's disk/CPU and our decode don't account for.
+        if c.pipelined {
+            // Streaming peer: read/encode/wire overlapped, and the reported times are
+            // BUSY-times (of the previous chunk, scaled). A stage is the bottleneck when its
+            // busy fraction of elapsed approaches 1; if no stage does, the wire is the
+            // bottleneck by elimination.
+            let el = elapsed.as_secs_f64().max(1e-4);
+            let (u_enc, u_read, u_dec) = (enc / el, read / el, decode / el);
+            if u_enc > ENC_SATURATED {
+                // The peer's encoder can barely keep ahead of the wire: shed load fast.
+                net.level = (net.level - ENC_STEP_DOWN).max(1);
+            } else if u_read > ENC_SATURATED {
+                // The peer's disk is the pacer: the level can neither help nor hurt. Hold.
+            } else if u_enc < ENC_CLIMB_BELOW && u_dec < ENC_SATURATED {
+                // Wire-bound with encoder slack: buy ratio with idle CPU.
+                let step = if u_enc < ENC_SLACK { ENC_STEP_UP_FAST } else { ENC_STEP_UP };
+                net.level = (net.level + step).min(ENC_MAX);
+            }
+            return;
+        }
+        // Buffered peer (small spans, or a pre-streaming version): stages were SERIAL, so
+        // wire time is what the peer's disk/CPU and our decode don't account for.
         let transfer = (elapsed.as_secs_f64() - enc - read - decode).max(1e-4);
         if enc > transfer {
             // The peer's CPU (or its encode queue) is the bottleneck: shed load fast.
@@ -1472,7 +1495,12 @@ mod tests {
             srv_read: Duration::from_millis(read_ms),
             srv_encode: Duration::from_millis(enc_ms),
             decode: Duration::from_millis(decode_ms),
+            pipelined: false,
         }
+    }
+
+    fn chunk_piped(enc_ms: u64, read_ms: u64, decode_ms: u64) -> crate::peers::Chunk {
+        crate::peers::Chunk { pipelined: true, ..chunk_timed(enc_ms, read_ms, decode_ms) }
     }
 
     #[test]
@@ -1508,5 +1536,33 @@ mod tests {
         ctx.set_rate(0, 1e9);
         ctx.observe_encoding(0, ms(1000), &chunk_timed(0, 0, 0));
         assert_eq!(ctx.zstd_level(0), Some(1));
+    }
+
+    #[test]
+    fn auto_level_reads_pipelined_times_as_utilizations() {
+        let ms = Duration::from_millis;
+        let ctx = ctx_with("auto");
+
+        // Overlapped stages, all with slack against elapsed: wire-bound, climb. Under the old
+        // serial math enc+read+decode > elapsed would have read as encode-bound and shed.
+        for _ in 0..10 {
+            ctx.observe_encoding(0, ms(1000), &chunk_piped(60, 700, 400));
+        }
+        assert_eq!(ctx.zstd_level(0), Some(19));
+
+        // Encoder busy ~the whole elapsed window: it is barely keeping ahead — shed fast.
+        for _ in 0..12 {
+            ctx.observe_encoding(0, ms(1000), &chunk_piped(900, 100, 5));
+        }
+        assert_eq!(ctx.zstd_level(0), Some(1));
+
+        // Disk saturated, encoder idle: hold — the level can neither help nor hurt.
+        ctx.observe_encoding(0, ms(1000), &chunk_piped(50, 900, 5));
+        assert_eq!(ctx.zstd_level(0), Some(1));
+
+        // First chunk of a NAR carries no stats: open-loop ladder, not a misread of zeros.
+        ctx.set_rate(0, 1e6);
+        ctx.observe_encoding(0, ms(1000), &chunk_piped(0, 0, 0));
+        assert_eq!(ctx.zstd_level(0), Some(19));
     }
 }

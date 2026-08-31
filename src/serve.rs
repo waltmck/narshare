@@ -36,19 +36,25 @@ const READ_CHUNK: u64 = 256 * 1024;
 /// Reads in flight per streaming response (each ≤ READ_CHUNK): the response-internal queue
 /// depth. 16 × 256 KiB = 4 MiB in flight per response.
 const READ_AHEAD: usize = 16;
-/// Largest span the chunk-encoding path will buffer for compression (proxies chunk well below
-/// this; anything bigger falls back to the raw stream).
-const MAX_ENCODED_SPAN: u64 = 64 << 20;
+/// Largest span the chunk-encoding path will compress (anything bigger falls back to the raw
+/// stream). Encoded spans STREAM — memory per job is the encoder window plus a few pieces, not
+/// the span — so this bounds only how long one encode job can monopolize its permit.
+const MAX_ENCODED_SPAN: u64 = 256 << 20;
+/// Encoder output accumulates to this granularity before it is flushed to the response body:
+/// big enough to amortize channel and HTTP framing, small enough that the first bytes hit the
+/// wire while the rest of the span is still being read and compressed.
+const ENCODE_FLUSH_BYTES: usize = 128 * 1024;
 /// Byte budget for cached seek tables (a table is ~lits + 56B/segment; big trees reach tens of
 /// MB). Entry counts are the wrong unit — budget the bytes.
 const TABLE_BUDGET: u64 = 256 * 1024 * 1024;
 /// Entry cap is a backstop only; the byte budget is the real limit.
 const TABLE_ENTRIES: usize = 4096;
-/// Concurrent buffered chunk-encode jobs — the serve side's CPU budget for wire compression,
-/// sized to the machine. Each job pins up to MAX_ENCODED_SPAN of memory plus one single-threaded
-/// zstd encode, and the serve listener is mesh-exposed — bound the aggregate. A FULL pool doubles
-/// as the "compression, not the wire, is the bottleneck" signal for the adaptive encoding's CPU
-/// half (see get_nar).
+/// Concurrent chunk-encode jobs — the serve side's CPU budget for wire compression, sized to
+/// the machine. Each job is one single-threaded zstd encode (streaming jobs hold their permit
+/// for the response's lifetime, mostly idle on backpressure — the permit bounds encoder THREADS,
+/// which is the resource that matters), and the serve listener is mesh-exposed — bound the
+/// aggregate. A FULL pool doubles as the "compression, not the wire, is the bottleneck" signal
+/// for the adaptive encoding's CPU half (see get_nar).
 fn encode_permits() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(2, 8)
 }
@@ -76,13 +82,14 @@ pub struct ServeState {
     manifest_sem: Arc<tokio::sync::Semaphore>,
     /// narhash → when a lookup found nothing (valid for NAR_NEGATIVE_TTL).
     nar_negative: Mutex<LruCache<[u8; 32], Instant>>,
-    /// Bounds concurrent buffered chunk-encode jobs (m4).
-    encode_sem: tokio::sync::Semaphore,
+    /// Bounds concurrent chunk-encode jobs (m4). Arc'd so streaming responses can carry an
+    /// owned permit for their whole lifetime.
+    encode_sem: Arc<tokio::sync::Semaphore>,
     /// A separate lane for SMALL spans: tokio's semaphore is FIFO, so a 50 KB NAR's single
-    /// chunk would otherwise queue behind up to eight 16 MiB encodes — exactly the
-    /// many-small-concurrent-fetches case a nixpkgs rebuild produces. Same permit count;
+    /// chunk would otherwise queue behind a fleet of long-lived streaming encodes — exactly
+    /// the many-small-concurrent-fetches case a nixpkgs rebuild produces. Same permit count;
     /// bounded extra memory (permits × SMALL_ENCODE_SPAN).
-    encode_sem_small: tokio::sync::Semaphore,
+    encode_sem_small: Arc<tokio::sync::Semaphore>,
     pub stats: ServeStats,
 }
 
@@ -144,6 +151,18 @@ impl NarCache {
 struct NarEntry {
     info: PathInfo,
     table: tokio::sync::OnceCell<Arc<SeekTable>>,
+    /// Busy-times of the most recently COMPLETED streaming encode of this NAR. A streaming
+    /// response can't know its own read/encode cost before its headers go out, so each chunk
+    /// reports the previous one's, scaled to its span (the requester's level controller
+    /// integrates over many chunks; one chunk of staleness is immaterial).
+    enc_stats: Mutex<Option<EncStats>>,
+}
+
+#[derive(Clone, Copy)]
+struct EncStats {
+    read_us: u64,
+    encode_us: u64,
+    span: u64,
 }
 
 impl ServeState {
@@ -162,8 +181,8 @@ impl ServeState {
             nar_negative: Mutex::new(LruCache::new(
                 NonZeroUsize::new(NAR_NEGATIVE_ENTRIES).unwrap(),
             )),
-            encode_sem: tokio::sync::Semaphore::new(encode_permits()),
-            encode_sem_small: tokio::sync::Semaphore::new(encode_permits()),
+            encode_sem: Arc::new(tokio::sync::Semaphore::new(encode_permits())),
+            encode_sem_small: Arc::new(tokio::sync::Semaphore::new(encode_permits())),
             stats: ServeStats::default(),
         })
     }
@@ -370,20 +389,14 @@ async fn get_nar(
             .and_then(|v| v.strip_prefix("zstd:"))
             .and_then(|l| l.parse::<i32>().ok())
         {
-            if end - start <= MAX_ENCODED_SPAN {
+            if end - start <= SMALL_ENCODE_SPAN {
                 let level = level.clamp(1, st.cfg.max_zstd_level.max(1));
-                // Bound aggregate buffered-encode memory and CPU. The WAIT for a permit is an
-                // honest CPU-pressure signal, so it is reported to the requester folded into the
-                // encode time: the requester's closed-loop level controller (fetch.rs,
-                // observe_encoding) steps down when queue+encode dominates a chunk's service
-                // time, which is what actually drains an overloaded pool.
+                // Small spans buffer: the whole read+encode is milliseconds, so the exact
+                // per-chunk timing headers are cheap to keep and the streaming machinery
+                // would be pure overhead. The WAIT for a permit is an honest CPU-pressure
+                // signal, so it is reported to the requester folded into the encode time.
                 let waited = std::time::Instant::now();
-                let sem = if end - start <= SMALL_ENCODE_SPAN {
-                    &st.encode_sem_small
-                } else {
-                    &st.encode_sem
-                };
-                let _permit = sem.acquire().await.expect("semaphore closed");
+                let _permit = st.encode_sem_small.acquire().await.expect("semaphore closed");
                 let wait = waited.elapsed();
                 st.stats.chunks_encoded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 st.stats
@@ -408,6 +421,58 @@ async fn get_nar(
                         .unwrap(),
                     Err(e) => err500("chunk encode", e),
                 };
+            }
+            if end - start <= MAX_ENCODED_SPAN {
+                let level = level.clamp(1, st.cfg.max_zstd_level.max(1));
+                let waited = std::time::Instant::now();
+                let permit = st
+                    .encode_sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore closed");
+                let wait = waited.elapsed();
+                st.stats.chunks_encoded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                st.stats
+                    .encode_wait_us
+                    .fetch_add(wait.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                let mut resp = Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, "application/x-narshare-chunk")
+                    .header(
+                        header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", start, end - 1, size),
+                    )
+                    .header("x-narshare-encoding", "zstd")
+                    // Read/encode/wire OVERLAP on this path; the requester's controller must
+                    // compare busy-times against elapsed as utilizations, not subtract them.
+                    .header("x-narshare-timing", "pipelined");
+                // Previous completed chunk's busy-times, scaled to this span, with the LIVE
+                // permit wait folded in so pool pressure is never stale. The first chunk of a
+                // NAR carries no timing headers and the requester falls back to its open-loop
+                // goodput ladder for that one observation.
+                if let Some(s) = *entry.enc_stats.lock().unwrap() {
+                    let scale = (end - start) as f64 / s.span.max(1) as f64;
+                    resp = resp
+                        .header(
+                            "x-narshare-read-us",
+                            (((s.read_us as f64) * scale) as u64).to_string(),
+                        )
+                        .header(
+                            "x-narshare-encode-us",
+                            (((s.encode_us as f64) * scale) as u64 + wait.as_micros() as u64)
+                                .to_string(),
+                        );
+                }
+                let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
+                let stc = st.clone();
+                let tbl = table.clone();
+                let ent = entry.clone();
+                tokio::spawn(async move {
+                    stream_encode(stc, tbl, ent, start, end, level, tx).await;
+                    drop(permit);
+                });
+                return resp.body(Body::from_stream(ReceiverStream::new(rx))).unwrap();
             }
         }
     }
@@ -462,7 +527,11 @@ async fn nar_entry(st: &Arc<ServeState>, nar_hash: [u8; 32]) -> Result<Option<Ar
     if let Some(e) = cache.lru.get(&nar_hash) {
         return Ok(Some(e.clone()));
     }
-    let entry = Arc::new(NarEntry { info, table: tokio::sync::OnceCell::new() });
+    let entry = Arc::new(NarEntry {
+        info,
+        table: tokio::sync::OnceCell::new(),
+        enc_stats: Mutex::new(None),
+    });
     cache.insert(nar_hash, entry.clone());
     Ok(Some(entry))
 }
@@ -655,6 +724,174 @@ pub(crate) fn parse_range(header: Option<&str>, size: u64) -> RangeSpec {
 /// Materialize [start, end) into memory and compress it as one zstd frame. Returns the frame
 /// plus how long the two stages took (read from disk; encode, including blocking-pool queueing)
 /// — the serve side's half of the adaptive-encoding timing breakdown.
+/// Stream [start, end) as ONE zstd frame produced incrementally: pieces are read with the same
+/// lookahead as the raw path and fed to an encoder thread whose output flushes to the body as it
+/// is produced, so read, encode, and wire overlap. The buffered predecessor serialized all three
+/// per chunk, which capped a stream's throughput at wire/(read+encode+wire) — measured as a >2x
+/// loss against a single raw stream on a shaped sub-gigabit path (tests/perf.nix).
+///
+/// Backpressure chains end to end: a slow reader stalls `tx`, which blocks the encoder thread,
+/// which fills `feed`, which parks the read loop — memory per job stays at a few pieces plus the
+/// encoder window regardless of span.
+async fn stream_encode(
+    st: Arc<ServeState>,
+    table: Arc<SeekTable>,
+    entry: Arc<NarEntry>,
+    start: u64,
+    end: u64,
+    level: i32,
+    tx: mpsc::Sender<std::io::Result<Bytes>>,
+) {
+    let (feed_tx, mut feed_rx) = mpsc::channel::<Bytes>(4);
+    let out = tx.clone();
+    let encoder = tokio::task::spawn_blocking(move || -> Result<Duration> {
+        // Wire compression is strictly background work: soak idle cycles, never compete with
+        // interactive processes for them. The requester's closed-loop level controller already
+        // adapts to whatever CPU this thread ends up getting, so deprioritizing degrades the
+        // compression ratio gracefully instead of degrading the machine.
+        let _nice = NiceGuard::lower(10);
+        let mut busy = Duration::ZERO;
+        let mut w = ChannelWriter { tx: out, buf: Vec::with_capacity(ENCODE_FLUSH_BYTES * 2) };
+        let mut enc =
+            zstd::stream::write::Encoder::new(&mut w, level).context("zstd encoder")?;
+        while let Some(b) = feed_rx.blocking_recv() {
+            let t = Instant::now();
+            std::io::Write::write_all(&mut enc, &b).context("zstd write")?;
+            busy += t.elapsed();
+        }
+        let t = Instant::now();
+        enc.finish().context("zstd finish")?;
+        busy += t.elapsed();
+        w.flush_all()?;
+        Ok(busy)
+    });
+
+    // The feeder: identical lookahead discipline to emit(). read_busy is time the pipeline
+    // actually WAITED on the disk — with READ_AHEAD in flight, cached reads cost ~zero here.
+    let mut read_busy = Duration::ZERO;
+    let mut pieces = Pieces::new(&table, start, end);
+    let mut q: std::collections::VecDeque<Fetched> = std::collections::VecDeque::new();
+    let mut failed = false;
+    loop {
+        while q.len() < READ_AHEAD {
+            let Some(d) = pieces.next() else { break };
+            q.push_back(start_piece(&st.reader, d));
+        }
+        let Some(next) = q.pop_front() else { break };
+        let res = match next {
+            Fetched::Lit(b) => Ok(b),
+            Fetched::Read(h) => {
+                let t = Instant::now();
+                let r = h.await.expect("read task panicked");
+                read_busy += t.elapsed();
+                r
+            }
+        };
+        match res {
+            Ok(b) => {
+                if feed_tx.send(b).await.is_err() {
+                    // Encoder died (its error already went to the body) or the client left.
+                    failed = true;
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!("aborting encoded NAR stream: {e:#}");
+                let _ = tx.send(Err(std::io::Error::other(format!("{e:#}")))).await;
+                failed = true;
+                break;
+            }
+        }
+    }
+    drop(feed_tx);
+    for p in q {
+        if let Fetched::Read(h) = p {
+            h.abort();
+        }
+    }
+    match encoder.await.expect("encode task panicked") {
+        Ok(encode_busy) if !failed => {
+            *entry.enc_stats.lock().unwrap() = Some(EncStats {
+                read_us: read_busy.as_micros() as u64,
+                encode_us: encode_busy.as_micros() as u64,
+                span: end - start,
+            });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("chunk encode stream: {e:#}");
+            let _ = tx.send(Err(std::io::Error::other(format!("{e:#}")))).await;
+        }
+    }
+}
+
+/// std::io::Write bridge from the encoder thread into the response body channel. `flush` is a
+/// deliberate no-op — zstd flushes internally at block boundaries, and honoring those would
+/// fragment the body into tiny frames; ENCODE_FLUSH_BYTES is the real granularity.
+struct ChannelWriter {
+    tx: mpsc::Sender<std::io::Result<Bytes>>,
+    buf: Vec<u8>,
+}
+
+impl ChannelWriter {
+    fn flush_all(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let b = Bytes::from(std::mem::take(&mut self.buf));
+        self.buf.reserve(ENCODE_FLUSH_BYTES * 2);
+        self.tx
+            .blocking_send(Ok(b))
+            .map_err(|_| std::io::Error::other("client went away"))
+    }
+}
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, d: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(d);
+        if self.buf.len() >= ENCODE_FLUSH_BYTES {
+            self.flush_all()?;
+        }
+        Ok(d.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Scoped per-thread nice(): lowers this thread's scheduling priority by `by`, restoring the
+/// previous value on drop (the thread returns to a shared blocking pool — a leaked nice would
+/// deprioritize whatever unrelated work lands on it next).
+struct NiceGuard {
+    tid: libc::pid_t,
+    prev: i32,
+}
+
+impl NiceGuard {
+    fn lower(by: i32) -> Option<Self> {
+        unsafe {
+            let tid = libc::gettid();
+            *libc::__errno_location() = 0;
+            let prev = libc::getpriority(libc::PRIO_PROCESS, tid as libc::id_t);
+            if prev == -1 && *libc::__errno_location() != 0 {
+                return None;
+            }
+            if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, (prev + by).min(19)) != 0 {
+                return None;
+            }
+            Some(Self { tid, prev })
+        }
+    }
+}
+
+impl Drop for NiceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, self.tid as libc::id_t, self.prev);
+        }
+    }
+}
+
 async fn encode_span(
     st: &Arc<ServeState>,
     table: &Arc<SeekTable>,
@@ -663,8 +900,8 @@ async fn encode_span(
     level: i32,
 ) -> Result<(Vec<u8>, Duration, Duration)> {
     let t0 = Instant::now();
-    // All reads in flight at once (the span is bounded by MAX_ENCODED_SPAN, so ≤256 pieces);
-    // the io pool's own semaphore is the actual concurrency bound. Assembled in order.
+    // All reads in flight at once (only SMALL_ENCODE_SPAN spans buffer, so a handful of
+    // pieces); the io pool's own semaphore is the actual concurrency bound. Assembled in order.
     let started: Vec<Fetched> =
         Pieces::new(table, start, end).map(|d| start_piece(&st.reader, d)).collect();
     let mut raw = Vec::with_capacity((end - start) as usize);

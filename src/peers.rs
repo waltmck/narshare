@@ -165,6 +165,10 @@ pub struct Chunk {
     pub srv_encode: Duration,
     /// Local decompression time (zero for raw bodies).
     pub decode: Duration,
+    /// True when the peer streamed the chunk (read/encode/wire OVERLAPPED, and the reported
+    /// times are the previous chunk's busy-times scaled to this span): the bottleneck math
+    /// must treat them as utilizations of elapsed, not serial components to subtract.
+    pub pipelined: bool,
 }
 
 fn micros_header(resp: &reqwest::Response, name: &str) -> Duration {
@@ -387,6 +391,10 @@ impl Peers {
             .is_some_and(|v| v.as_bytes() == b"zstd");
         let srv_read = micros_header(&resp, "x-narshare-read-us");
         let srv_encode = micros_header(&resp, "x-narshare-encode-us");
+        let pipelined = resp
+            .headers()
+            .get("x-narshare-timing")
+            .is_some_and(|v| v.as_bytes() == b"pipelined");
         let want = (end - start) as usize;
         // Cap the WIRE body: raw must be exactly `want`; a compressed frame must be no larger than
         // `want + slack` (it should be smaller). This bounds the read before decompression.
@@ -433,6 +441,6 @@ impl Peers {
             );
         }
         peer.record_ok(); // a delivered chunk closes any half-open breaker
-        Ok(Chunk { bytes, wire, srv_read, srv_encode, decode })
+        Ok(Chunk { bytes, wire, srv_read, srv_encode, decode, pipelined })
     }
 }

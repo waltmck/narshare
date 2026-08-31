@@ -205,7 +205,10 @@ fn d_segment_bytes() -> ByteSize { ByteSize(4 << 20) }
 fn d_store_dir() -> PathBuf { "/nix/store".into() }
 fn d_db_path() -> PathBuf { "/nix/var/nix/db/db.sqlite".into() }
 fn d_io_concurrency() -> usize { 64 }
-fn d_chunk_max() -> ByteSize { ByteSize(16 << 20) }
+// 64 MiB: with streaming serve-side encode a chunk's cost is pure wire time, so the cap only
+// bounds requeue waste and striping granularity; the rate*CHUNK_TARGET_SECS sizer stops being
+// cap-bound on fast LAN links (16 MiB capped every link past 8 MB/s).
+fn d_chunk_max() -> ByteSize { ByteSize(64 << 20) }
 fn d_window_bytes() -> ByteSize { ByteSize(256 << 20) }
 fn d_dedup_budget() -> ByteSize { ByteSize(512 << 20) }
 fn d_per_peer_connections() -> usize { 8 }

@@ -47,6 +47,10 @@
         # suite: four nodes over shaped links (fast / 20 Mbit / lossy), substituting from
         # each other through the proxy with no trusted keys. Needs KVM.
         mesh = pkgs.testers.runNixOSTest (import ./tests/mesh.nix { inherit self; });
+        # The saturation bench: GB-scale transfer over a shaped (sub-gigabit, real-RTT,
+        # cold-cache) link, measured as a ratio against a single-stream fetch of the same
+        # NAR over the same path. Kept separate from `mesh` so perf iteration is fast.
+        perf = pkgs.testers.runNixOSTest (import ./tests/perf.nix { inherit self; });
       });
     };
 }
