@@ -27,6 +27,9 @@ pub struct Candidate {
     pub nar_size: u64,
     pub sigs: Vec<String>,
     pub ca: Option<String>,
+    /// Full store path of the deriver, if recorded — consulted (lazily, per changed row)
+    /// for its allowSubstitutes verdict at export time.
+    pub deriver: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,7 +178,7 @@ impl StoreDb {
     pub fn feasible_candidates(&self) -> Result<Vec<Candidate>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
-            "SELECT id, path, hash, narSize, sigs, ca FROM ValidPaths \
+            "SELECT id, path, hash, narSize, sigs, ca, deriver FROM ValidPaths \
              WHERE (sigs IS NOT NULL AND sigs != '') OR (ca IS NOT NULL AND ca != '')",
         )?;
         let rows = stmt
@@ -187,11 +190,12 @@ impl StoreDb {
                     r.get::<_, Option<i64>>(3)?,
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut out = Vec::with_capacity(rows.len());
-        for (id, path, hash, sz, sigs, ca) in rows {
+        for (id, path, hash, sz, sigs, ca, deriver) in rows {
             let Some(nar_size) = sz else {
                 warn_once(&anyhow::anyhow!("path {path} has no narSize in nix db"));
                 continue;
@@ -206,6 +210,7 @@ impl StoreDb {
                         .map(|s| s.split_whitespace().map(str::to_owned).collect())
                         .unwrap_or_default(),
                     ca: ca.filter(|c| !c.is_empty()),
+                    deriver: deriver.filter(|d| !d.is_empty()),
                 }),
                 Err(e) => warn_once(&e),
             }
@@ -379,6 +384,16 @@ pub mod tests {
             .unwrap();
         }
         db
+    }
+
+    /// Attach a deriver to a fake-db row.
+    pub fn set_deriver(db: &Path, path: &str, deriver: &str) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute(
+            "UPDATE ValidPaths SET deriver = ?2 WHERE path = ?1",
+            rusqlite::params![path, deriver],
+        )
+        .unwrap();
     }
 
     /// Attach signatures to a fake-db row (space-separated, as nix stores them).

@@ -82,6 +82,11 @@ pub struct Index {
     origin_set: HashSet<String>,
     peer_names: Vec<String>,
     trusted: TrustedKeys,
+    /// Deriver drv path -> "may this output be substituted" verdict cache. Reading and
+    /// scanning a drv file happens at most once per deriver per process lifetime; without the
+    /// cache, paths filtered by allowSubstitutes=false would re-read their drv on every diff
+    /// cycle forever (they never enter the index, so they stay "new" to the differ).
+    nosub: Mutex<HashMap<String, bool>>,
 }
 
 /// One lookup result: a feasible narinfo and who currently holds it.
@@ -343,6 +348,7 @@ impl Index {
             origin_set,
             peer_names: peer_names.to_vec(),
             trusted,
+            nosub: Mutex::new(HashMap::new()),
         })
     }
 
@@ -651,6 +657,24 @@ impl Index {
         Ok(g)
     }
 
+    /// Does the deriver permit substitution of its outputs? Missing deriver or unreadable
+    /// drv file defaults to yes (the attribute is advisory and absent means true). Detects
+    /// both the classic env encoding and the __structuredAttrs JSON encoding.
+    fn substitutable(&self, c: &crate::db::Candidate) -> bool {
+        let Some(drv) = &c.deriver else { return true };
+        if let Some(&v) = self.nosub.lock().unwrap().get(drv) {
+            return v;
+        }
+        let allows = std::fs::read_to_string(drv)
+            .map(|s| {
+                !s.contains(r#"("allowSubstitutes","")"#)
+                    && !s.contains(r#"\"allowSubstitutes\":false"#)
+            })
+            .unwrap_or(true);
+        self.nosub.lock().unwrap().insert(drv.clone(), allows);
+        allows
+    }
+
     /// The exporting node's half: diff our Nix db against our indexed self-holdings and emit
     /// add/remove events to our own journal. Feasibility is checked HERE, by the exporter, per
     /// the design: only CA or trusted-signed rows leave this node. Returns events emitted.
@@ -691,6 +715,15 @@ impl Index {
             if !changed {
                 kept.insert(info.path.as_str());
                 continue;
+            }
+            // Respect the deriver's allowSubstitutes = false: nixpkgs sets it (paired with
+            // preferLocalBuild) on derivations that are cheaper to rebuild than to fetch —
+            // wrapper scripts, setup hooks, text files. Requesters that evaluated the same
+            // derivation will never ask a substituter for these, so indexing them is pure
+            // overhead (~4% of a system's build closure, measured). Checked only for rows
+            // about to be exported, never across the whole candidate set.
+            if !self.substitutable(info) {
+                continue; // not `kept`: a previously exported row degrades to a Remove
             }
             // References are fetched HERE, one query per CHANGED row — never for the whole
             // candidate set (a per-row JOIN across a 100k-path store cost ~10 CPU-seconds per
@@ -1214,6 +1247,38 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].holders, vec!["a".to_string()]);
         assert_eq!(rows[0].info.nar_hash, [2u8; 32]);
+    }
+
+    #[test]
+    fn allow_substitutes_false_is_not_exported() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let p1 = format!("{}/{}-wrapper", store.display(), "1".repeat(32));
+        let p2 = format!("{}/{}-real", store.display(), "2".repeat(32));
+        let db_path = crate::db::tests::fake_db(
+            dir.path(),
+            &[
+                (&p1, [1u8; 32], 10, Some("fixed:r:sha256:x")),
+                (&p2, [2u8; 32], 20, Some("fixed:r:sha256:y")),
+            ],
+        );
+        // p1's deriver forbids substitution (classic env encoding); p2's allows (no attr).
+        let drv1 = dir.path().join("wrapper.drv");
+        std::fs::write(&drv1, r#"Derive([...],[("allowSubstitutes",""),("x","y")])"#).unwrap();
+        let drv2 = dir.path().join("real.drv");
+        std::fs::write(&drv2, r#"Derive([...],[("x","y")])"#).unwrap();
+        crate::db::tests::set_deriver(&db_path, &p1, drv1.to_str().unwrap());
+        crate::db::tests::set_deriver(&db_path, &p2, drv2.to_str().unwrap());
+
+        let db = crate::db::StoreDb::open(&db_path, store.to_str().unwrap()).unwrap();
+        let a = idx(dir.path(), "a", &["b"]);
+        assert_eq!(a.sync_own_db(&db).unwrap(), 1, "only the substitutable path exports");
+        assert_eq!(a.count_narinfos(), 1);
+        assert_eq!(a.lookup_hash_part(&"2".repeat(32)).unwrap().len(), 1);
+        assert!(a.lookup_hash_part(&"1".repeat(32)).unwrap().is_empty());
+        // Idempotent: the filtered path must not thrash the journal on later diffs.
+        assert_eq!(a.sync_own_db(&db).unwrap(), 0);
     }
 
     #[test]
