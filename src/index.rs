@@ -1282,6 +1282,44 @@ mod tests {
     }
 
     #[test]
+    fn deriver_flip_to_nosub_retracts_on_next_row_change() {
+        // A FOD keeps its output path when allowSubstitutes flips (only the drv changes), so
+        // the same store path can acquire a nosub deriver after being exported. Contract:
+        // while the row itself is byte-identical the export stands (unchanged rows never
+        // re-consult their deriver — that is the differ's whole cost model, and the stale
+        // advertisement is still valid for peers that evaluated the old drv). The moment the
+        // row changes for any reason, the filter re-runs and the path is RETRACTED with a
+        // journaled Remove, not silently kept.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let p = format!("{}/{}-fod", store.display(), "7".repeat(32));
+        let db_path =
+            crate::db::tests::fake_db(dir.path(), &[(&p, [7u8; 32], 10, Some("fixed:r:sha256:x"))]);
+        let drv_yes = dir.path().join("yes.drv");
+        std::fs::write(&drv_yes, r#"Derive([...],[("x","y")])"#).unwrap();
+        let drv_no = dir.path().join("no.drv");
+        std::fs::write(&drv_no, r#"Derive([...],[("allowSubstitutes",""),("x","y")])"#).unwrap();
+        crate::db::tests::set_deriver(&db_path, &p, drv_yes.to_str().unwrap());
+
+        let db = crate::db::StoreDb::open(&db_path, store.to_str().unwrap()).unwrap();
+        let a = idx(dir.path(), "a", &["b"]);
+        assert_eq!(a.sync_own_db(&db).unwrap(), 1);
+        assert_eq!(a.count_narinfos(), 1);
+
+        // Deriver flips, row unchanged: the export stands.
+        crate::db::tests::set_deriver(&db_path, &p, drv_no.to_str().unwrap());
+        assert_eq!(a.sync_own_db(&db).unwrap(), 0);
+        assert_eq!(a.count_narinfos(), 1);
+
+        // Row changes (re-registered with a signature): filter re-runs, path is retracted.
+        crate::db::tests::set_sigs(&db_path, &p, "cache.example-1:c2lnbmF0dXJl");
+        assert_eq!(a.sync_own_db(&db).unwrap(), 1, "exactly one Remove event");
+        assert_eq!(a.count_narinfos(), 0);
+        assert!(a.lookup_hash_part(&"7".repeat(32)).unwrap().is_empty());
+    }
+
+    #[test]
     fn normalized_refs_round_trip_in_order_and_replace_on_upsert() {
         let dir = tempfile::tempdir().unwrap();
         let b = idx(dir.path(), "b", &["a"]);
