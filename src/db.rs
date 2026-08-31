@@ -17,6 +17,18 @@ fn warn_once(e: &anyhow::Error) {
     tracing::warn!("skipping malformed nix-db row: {e:#}");
 }
 
+/// A feasible-candidate row as the differ sees it: everything change detection needs,
+/// references deliberately omitted (see feasible_candidates).
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub id: i64,
+    pub path: String,
+    pub nar_hash: [u8; 32],
+    pub nar_size: u64,
+    pub sigs: Vec<String>,
+    pub ca: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PathInfo {
     /// Full store path.
@@ -154,39 +166,74 @@ impl StoreDb {
         .transpose()
     }
 
-    /// Rows that could be mesh-feasible (CA, or carrying signatures), with references — the
-    /// candidate set the index differ exports from. Signature validity is the caller's check.
-    pub fn feasible_candidates(&self) -> Result<Vec<PathInfo>> {
-        type Row = (i64, String, String, Option<i64>, Option<String>, Option<String>, Option<String>);
+    /// Rows that could be mesh-feasible (CA, or carrying signatures) — the candidate set the
+    /// index differ exports from. DELIBERATELY without references: fetching them is one JOIN
+    /// query per row (~100k queries on a real store, ~10 CPU-seconds per diff, measured), and
+    /// the differ's change detection needs only (hash, sigs). Callers fetch references via
+    /// references_of() for the handful of rows that actually changed. Signature validity is
+    /// the caller's check.
+    pub fn feasible_candidates(&self) -> Result<Vec<Candidate>> {
         let conn = self.conn.lock().unwrap();
-        let rows: Vec<Row> = {
-            let mut stmt = conn.prepare_cached(
-                "SELECT id, path, hash, narSize, deriver, sigs, ca FROM ValidPaths \
-                 WHERE (sigs IS NOT NULL AND sigs != '') OR (ca IS NOT NULL AND ca != '')",
-            )?;
-            let v = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            v
-        };
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, path, hash, narSize, sigs, ca FROM ValidPaths \
+             WHERE (sigs IS NOT NULL AND sigs != '') OR (ca IS NOT NULL AND ca != '')",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut out = Vec::with_capacity(rows.len());
-        for (id, path, hash, sz, drv, sigs, ca) in rows {
-            match Self::info_from_row(&conn, id, path, hash, sz, drv, sigs, ca) {
-                Ok(info) => out.push(info),
+        for (id, path, hash, sz, sigs, ca) in rows {
+            let Some(nar_size) = sz else {
+                warn_once(&anyhow::anyhow!("path {path} has no narSize in nix db"));
+                continue;
+            };
+            match parse_hash_column(&hash) {
+                Ok(nar_hash) => out.push(Candidate {
+                    id,
+                    path,
+                    nar_hash,
+                    nar_size: nar_size as u64,
+                    sigs: sigs
+                        .map(|s| s.split_whitespace().map(str::to_owned).collect())
+                        .unwrap_or_default(),
+                    ca: ca.filter(|c| !c.is_empty()),
+                }),
                 Err(e) => warn_once(&e),
             }
         }
         Ok(out)
+    }
+
+    /// Full store paths of one row's references, sorted (the fingerprint needs them) — fetched
+    /// per CHANGED row only, never for the whole candidate set.
+    pub fn references_of(&self, id: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT v.path FROM Refs JOIN ValidPaths v ON v.id = Refs.reference \
+             WHERE Refs.referrer = ?1 ORDER BY v.path",
+        )?;
+        let refs = stmt
+            .query_map([id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(refs)
+    }
+
+    /// SQLite's global change counter: increments whenever ANOTHER connection commits to the
+    /// database. The differ's cheap gate — an unchanged version means the store is byte-for-
+    /// byte as last diffed, so idle rescans and reader-generated inotify chatter cost one
+    /// pragma instead of a 100k-row scan.
+    pub fn data_version(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
     }
 
     /// Look up by NAR hash (nar request — the hot path of every fetch a peer makes from us).

@@ -577,7 +577,6 @@ impl Index {
         let mut adds: Vec<proto::Narinfo> = Vec::new();
         let mut kept: HashSet<&str> = HashSet::with_capacity(candidates.len());
         for info in &candidates {
-            let n = pathinfo_to_proto(info, &db.store_dir);
             let changed = match held.get(&info.path) {
                 Some((hash, sigs)) => {
                     // Sig comparison is SUBSET, not equality: peers holding the same
@@ -587,8 +586,8 @@ impl Index {
                     // hints the mesh and every application re-hints, the whole mesh would spin
                     // on pull/hint churn with unbounded journal growth.
                     let stored: HashSet<&str> = sigs.split_whitespace().collect();
-                    hash != &n.nar_hash.to_vec()
-                        || n.sigs.iter().any(|s| !stored.contains(s.as_str()))
+                    hash[..] != info.nar_hash[..]
+                        || info.sigs.iter().any(|s| !stored.contains(s.as_str()))
                 }
                 None => true,
             };
@@ -596,6 +595,22 @@ impl Index {
                 kept.insert(info.path.as_str());
                 continue;
             }
+            // References are fetched HERE, one query per CHANGED row — never for the whole
+            // candidate set (a per-row JOIN across a 100k-path store cost ~10 CPU-seconds per
+            // diff, measured in production). The signed fingerprint covers them and the
+            // exported narinfo carries them, so only exports need them.
+            let refs = db.references_of(info.id)?;
+            let n = proto::Narinfo {
+                store_path: info.path.clone(),
+                nar_hash: info.nar_hash.to_vec(),
+                nar_size: info.nar_size,
+                references: refs
+                    .iter()
+                    .map(|r| crate::narinfo::basename(r, &db.store_dir).to_owned())
+                    .collect(),
+                ca: info.ca.clone().unwrap_or_default(),
+                sigs: info.sigs.clone(),
+            };
             // Feasibility (with its ed25519 verify) only for changed rows: unchanged rows were
             // already vetted when first exported.
             if self.feasible(&n) {
@@ -1110,21 +1125,6 @@ pub fn proto_to_remote(n: &proto::Narinfo) -> RemoteNarinfo {
         deriver: None,
         ca: (!n.ca.is_empty()).then(|| n.ca.clone()),
         sigs: n.sigs.clone(),
-    }
-}
-
-fn pathinfo_to_proto(info: &crate::db::PathInfo, store_dir: &str) -> proto::Narinfo {
-    proto::Narinfo {
-        store_path: info.path.clone(),
-        nar_hash: info.nar_hash.to_vec(),
-        nar_size: info.nar_size,
-        references: info
-            .references
-            .iter()
-            .map(|r| crate::narinfo::basename(r, store_dir).to_owned())
-            .collect(),
-        ca: info.ca.clone().unwrap_or_default(),
-        sigs: info.sigs.clone(),
     }
 }
 

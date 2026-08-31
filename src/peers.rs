@@ -122,10 +122,18 @@ impl Peer {
                 h.opens += 1; // a fresh open (or a half-open probe failing), not an extension
             }
             h.open_until = Some(Instant::now() + cooldown);
-            warn!(
-                "peer {name}: breaker open for {cooldown:?} ({} strikes)",
-                h.strikes
-            );
+            // Warn once per OUTAGE (strikes reset on success), or a permanently-dead
+            // configured peer would log every re-open forever — 8 dead peers × once a
+            // minute of journal churn, measured. Re-opens are visible in the status
+            // endpoint (breaker.opens_total) and at debug level.
+            if h.strikes == threshold {
+                warn!("peer {name}: breaker open for {cooldown:?} ({threshold} strikes)");
+            } else {
+                debug!(
+                    "peer {name}: breaker re-open for {cooldown:?} ({} strikes)",
+                    h.strikes
+                );
+            }
         }
     }
 

@@ -54,6 +54,11 @@ pub struct Sync {
     kick_rxs: std::sync::Mutex<Vec<Option<mpsc::Receiver<()>>>>,
     hint_tx: mpsc::Sender<()>,
     hint_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+    /// The nix db's data_version as of the last completed diff (i64::MIN = never diffed).
+    /// The differ's cheap gate: PRAGMA data_version moves only when another connection
+    /// COMMITS, so timer rescans and reader-generated inotify chatter on an unchanged store
+    /// cost one pragma instead of a full candidate scan.
+    last_data_version: std::sync::atomic::AtomicI64,
     pub stats: SyncStats,
 }
 
@@ -97,6 +102,7 @@ impl Sync {
             kick_rxs: std::sync::Mutex::new(kick_rxs),
             hint_tx,
             hint_rx: std::sync::Mutex::new(Some(hint_rx)),
+            last_data_version: std::sync::atomic::AtomicI64::new(i64::MIN),
             stats: SyncStats::default(),
         })
     }
@@ -222,14 +228,29 @@ impl Sync {
     }
 
     /// Diff the Nix db against our indexed self-holdings once (the exporting half).
+    ///
+    /// Gated on the db's data_version: the version is sampled BEFORE the diff and stored only
+    /// after a successful one, so a write landing mid-diff bumps the version again and the
+    /// next trigger re-diffs — at-least-once, never lost. An unchanged version means the
+    /// store is byte-for-byte as last diffed and the whole scan is skipped.
     pub async fn export_own_db(&self) -> Result<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
         let Some(db) = self.db.clone() else { return Ok(0) };
+        let v = {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.data_version())
+                .await
+                .map_err(|e| anyhow::anyhow!("gate task died: {e}"))??
+        };
+        if v == self.last_data_version.load(Relaxed) {
+            return Ok(0);
+        }
         let index = self.index.clone();
         let n = tokio::task::spawn_blocking(move || index.sync_own_db(&db))
             .await
             .map_err(|e| anyhow::anyhow!("differ task died: {e}"))??;
+        self.last_data_version.store(v, Relaxed);
         if n > 0 {
-            use std::sync::atomic::Ordering::Relaxed;
             self.stats.exports.fetch_add(1, Relaxed);
             self.stats.export_events.fetch_add(n as u64, Relaxed);
         }
