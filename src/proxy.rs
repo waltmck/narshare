@@ -658,10 +658,17 @@ mod tests {
             assert_eq!(b.len(), payload.len());
             picks_b_at.push(tally(1).0);
         }
+        // Let detached hedge losers land their tallies before reading them.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         let (ok_a, err_a, _) = tally(0);
         let (ok_b, err_b, _) = tally(1);
         assert_eq!(err_a + err_b, 0, "the fluid links never fail");
-        assert_eq!((ok_a + ok_b) as usize, T1, "one decision per fetch");
+        // Hedged fetches complete TWICE (the loser is recorded by design), so completions
+        // exceed decisions. Attribution stays exact: the slow peer is never a hedge partner
+        // (partners are drawn for below-uniform primaries, and the slow peer is the only one
+        // below uniform here), so ok_b counts exactly the slow-primary decisions.
+        assert!((ok_a + ok_b) as usize >= T1, "at least one completion per fetch");
+        let ok_b = picks_b_at[T1 - 1]; // slow picks at the moment the burst ended
         let loss_b = 1.0 - 1.0 / 64.0;
         let regret = ok_b as f64 * loss_b;
         let hedge_ref = (T1 as f64 / 2.0 * 2f64.ln()).sqrt();
@@ -786,6 +793,176 @@ mod tests {
             .map(|w| (w * 1000.0).round() / 1000.0)
             .collect();
         ((payload.len() as f64 / MB as f64) / median, share_b, weights)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hedged_ping_is_insured_and_still_measured() {
+        // A floor-weight peer's pings must (a) not gate the fetches that draw them — the
+        // duplicate wins — and (b) still produce measurements: the detached loser completes
+        // and records itself even though its transfer already returned.
+        const MB: u64 = 1_000_000;
+        let link_a = FluidLink::new(64 * MB);
+        let link_b = FluidLink::new(MB / 2);
+        let payload = bytes::Bytes::from(vec![0x66u8; 256 * 1024]);
+        let url_a = spawn_router(throttled_peer(link_a, payload.clone())).await;
+        let url_b = spawn_router(throttled_peer(link_b, payload.clone())).await;
+        let client =
+            spawn_client("c", &[("a", &url_a), ("b", &url_b)], "", TrustedKeys::none()).await;
+        let nar32 = seed_two_holders(&client, &payload, "hedge");
+        client.state.fetch.pool.restore(&[1.0, 0.03], 64e6, 0.05);
+        client.state.fetch.set_rate(0, 64e6);
+        client.state.fetch.set_rate(1, 5e5);
+        let http = reqwest::Client::new();
+        let url = format!("{}/nar/{nar32}.nar", client.url);
+        let t0 = Instant::now();
+        for _ in 0..200 {
+            let b = http.get(&url).send().await.unwrap().bytes().await.unwrap();
+            assert_eq!(b.len(), payload.len());
+        }
+        let wall = t0.elapsed();
+        // Let detached losers land their measurements.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let hedges = client.state.fetch.stats.hedges.load(Ordering::Relaxed);
+        let (ok_b, err_b, _) = client.state.fetch.peer_tally(1);
+        assert!(hedges >= 1, "floor-weight pings must be insured");
+        assert!(ok_b + err_b >= 1, "the losing twin must still be measured");
+        // Mechanism test only: the burst's THROUGHPUT under drift is a tuning quantity the
+        // mw_tune_sweep bench measures (fixed-share drift lifts the slow weight between
+        // pings, and mid-weight draws are only partially insured). This bound is a hang guard.
+        assert!(wall < std::time::Duration::from_secs(90), "hung: {wall:?}");
+    }
+
+    /// One (η, ν) sweep cell over the fluid 64:1 pair, sequential regime:
+    /// returns (slow picks in first 50, slow share % of last 100, tail fetches >150 ms in last
+    /// 100, decisions to majority-flip after a capability swap, stale picks after the swap).
+    async fn tune_seq_cell(eta: f64, nu: f64, share: f64) -> (u64, f64, usize, usize, u64) {
+        const MB: u64 = 1_000_000;
+        let link_a = FluidLink::new(64 * MB);
+        let link_b = FluidLink::new(MB);
+        let payload = bytes::Bytes::from(vec![0x42u8; 256 * 1024]);
+        let url_a = spawn_router(throttled_peer(link_a.clone(), payload.clone())).await;
+        let url_b = spawn_router(throttled_peer(link_b.clone(), payload.clone())).await;
+        let client =
+            spawn_client("c", &[("a", &url_a), ("b", &url_b)], "", TrustedKeys::none()).await;
+        client.state.fetch.pool.set_eta(eta);
+        client.state.fetch.pool.set_share(share);
+        client.state.fetch.set_nu(nu);
+        let nar32 = seed_two_holders(&client, &payload, "seq");
+        let http = reqwest::Client::new();
+        let url = format!("{}/nar/{nar32}.nar", client.url);
+        let slow_picks = |i: usize| {
+            let (ok, err, _) = client.state.fetch.peer_tally(i);
+            ok + err
+        };
+        const T: usize = 200;
+        let mut b_at = Vec::with_capacity(T);
+        let mut tails_last100 = 0usize;
+        for i in 0..T {
+            let t0 = Instant::now();
+            let b = http.get(&url).send().await.unwrap().bytes().await.unwrap();
+            assert_eq!(b.len(), payload.len());
+            if i >= T - 100 && t0.elapsed().as_millis() > 150 {
+                tails_last100 += 1;
+            }
+            b_at.push(slow_picks(1));
+        }
+        let first50 = b_at[49];
+        let last100 = b_at[T - 1] - b_at[T - 101];
+
+        // Swap capabilities; measure tracking.
+        link_a.rate.store(MB, Ordering::Relaxed);
+        link_b.rate.store(64 * MB, Ordering::Relaxed);
+        let (base_a, base_b) = (slow_picks(0), slow_picks(1));
+        let mut flip = usize::MAX;
+        let mut prev_b = base_b;
+        for i in 0..T {
+            http.get(&url).send().await.unwrap().bytes().await.unwrap();
+            if (i + 1) % 25 == 0 {
+                let nb = slow_picks(1);
+                if flip == usize::MAX && nb - prev_b >= 13 {
+                    flip = i + 1;
+                }
+                prev_b = nb;
+            }
+        }
+        let stale = slow_picks(0) - base_a;
+        (first50, last100 as f64, tails_last100, flip, stale)
+    }
+
+    /// One (η, ν) sweep cell, striped regime with LEARNED weights: returns
+    /// (median % of single-best, worst wall s, learned slow weight, hedge waste % of remote).
+    async fn tune_striped_cell(
+        eta: f64,
+        nu: f64,
+        share: f64,
+        ra: u64,
+        rb: u64,
+        warmups: usize,
+    ) -> (f64, f64, f64, f64) {
+        const MB: u64 = 1_000_000;
+        let link_a = FluidLink::new(ra);
+        let link_b = FluidLink::new(rb);
+        let payload = bytes::Bytes::from(vec![0x43u8; 32 * 1024 * 1024]);
+        let url_a = spawn_router(throttled_peer(link_a, payload.clone())).await;
+        let url_b = spawn_router(throttled_peer(link_b, payload.clone())).await;
+        let client =
+            spawn_client("c", &[("a", &url_a), ("b", &url_b)], "", TrustedKeys::none()).await;
+        client.state.fetch.pool.set_eta(eta);
+        client.state.fetch.pool.set_share(share);
+        client.state.fetch.set_nu(nu);
+        let nar32 = seed_two_holders(&client, &payload, "str");
+        let http = reqwest::Client::new();
+        let url = format!("{}/nar/{nar32}.nar", client.url);
+        for _ in 0..warmups {
+            let b = http.get(&url).send().await.unwrap().bytes().await.unwrap();
+            assert_eq!(b.len(), payload.len());
+        }
+        let mut walls = Vec::new();
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let b = http.get(&url).send().await.unwrap().bytes().await.unwrap();
+            assert_eq!(b.len(), payload.len());
+            walls.push(t0.elapsed().as_secs_f64());
+        }
+        let mut sorted = walls.clone();
+        sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let size_mb = payload.len() as f64 / MB as f64;
+        let median_pct = 100.0 * (size_mb / sorted[2]) / (ra as f64 / MB as f64);
+        let worst = sorted[4];
+        let w_slow = client.state.fetch.pool.snapshot().0[1];
+        let s = &client.state.fetch.stats;
+        let waste_pct = 100.0 * s.hedged_waste_bytes.load(Ordering::Relaxed) as f64
+            / s.remote_bytes.load(Ordering::Relaxed).max(1) as f64;
+        (median_pct, worst, w_slow, waste_pct)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // tuning sweep — run alone: cargo test --release mw_tune -- --ignored --nocapture
+    async fn mw_tune_sweep() {
+        let run = |eta: f64, nu: f64, sh: f64| async move {
+            let (first50, slow_share, tails, flip, stale) = tune_seq_cell(eta, nu, sh).await;
+            let (med64, worst64, _w64, waste64) =
+                tune_striped_cell(eta, nu, sh, 64_000_000, 1_000_000, 3).await;
+            let (med21, worst21, w21, _) =
+                tune_striped_cell(eta, nu, sh, 32_000_000, 16_000_000, 5).await;
+            println!(
+                "[tune] eta={eta} nu={nu} share={sh} | seq64: first50={first50} \
+                 slow={slow_share}/100 tails={tails}/100 | swap: flip<={flip} stale={stale} | \
+                 striped64: med={med64:.0}% worst={worst64:.2}s waste={waste64:.1}% | 2:1: \
+                 med={med21:.0}% worst={worst21:.2}s w_slow={w21:.2}"
+            );
+        };
+        for eta in [0.4, 0.7, 1.2] {
+            for nu in [1.0, 3.0, 6.0] {
+                run(eta, nu, 0.02).await;
+            }
+        }
+        // Supplementary (outside the asked scope, but the binding constraint the grid
+        // exposes): the fixed-share drift rate sets the steady slow share and the tail rate
+        // far more than eta/nu do — measure it at the provisional center.
+        for sh in [0.005, 0.001] {
+            run(0.7, 3.0, sh).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

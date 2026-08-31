@@ -86,6 +86,8 @@ async fn status(State(ctx): State<Arc<StatusCtx>>) -> Response {
                 "completed": s.transfers_completed.load(Relaxed),
                 "manifest_plans": s.manifest_plans.load(Relaxed),
                 "clients_gone": s.clients_gone.load(Relaxed),
+                "hedges": s.hedges.load(Relaxed),
+                "hedged_waste_bytes": s.hedged_waste_bytes.load(Relaxed),
                 "aborted": {
                     "stall": s.aborts_stall.load(Relaxed),
                     "streak": s.aborts_streak.load(Relaxed),

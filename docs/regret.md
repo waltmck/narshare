@@ -112,49 +112,73 @@ needs a rate-proportional share estimator (a learning-dynamics question: η shap
 sub-best peers collapse) *and* tail insurance — which is what hedged exploration below
 provides. Neither is a regression of the routing change.
 
-## Proposed (not yet implemented): hedged exploration
+## Hedged exploration (implemented)
 
-The residual variance cost of weight routing is the ping itself: a `W_MIN`-probability draw
-hands the slow peer one ~2 s chunk and that fetch's completion waits for it. Threshold hacks
-("if w < 0.1, also try someone else") are ugly; the continuous rule falls out of the pool's
-own invariant. The pool renormalizes so the best weight is 1.0, making `w_i` read as "relative
-confidence that routing to i costs nothing vs best". So:
+The residual variance cost of weight routing was the ping itself: a floor-probability draw
+handed the slow peer one ~2 s chunk and that fetch's completion waited for it. Now, after the
+weighted draw picks primary `i`, a DUPLICATE of the chunk is dispatched to a second weighted
+draw with probability
 
-> After drawing primary `i` (∝ w), dispatch a **duplicate** of the same chunk to a second peer
-> `j` (drawn ∝ w over the rest) with probability `h_i = 1 − w_i`. First arrival feeds the
-> emitter; the loser **completes anyway and is recorded normally**, its bytes discarded.
+    h = clamp((1/N − p) / (1/N − p_floor), 0, 1)^ν
 
-Properties, in the order they matter:
-- **Asymptotically stable weights are unchanged.** Updates are per-completion; hedging changes
-  which bytes are *used*, never which requests complete. The crux is not cancelling the loser:
-  a cancelled ping produces no observation, so a floored peer would rise on fixed-share drift
-  alone (evidence-free) until it won real traffic — oscillation. Letting the loser finish
-  preserves the exact measurement the ping exists for.
-- **Continuous, knob-free, N-ary.** Best peer: h = 0, never hedged. Floor peer: h ≈ 0.97,
-  nearly always insured. Mid-recovery peer (w = 0.5): half its chunks carry a backup — paying
-  duplicate bytes exactly while the scheduler is uncertain about it. Arbitrary weight
-  distributions need no special-casing because h is defined pointwise against the renormalized
-  max. (If linear over/under-hedges mid-weights in practice, `h = (1−w)^γ` is the one-knob
-  generalization — a learning-dynamics tuning question.)
-- **Cost is the complement of confidence.** Expected duplicate bytes per decision =
-  Σ pᵢ(1−wᵢ)sᵢ; at asymptotic weights that is ≈ W_MIN · s_slow per ~30 decisions — noise. It
-  also degrades gracefully: the more the pool trusts a peer, the less it spends insuring it.
-- **What it fixes beyond the ping tail**: the S4 tail cause (b) — a slow-but-useful peer's
-  final chunk is hedged with probability 1−w, so unequal-peer aggregation stops being gated by
-  its straggler. What it deliberately does NOT fix: a *high*-weight frozen peer (h ≈ 0) still
-  parks a fresh transfer until its deadline strikes — that is the accepted
-  weights-were-wrong tradeoff, bounded by the deadline machinery.
-- **Bookkeeping it requires**: in-flight tracking keyed by (offset, attempt) instead of offset
-  (two copies of one range fly concurrently); the loser's Err must not requeue a range the
-  winner already delivered; loser bytes counted under a `hedged_waste` observable.
+where p is i's within-holder-set routing share and p_floor the share it WOULD have at the
+weight floor W_MIN given the others' current weights — so h spans exactly [0, 1]: zero at or
+above the uniform share (single holders and all-equally-weak sets are never hedged: there is
+no better alternative), and exactly one at the floor (a pure ping is always insured). First
+arrival feeds the emitter.
+
+Two properties were load-bearing enough to get dedicated machinery:
+
+- **The loser completes and is recorded.** Both members of a hedged pair run DETACHED from the
+  transfer (in the common case the loser is the slow primary the partner just beat, and the
+  transfer usually finishes before it does). A cancelled ping would produce no measurement, so
+  a floored weight would rise on evidence-free drift until it won real traffic — oscillation.
+  Letting losers finish preserves the per-observation dynamics, so hedging leaves the
+  asymptotically stable weights unchanged. (First implementation aborted winners' twins with
+  the transfer; the sweep caught it as `tails == slow picks` — insured pings were invisible in
+  the tallies.)
+- **The hedge is decided BEFORE the capacity check.** An insured chunk whose primary has no
+  free slot proceeds on the partner alone (a busy floor peer means a ping is already in flight
+  there); an UNinsured busy draw parks, which is the deliberate policy for peers the weights
+  trust. Without this, detached losers occupying the slow peer's slots made later draws park
+  behind the least-trusted peer.
+
+Ranges are tracked as flights keyed by offset with per-attempt ids: a range requeues only when
+its LAST attempt dies undelivered, and a losing twin's bytes are dropped (counted under
+`hedged_waste_bytes` in the status endpoint) rather than re-buffered.
+
+## Tuning (η, ν, and the drift that turned out to matter more)
+
+`mw_tune_sweep` (fluid links, learned weights; per cell: sequential 64:1 steady state + a
+capability swap + warm striped 64:1 and 2:1): grid η ∈ {0.4, 0.7, 1.2} × ν ∈ {1, 3, 6}, plus
+supplementary fixed-share rows.
+
+- **ν = 1** (the linear ramp) beat ν = 3 and ν = 6 on uninsured tails in every η row (1 vs 4
+  vs 8 per 100 at η = 0.7) at no measurable cost — hedge chunks are sized for the slow peer,
+  so broad insurance is nearly free, and larger ν only re-exposes the drifted mid-weight picks
+  the insurance exists for.
+- **η = 0.7** stands: 1.2 collapses and tracks faster (stale picks 12 vs 18) but dents the
+  warm striped median (79–83%); 0.4 loses to drift everywhere.
+- **The binding constraint was the fixed-share drift, not η or ν.** At SHARE = 0.02 with two
+  peers, a floored weight climbs w ← 0.99w + 0.01 to ~0.28 within ~30 observations — so slow
+  picks concentrated exactly where insurance is weakest (draw probability and hedge
+  probability are complementary by construction). SHARE = 0.005 cuts steady slow picks ~2×
+  and uninsured tails to ~1/100 with swap tracking UNHARMED (flip ≤ 25 — recovery rides
+  η-collapse of the stale best plus renormalization, not drift). Adopted: **η = 0.7, ν = 1,
+  SHARE = 0.005**.
+
+Post-tuning instrument readings: S1 steady slow share **3/100 — the exploration floor
+itself** (was ~10), per-decision regret 0.046 (was 0.10); S2 flip ≤ 25 with post-swap blocks
+saturating at 25/25; S3 warm 64:1 median 87% of single-best with walls [0.58–0.65 s] — the
+4 s uninsured-ping outlier is gone; 4:1 91–92% with uniformly tight walls.
 
 ## Verdict
 
-- Decision-level: near-floor regret, linear at ~0.10/decision under 64:1 — acceptable and
-  intentional (the slope is the exploration+tracking budget; tune η/W_MIN/SHARE next).
-- Tracking: majority flip ≤ 25 decisions — the design goal, confirmed.
-- Completion-time at asymptotic weights: **85–92% of the fastest peer** (bench floors: 0.8×
-  at 64:1, 0.7× at 4:1), vs 6% before the policy change.
-- Aggregation: equal peers ≈ 1.9× solo under both policies; unequal peers sit at single-best
-  under both — an open (pre-existing) limitation whose fix path is rate-shaped shares +
-  hedged exploration, not admission policy.
+- Decision-level: steady slow share at the W_MIN floor (3/100), per-decision regret 0.046 —
+  within 1.4× the Hedge √-reference at T=300 despite bandit feedback and tracking machinery.
+- Tracking: majority flip ≤ 25 decisions, saturating immediately after.
+- Completion-time at asymptotic weights: 87–92% of the fastest peer with NO fat tail — every
+  floor ping is insured; the residual gap is chunk-granularity overhead on 2–3-chunk
+  transfers.
+- Aggregation: equal peers ≈ 1.9× solo; unequal peers sit at single-best (pre-existing under
+  both policies; the fix path is rate-shaped shares, a learning-dynamics question).

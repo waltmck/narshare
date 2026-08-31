@@ -54,6 +54,40 @@ const MANIFEST_MIN: u64 = 4 << 20;
 /// completion resets it, so flaky-but-usable links are untouched. Requeues are paced at 100 ms,
 /// so this is also a floor of ~3 s on the abort.
 const MAX_FAILURE_STREAK: u32 = 30;
+/// Hedged exploration (docs/regret.md): when the weighted draw hands a chunk to a peer whose
+/// within-set routing share p sits below the uniform share 1/N, a DUPLICATE of the chunk is
+/// opportunistically dispatched to a second weighted draw with probability
+///
+///     h = clamp((1/N − p) / (1/N − p_floor), 0, 1)^ν
+///
+/// where p_floor is the share this peer WOULD have at the weight floor W_MIN given the others'
+/// current weights — so h spans exactly [0, 1]: zero at or above the uniform share (including
+/// the single-holder and all-equally-weak sets, where no better alternative exists), and
+/// EXACTLY one at the floor (a pure ping is always insured). First arrival feeds the emitter;
+/// the loser completes anyway and is recorded normally (a cancelled ping would produce no
+/// measurement, and evidence-free fixed-share drift would then oscillate the weight) — so the
+/// asymptotically stable weights are unchanged by hedging. ν shapes how tightly the insurance
+/// concentrates on collapsed weights.
+///
+/// ν tuned empirically (mw_tune_sweep): ν=1 (the linear ramp) beat ν=3 and ν=6 on uninsured
+/// tails in every η row (1 vs 4 vs 8 per 100 at η=0.7) at no measurable duplicate cost —
+/// hedge chunks are sized for the SLOW peer, so broad insurance is nearly free; larger ν only
+/// re-exposes the drifted mid-weight picks the insurance exists for.
+const HEDGE_NU: f64 = 1.0;
+
+fn hedge_prob(n: usize, share: f64, floor_share: f64, nu: f64) -> f64 {
+    let uniform = 1.0 / n as f64;
+    let num = uniform - share;
+    if num <= 0.0 {
+        return 0.0;
+    }
+    let denom = uniform - floor_share;
+    if denom <= 0.0 {
+        return 1.0; // below uniform yet floor-equivalent: fully insured
+    }
+    (num / denom).clamp(0.0, 1.0).powf(nu)
+}
+
 /// Fetch ranges are merged across non-fetch gaps (framing lits, tiny replay holes) up to this
 /// size. An HTTP chunk request costs ~milliseconds regardless of size, so a tree of many small
 /// files would otherwise fragment the range space at every file boundary into sub-chunk
@@ -90,6 +124,11 @@ pub struct Stats {
     pub clients_gone: AtomicU64,
     /// Transfers that ran from a manifest plan (vs plain striping).
     pub manifest_plans: AtomicU64,
+
+    /// Hedged (duplicate) attempts launched — the insurance spend, in requests…
+    pub hedges: AtomicU64,
+    /// …and the bytes a losing twin delivered after its range was already served (discarded).
+    pub hedged_waste_bytes: AtomicU64,
 }
 
 impl Stats {
@@ -247,6 +286,8 @@ pub struct FetchCtx {
     /// immediately instead of polling — the many-small-fetches case would otherwise queue in
     /// 200 ms quanta behind one big transfer that structurally reacquires its own slots.
     slot_freed: tokio::sync::Notify,
+    /// Hedging exponent ν (f64 bits; adjustable for the tuning benches).
+    nu_bits: AtomicU64,
     roaming_until: Mutex<Option<Instant>>,
     cfg_chunk_max: u64,
     cfg_window: u64,
@@ -269,6 +310,7 @@ impl FetchCtx {
             encodings: peer_cfgs.iter().map(|p| p.encoding.clone()).collect(),
             stats: Stats::default(),
             slot_freed: tokio::sync::Notify::new(),
+            nu_bits: AtomicU64::new(HEDGE_NU.to_bits()),
             roaming_until: Mutex::new(None),
             cfg_chunk_max: cfg.chunk_max.0.max(CHUNK_MIN),
             cfg_window: cfg.window_bytes.0.max(CHUNK_MIN * 4),
@@ -286,6 +328,15 @@ impl FetchCtx {
     #[cfg(test)]
     pub fn set_rate(&self, peer: usize, r: f64) {
         self.net[peer].lock().unwrap().rate = r;
+    }
+
+    fn nu(&self) -> f64 {
+        f64::from_bits(self.nu_bits.load(Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    pub fn set_nu(&self, nu: f64) {
+        self.nu_bits.store(nu.to_bits(), Ordering::Relaxed);
     }
 
     fn record_rate(&self, peer: usize, bytes: u64, elapsed: Duration) {
@@ -534,8 +585,19 @@ struct Done {
     off: u64,
     len: u64,
     peer: usize,
-    elapsed: Duration,
+    /// Which attempt on this range (hedged duplicates share off/len, not attempt ids).
+    attempt: u64,
     result: anyhow::Result<crate::peers::Chunk>,
+}
+
+/// One in-flight RANGE: possibly several concurrent attempts (a primary and its hedge twin).
+/// Requeueing happens only when the last attempt dies with nothing delivered, so ranges are
+/// delivered into the buffer at most once and buffered entries stay disjoint.
+struct Flight {
+    /// (attempt id, that attempt's deadline) per live attempt.
+    attempts: Vec<(u64, Instant)>,
+    /// A copy of this range already reached the buffer; late twins are recorded, not buffered.
+    delivered: bool,
 }
 
 /// RAII stream slot: released on drop, so a worker aborted mid-fetch (transfer abort, client
@@ -848,13 +910,14 @@ pub async fn run_transfer(
     let mut last_progress = Instant::now();
     let mut failure_streak = 0u32;
     let mut retry_gate: Option<Instant> = None;
-    // Per-peer deadline of every request currently in flight, keyed by chunk offset (in-flight
-    // chunks cover disjoint ranges, so offsets are unique). The stall watchdog is SUBORDINATE
-    // to these: patience may only fire once no request is still within its own deadline, so
-    // the two clocks compose instead of racing (the old failure mode: a legally in-flight
-    // chunk starved the window past stall_timeout and the watchdog killed a transfer the
-    // other holders could have finished).
-    let mut inflight: HashMap<u64, Instant> = HashMap::new();
+    // Every in-flight RANGE keyed by offset (ranges are disjoint; a range may carry several
+    // attempts when hedged). The stall watchdog is SUBORDINATE to the attempts' deadlines:
+    // patience may only fire once no request is still within its own deadline, so the two
+    // clocks compose instead of racing (the old failure mode: a legally in-flight chunk
+    // starved the window past stall_timeout and the watchdog killed a transfer the other
+    // holders could have finished).
+    let mut inflight: HashMap<u64, Flight> = HashMap::new();
+    let mut next_attempt: u64 = 0;
     // Bytes actually pulled from the network for THIS transfer (excludes local lits and replays),
     // so the min_bandwidth floor measures real link goodput, not synthesized/replayed bytes.
     let mut remote_fetched: u64 = 0;
@@ -922,19 +985,65 @@ pub async fn run_transfer(
             }
             let avail: Vec<usize> =
                 peer_ids.iter().copied().filter(|&p| st.peers.list[p].available()).collect();
-            let Some((peer, slot)) = try_pick(&st, &avail) else {
-                // Live peers exist but every stream slot is taken (likely by other transfers):
-                // wait for a release, not a timer.
+            // One weighted draw — the weights ARE the routing distribution (no capacity
+            // conditioning; docs/regret.md). The hedge decision happens BEFORE the capacity
+            // check: an insured chunk whose primary is busy proceeds on the partner alone
+            // (a busy floor peer means a ping is already in flight there — its measurement is
+            // coming; queuing more behind it would park the transfer on the least-trusted
+            // peer), while an UNinsured busy draw parks — the deliberate policy for peers the
+            // weights trust.
+            let Some(drawn) = ctx.pool.pick_among(&avail) else { break }; // no live holders
+            let (share, floor_share) = ctx.pool.hedge_shares(&avail, drawn);
+            let h = hedge_prob(avail.len(), share, floor_share, ctx.nu());
+            let hedge_fired = avail.len() >= 2 && h > 0.0 && ctx.pool.chance(h);
+            #[cfg_attr(not(test), allow(unused_mut))] // mutated only by the bench A/B lever
+            let mut primary_slot = if ctx.limits[drawn].try_acquire() {
+                Some(Slot { st: st.clone(), peer: drawn })
+            } else {
+                None
+            };
+            let partner_slot = if hedge_fired {
+                let others: Vec<usize> =
+                    avail.iter().copied().filter(|&q| q != drawn).collect();
+                match ctx.pool.pick_among(&others) {
+                    // Opportunistic: a busy partner skips the hedge (the insurance must
+                    // never delay anything).
+                    Some(q) if ctx.limits[q].try_acquire() => {
+                        Some(Slot { st: st.clone(), peer: q })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            #[cfg(test)]
+            if primary_slot.is_none()
+                && BENCH_WORK_CONSERVING.load(Ordering::Relaxed)
+            {
+                primary_slot = avail
+                    .iter()
+                    .copied()
+                    .find(|&q| ctx.limits[q].try_acquire())
+                    .map(|q| Slot { st: st.clone(), peer: q });
+            }
+            if primary_slot.is_none() && partner_slot.is_none() {
+                // Every launchable path is capacity-blocked: wait for a release, not a timer.
                 starved = !avail.is_empty();
                 break;
-            };
+            }
+            // The chunk is sized for whichever peer leads the fetch.
+            let lead = primary_slot
+                .as_ref()
+                .or(partner_slot.as_ref())
+                .map(|s| s.peer)
+                .expect("one slot exists");
             let len = match queued_len {
                 Some(l) => {
                     requeue.pop();
                     // Re-carve an oversized requeue to the CURRENT chunk size: the original
                     // carve may predate the link (a seed that outran a thin link, a rate that
                     // collapsed), and re-flying it whole would just die on its deadline again.
-                    let cs = ctx.chunk_size(peer);
+                    let cs = ctx.chunk_size(lead);
                     if l > cs.saturating_mul(2) {
                         requeue.push(Reverse((off + cs, l - cs)));
                         cs
@@ -944,41 +1053,106 @@ pub async fn run_transfer(
                 }
                 None => {
                     let room = ranges[range_i].1 - range_pos;
-                    let l = ctx.chunk_size(peer).min(room);
+                    let l = ctx.chunk_size(lead).min(room);
                     range_pos += l;
                     l
                 }
             };
-            let url = url_of[&peer].clone();
-            let dtx = done_tx.clone();
-            let stc = st.clone();
-            let level = ctx.zstd_level(peer);
-            let deadline = ctx.chunk_deadline(peer, len);
-            inflight.insert(off, Instant::now() + deadline);
-            let prog = progress.clone();
-            workers.spawn(async move {
-                let started = Instant::now();
-                let result = match tokio::time::timeout(
-                    deadline,
-                    stc.peers.fetch_range(peer, &url, off, off + len, level, &prog),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => {
-                        // A deadline death is transport-indistinguishable from a black hole
-                        // (accepts TCP, never answers): without a strike, such a peer would
-                        // stay "available" forever — the breaker's only other probe is the
-                        // 60 s sync loop. Honest-slow peers eat at most a couple of strikes
-                        // before their seeded rate makes carves completable, and any delivered
-                        // chunk resets the count.
-                        stc.peers.strike(peer);
-                        Err(anyhow::anyhow!("chunk deadline ({deadline:?}) exceeded"))
+            // Spawn one attempt of [off, off+len) on `peer`; returns its deadline instant.
+            // Peer-level accounting (MW loss/success, rate EWMA, encoding controller, tallies,
+            // governor) happens IN the worker, not the transfer loop: a hedge loser must
+            // produce its measurement even if its transfer already finished — that measurement
+            // is the whole point of the ping — so hedge twins are spawned DETACHED and only
+            // primaries ride the JoinSet (and die with the transfer).
+            let spawn_attempt = |workers: &mut tokio::task::JoinSet<()>,
+                                 peer: usize,
+                                 slot: Slot,
+                                 attempt: u64,
+                                 detached: bool|
+             -> Instant {
+                let url = url_of[&peer].clone();
+                let dtx = done_tx.clone();
+                let stc = st.clone();
+                let level = ctx.zstd_level(peer);
+                let deadline = ctx.chunk_deadline(peer, len);
+                let deadline_at = Instant::now() + deadline;
+                let prog = progress.clone();
+                let fut = async move {
+                    let started = Instant::now();
+                    let result = match tokio::time::timeout(
+                        deadline,
+                        stc.peers.fetch_range(peer, &url, off, off + len, level, &prog),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => {
+                            // A deadline death is transport-indistinguishable from a black
+                            // hole (accepts TCP, never answers): without a strike, such a
+                            // peer would stay "available" forever — the breaker's only other
+                            // probe is the 60 s sync loop. Honest-slow peers eat at most a
+                            // couple of strikes before their seeded rate makes carves
+                            // completable, and any delivered chunk resets the count.
+                            stc.peers.strike(peer);
+                            Err(anyhow::anyhow!("chunk deadline ({deadline:?}) exceeded"))
+                        }
+                    };
+                    let elapsed = started.elapsed();
+                    let ctx = &stc.fetch;
+                    match &result {
+                        Ok(chunk) => {
+                            // Sub-CHUNK_MIN chunks are latency-dominated: their timing says
+                            // nothing about throughput, so they don't move the adaptive state.
+                            if len >= CHUNK_MIN {
+                                ctx.pool.record_success(peer, len, elapsed);
+                                ctx.record_rate(peer, len, elapsed);
+                                ctx.observe_encoding(peer, elapsed, chunk);
+                            }
+                            ctx.tally[peer].chunks_ok.fetch_add(1, Ordering::Relaxed);
+                            ctx.tally[peer].bytes.fetch_add(len, Ordering::Relaxed);
+                            ctx.limits[peer].observe(true, len);
+                            ctx.stats.remote_bytes.fetch_add(len, Ordering::Relaxed);
+                            ctx.stats.wire_bytes.fetch_add(chunk.wire, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            ctx.tally[peer].chunks_err.fetch_add(1, Ordering::Relaxed);
+                            ctx.pool.record_failure(peer);
+                            ctx.limits[peer].observe(false, 0);
+                        }
                     }
+                    drop(slot); // free the slot (and notify) before reporting
+                    let _ = dtx.send(Done { off, len, peer, attempt, result }).await;
                 };
-                drop(slot); // free the stream slot before reporting, so relaunch sees capacity
-                let _ = dtx.send(Done { off, len, peer, elapsed: started.elapsed(), result }).await;
-            });
+                if detached {
+                    tokio::spawn(fut);
+                } else {
+                    workers.spawn(fut);
+                }
+                deadline_at
+            };
+
+            let fl = inflight
+                .entry(off)
+                .or_insert(Flight { attempts: Vec::new(), delivered: false });
+            // BOTH members of a hedged pair are detached: whichever loses must outlive the
+            // transfer (which the winner may complete) to deliver its measurement — in the
+            // common case the LOSER IS THE PRIMARY (the slow ping the partner just beat), and
+            // aborting it with the JoinSet would silently discard exactly the observation the
+            // ping exists to produce.
+            let hedged = partner_slot.is_some();
+            if let Some(slot) = primary_slot {
+                next_attempt += 1;
+                let peer = slot.peer;
+                let d_at = spawn_attempt(&mut workers, peer, slot, next_attempt, hedged);
+                fl.attempts.push((next_attempt, d_at));
+            }
+            if let Some(slot) = partner_slot {
+                ctx.stats.hedges.fetch_add(1, Ordering::Relaxed);
+                next_attempt += 1;
+                let peer = slot.peer;
+                let d_at = spawn_attempt(&mut workers, peer, slot, next_attempt, true);
+                fl.attempts.push((next_attempt, d_at));
+            }
         }
 
         let mut wake = last_progress + ctx.cfg_stall;
@@ -986,7 +1160,9 @@ pub async fn run_transfer(
         // — a hung request belongs to its own detector (deadline → requeue → strike), and the
         // watchdog's question ("has the WHOLE transfer gone silent past patience?") is only
         // well-posed once nothing is legally in flight.
-        if let Some(&d) = inflight.values().max() {
+        if let Some(d) =
+            inflight.values().flat_map(|f| f.attempts.iter().map(|&(_, d)| d)).max()
+        {
             wake = wake.max(d);
         }
         if let Some(g) = retry_gate {
@@ -1013,32 +1189,43 @@ pub async fn run_transfer(
                     ctx.stats.aborts_other.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
-                inflight.remove(&done.off);
+                // Flight bookkeeping: retire this attempt; learn whether a twin already
+                // delivered the range and whether any twin is still flying.
+                let (was_delivered, twins_live) = match inflight.get_mut(&done.off) {
+                    Some(fl) => {
+                        fl.attempts.retain(|&(id, _)| id != done.attempt);
+                        (fl.delivered, !fl.attempts.is_empty())
+                    }
+                    None => (true, false), // stale (should not happen); treat as covered
+                };
                 match done.result {
                     Ok(chunk) => {
-                        // Sub-CHUNK_MIN chunks (whole small NARs, range tails) are latency-
-                        // dominated: their "goodput" is mostly RTT plus the peer's encode-pool
-                        // wait, and folding them into the rate EWMA / MW losses / the encoding
-                        // controller lets a burst of small fetches demolish state that big
-                        // transfers spent time learning. Real carved chunks are always
-                        // ≥ CHUNK_MIN, so this only mutes the noise.
-                        if done.len >= CHUNK_MIN {
-                            ctx.pool.record_success(done.peer, done.len, done.elapsed);
-                            ctx.record_rate(done.peer, done.len, done.elapsed);
-                            ctx.observe_encoding(done.peer, done.elapsed, &chunk);
-                        }
-                        ctx.tally[done.peer].chunks_ok.fetch_add(1, Ordering::Relaxed);
-                        ctx.tally[done.peer].bytes.fetch_add(done.len, Ordering::Relaxed);
-                        ctx.limits[done.peer].observe(true, done.len);
-                        // An epoch close may have RAISED the limit — capacity without a release.
-                        ctx.slot_freed.notify_waiters();
+                        // Peer-level accounting already happened in the worker; here only the
+                        // TRANSFER-level state advances.
                         remote_fetched += done.len;
-                        ctx.stats.remote_bytes.fetch_add(done.len, Ordering::Relaxed);
-                        ctx.stats.wire_bytes.fetch_add(chunk.wire, Ordering::Relaxed);
-                        em.buffered.insert(done.off, chunk.bytes);
                         last_progress = Instant::now();
                         last_seen_bytes = progress.load(Ordering::Relaxed);
                         failure_streak = 0;
+                        if was_delivered {
+                            // A losing twin: fully recorded above (its completion IS the
+                            // exploration measurement), bytes discarded — the winner already
+                            // fed the buffer, and duplicate inserts would break the disjoint-
+                            // entries invariant the emitter relies on.
+                            ctx.stats
+                                .hedged_waste_bytes
+                                .fetch_add(done.len, Ordering::Relaxed);
+                            if !twins_live {
+                                inflight.remove(&done.off);
+                            }
+                            continue;
+                        }
+                        if let Some(fl) = inflight.get_mut(&done.off) {
+                            fl.delivered = true;
+                            if !twins_live {
+                                inflight.remove(&done.off);
+                            }
+                        }
+                        em.buffered.insert(done.off, chunk.bytes);
 
                         match em.pump(&out, &ctx.stats).await {
                             Err(end) => {
@@ -1093,9 +1280,6 @@ pub async fn run_transfer(
                     }
                     Err(e) => {
                         debug!("chunk @{} from peer {} failed: {e:#}", done.off, done.peer);
-                        ctx.tally[done.peer].chunks_err.fetch_add(1, Ordering::Relaxed);
-                        ctx.pool.record_failure(done.peer);
-                        ctx.limits[done.peer].observe(false, 0);
                         // A chunk that died on its deadline BEFORE any completion means the
                         // seed size outran the link: seed the rate estimate from raw wire
                         // progress so the next carve is completable, instead of retrying an
@@ -1106,9 +1290,17 @@ pub async fn run_transfer(
                                 ctx.record_rate(done.peer, seen, t0.elapsed());
                             }
                         }
-                        ctx.stats.requeues.fetch_add(1, Ordering::Relaxed);
-                        requeue.push(Reverse((done.off, done.len)));
-                        retry_gate = Some(Instant::now() + Duration::from_millis(100));
+                        // Requeue only when the LAST attempt died with nothing delivered: a
+                        // still-flying twin may yet deliver, and a delivered range must never
+                        // be fetched again.
+                        if !was_delivered && !twins_live {
+                            inflight.remove(&done.off);
+                            ctx.stats.requeues.fetch_add(1, Ordering::Relaxed);
+                            requeue.push(Reverse((done.off, done.len)));
+                            retry_gate = Some(Instant::now() + Duration::from_millis(100));
+                        } else if !twins_live {
+                            inflight.remove(&done.off);
+                        }
                         failure_streak += 1;
                         if failure_streak >= MAX_FAILURE_STREAK {
                             warn!(
@@ -1135,7 +1327,10 @@ pub async fn run_transfer(
                     last_seen_bytes = seen;
                     last_progress = now;
                 } else if last_progress.elapsed() >= ctx.cfg_stall
-                    && !inflight.values().any(|&d| d > now)
+                    && !inflight
+                        .values()
+                        .flat_map(|f| f.attempts.iter())
+                        .any(|&(_, d)| d > now)
                 {
                     // Silent past patience AND nothing legally in flight (an early wake from
                     // the retry gate or repoll can land here first — the in-flight guard,
@@ -1157,43 +1352,20 @@ pub async fn run_transfer(
     }
 }
 
-/// One weighted draw over the available holders — the weights ARE the routing distribution
-/// ("this peer's share of the work"), deliberately NOT conditioned on capacity. If the drawn
-/// peer has no free stream slot, nothing launches this attempt: the loop parks and a wake
-/// (slot release, completion, breaker repoll) retries with a fresh draw. Waiting for a busy
-/// healthy peer costs one wake interval (milliseconds mid-transfer); handing its chunk to
-/// whoever happens to be idle instead — the old work-conserving overflow — is how a
-/// floor-weight straggler ended up owning every transfer's completion tail (a constant
-/// ~slots×2 s tax per transfer, measured 16× at 64:1 skew; docs/regret.md). At asymptotic
-/// weights a very slow peer now receives only its floor share of DECISIONS (~W_MIN), which
-/// is exactly the periodic re-discovery ping, and since chunks are time-normalized its byte
-/// share is W_MIN·R_slow/R_fast — noise. The trade accepted with eyes open: a hung-but-
-/// breaker-closed peer can idle the transfer for up to one chunk deadline before its strikes
-/// open the breaker and the draws exclude it — bounded by the deadline machinery, and far
-/// rarer than the skewed-capacity steady state.
-///
-/// The returned Slot releases the stream budget on drop, however the worker ends.
-fn try_pick(st: &Arc<crate::proxy::ProxyState>, avail: &[usize]) -> Option<(usize, Slot)> {
-    let ctx = &st.fetch;
-    let p = ctx.pool.pick_among(avail)?;
-    if ctx.limits[p].try_acquire() {
-        return Some((p, Slot { st: st.clone(), peer: p }));
-    }
-    #[cfg(test)]
-    if BENCH_WORK_CONSERVING.load(Ordering::Relaxed) {
-        // Bench-only resurrection of the pre-weight-routing policy (overflow to any free
-        // peer when the draw lands on a busy one), so aggregation A/B comparisons are
-        // measured against the real old behavior. Never enabled outside benches; run those
-        // benches with a name filter — the flag is process-global.
-        return avail
-            .iter()
-            .copied()
-            .find(|&q| ctx.limits[q].try_acquire())
-            .map(|q| (q, Slot { st: st.clone(), peer: q }));
-    }
-    None
-}
+// Peer selection lives inline in run_transfer's launch loop: one weighted draw over the
+// available holders — the weights ARE the routing distribution, deliberately NOT conditioned
+// on capacity. An UNinsured draw landing on a busy peer launches nothing (park; a wake
+// retries): waiting for a busy healthy peer costs one wake interval, while handing its chunk
+// to whoever happens to be idle — the old work-conserving overflow — is how a floor-weight
+// straggler ended up owning every transfer's completion tail (a constant ~slots×2 s tax per
+// transfer, measured 16× at 64:1 skew; docs/regret.md). An INSURED draw whose primary is busy
+// proceeds on the hedge partner alone. The accepted trade: a hung-but-breaker-closed peer the
+// weights still trust can idle a transfer for up to one chunk deadline before its strikes
+// open the breaker — bounded by the deadline machinery.
 
+/// Bench-only resurrection of the pre-weight-routing overflow policy (any free peer takes a
+/// busy draw's chunk), so aggregation A/B comparisons measure the real old behavior. Never
+/// enabled outside benches; run those benches with a name filter — the flag is process-global.
 #[cfg(test)]
 pub static BENCH_WORK_CONSERVING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1239,6 +1411,24 @@ mod tests {
             encoding: encoding.into(),
         }];
         FetchCtx::new(&peers, &pcfg)
+    }
+
+    #[test]
+    fn hedge_probability_shape() {
+        let fs2 = 0.03 / 1.03; // floor share against one full-weight partner
+        // At or above the uniform share, never hedge — including the single-holder case and
+        // a set of equally-weak peers (nothing better to hedge onto).
+        assert_eq!(hedge_prob(1, 1.0, 0.03, 3.0), 0.0);
+        assert_eq!(hedge_prob(2, 0.5, fs2, 3.0), 0.0);
+        assert_eq!(hedge_prob(4, 0.30, 0.01, 3.0), 0.0);
+        assert_eq!(hedge_prob(2, 0.5, 0.5, 3.0), 0.0, "all-floor set: numerator dies first");
+        // AT the weight floor: fully insured, exactly.
+        assert_eq!(hedge_prob(2, fs2, fs2, 3.0), 1.0);
+        // A mid-recovery peer is barely insured (ν concentrates the budget at the bottom).
+        let mid = hedge_prob(2, 1.0 / 3.0, fs2, 3.0);
+        assert!(mid < 0.06, "{mid}");
+        // Larger ν ⇒ less mid-weight hedging; h is monotone decreasing in ν on (0,1).
+        assert!(hedge_prob(2, 0.2, fs2, 6.0) < hedge_prob(2, 0.2, fs2, 1.0));
     }
 
     #[test]

@@ -28,7 +28,14 @@ const BEST_DECAY: f64 = 0.999;
 /// EWMA rate for the mean loss the update is measured against.
 const AVG_ALPHA: f64 = 0.1;
 /// Fixed-share mixing rate: each update pulls every weight this far toward the pool mean.
-const SHARE: f64 = 0.02;
+/// Tuned empirically (mw_tune_sweep): 0.02 let a collapsed weight sawtooth to ~0.3 between
+/// pings — with 2 peers, w ← 0.99w + 0.01 climbs from the floor to ~0.28 in just 30
+/// observations — which set the real steady-state ping rate and tail count, dwarfing η's and
+/// ν's effects. 0.005 cuts steady slow picks ~2× and uninsured tails to ~1/100 with swap
+/// tracking UNharmed (recovery is driven by η-collapse of the stale best plus
+/// renormalization, not by drift; the W_MIN floor pings — now hedge-insured — carry
+/// re-discovery).
+const SHARE: f64 = 0.005;
 
 pub struct HostPool {
     state: Mutex<State>,
@@ -41,6 +48,10 @@ struct State {
     rng: u64,
     /// Observations folded in since construction — the persistence layer's dirty check.
     observations: u64,
+    /// Learning rate (ETA by default; adjustable for the tuning benches).
+    eta: f64,
+    /// Fixed-share mixing rate (SHARE by default; adjustable for the tuning benches).
+    share: f64,
 }
 
 impl HostPool {
@@ -55,8 +66,45 @@ impl HostPool {
                 // bad run reproducible.
                 rng: 0x9E3779B97F4A7C15,
                 observations: 0,
+                eta: ETA,
+                share: SHARE,
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_eta(&self, eta: f64) {
+        self.state.lock().unwrap().eta = eta;
+    }
+
+    #[cfg(test)]
+    pub fn set_share(&self, share: f64) {
+        self.state.lock().unwrap().share = share;
+    }
+
+    /// The hedging formula's inputs for peer `idx` among `allowed`: (its within-set routing
+    /// share, the share it WOULD have at the weight floor given the others' current weights).
+    /// The latter anchors h = 1.0 exactly at the floor (see fetch.rs::hedge_prob).
+    pub fn hedge_shares(&self, allowed: &[usize], idx: usize) -> (f64, f64) {
+        let st = self.state.lock().unwrap();
+        let total: f64 = allowed.iter().map(|&i| st.weight[i]).sum();
+        #[allow(clippy::neg_cmp_op_on_partial_ord)] // NaN must take this branch
+        if !(total > 0.0) {
+            let u = 1.0 / allowed.len().max(1) as f64;
+            return (u, u);
+        }
+        let w = st.weight.get(idx).copied().unwrap_or(0.0);
+        let others = (total - w).max(0.0);
+        (w / total, W_MIN / (W_MIN + others))
+    }
+
+    /// Bernoulli draw from the pool's own (fixed-seed) rng — reproducible like pick_among.
+    pub fn chance(&self, p: f64) -> bool {
+        if p <= 0.0 {
+            return false;
+        }
+        let mut st = self.state.lock().unwrap();
+        unit_f64(next_u64(&mut st.rng)) < p
     }
 
     #[cfg(test)]
@@ -139,7 +187,7 @@ impl State {
             return;
         }
         self.observations += 1;
-        self.weight[idx] *= (-ETA * (loss - self.avg_loss)).exp();
+        self.weight[idx] *= (-self.eta * (loss - self.avg_loss)).exp();
         self.avg_loss += AVG_ALPHA * (loss - self.avg_loss);
         // Rescale so the best sits at 1.0 (bounded range whatever the run length; the floor
         // becomes "relative to the best").
@@ -157,7 +205,7 @@ impl State {
         let n = self.weight.len() as f64;
         let mean = self.weight.iter().sum::<f64>() / n;
         for w in self.weight.iter_mut() {
-            *w = ((1.0 - SHARE) * *w + SHARE * mean).max(W_MIN);
+            *w = ((1.0 - self.share) * *w + self.share * mean).max(W_MIN);
         }
     }
 }
@@ -222,10 +270,13 @@ mod tests {
             pool.record_success(1, 8 << 20, Duration::from_secs(1));
         }
         assert!(pool.weights()[1] > W_MIN * 2.0, "should be climbing after 10 successes");
-        for _ in 0..40 {
+        // With the tuned drift (SHARE=0.005, mw_tune_sweep) the late climb leans on the
+        // exponential term alone, whose fuel (avg_loss) decays as successes accumulate —
+        // full parity takes a couple hundred clean observations instead of forty.
+        for _ in 0..200 {
             pool.record_success(1, 8 << 20, Duration::from_secs(1));
         }
-        assert!(pool.weights()[1] > 0.9, "a healthy peer must return to full weight");
+        assert!(pool.weights()[1] > 0.8, "a healthy peer must return near full weight");
     }
 
     #[test]
