@@ -176,6 +176,20 @@ origin's history is totally ordered, "peer P saw deletion N" collapses to "P's w
   the index catalogs what is *currently fetchable*, not history. Staleness is bounded by hint
   latency and carries the same semantics as the long-standing GC race: a transfer from a
   just-departed holder fails cleanly and nix falls back.
+* **Storage is sharded by origin** — the same single-writer fact makes origins' write streams
+  disjoint, so each origin lives in its own SQLite file (`origins/<name>.db`: its clock, its
+  journal, its paths) with its own write lock and WAL. Applies for different origins run fully
+  in parallel (a resync storm costs ~max, not sum — measured 1.78× for 4-way on one NVMe,
+  fsync-bound), a per-origin wipe is a truncation, and cross-origin coupling at write time is
+  gone: no shared rows, no sig merging on write, no holder edges, no orphan GC. Lookups fan
+  out over the (config-sized) shard set on per-shard read-only connections and merge rows by
+  (store_path, nar_hash) at read time — holders collect, signature sets union. The differ
+  compares plain sig EQUALITY against the self shard (it contains exactly what we exported;
+  the old shared-row layout forced a subset test to dodge merge pollution). A small `meta.db`
+  carries the node-global oddments: self generation, trust anchor, watermarks, MW weights.
+  Layout migrations are wipe-and-resync (the cache is disposable by design): a schema-version
+  mismatch — or the pre-shard `index.db` — deletes the cache and lets the mesh snapshot it
+  back.
 
 ### Representation vs. addressing (the compression design)
 

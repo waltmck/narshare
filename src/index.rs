@@ -9,9 +9,21 @@
 //! back to a full per-origin snapshot, the same path that serves first contact, cache loss, and
 //! peer addition.
 //!
-//! Persistence lives at `<cache.dir>/index.db` — the daemon's only on-disk state, and state it
-//! can always afford to lose: rows are re-learnable from the mesh, signatures re-verify, and a
+//! STORAGE IS SHARDED BY ORIGIN, because that same single-writer fact makes origins' write
+//! streams disjoint: each origin lives in its own SQLite file (`origins/<name>.db`) holding its
+//! clock, its journal, and its paths — so applies for DIFFERENT origins run fully in parallel
+//! (separate files, separate WALs, separate locks), a per-origin wipe is a table truncation,
+//! and there is no cross-origin coupling at write time at all. What the old shared-table layout
+//! bought with sig-merging, holder edges, and orphan GC, the shards get for free: lookups fan
+//! out over the (≤ config-sized) shard set and merge rows by (store_path, nar_hash) at READ
+//! time, unioning signatures and collecting holders. A small `meta.db` carries the node-global
+//! oddments: self generation, trust-anchor digest, sync watermarks, persisted MW weights.
+//!
+//! Persistence lives under `<cache.dir>` — the daemon's only on-disk state, and state it can
+//! always afford to lose: rows are re-learnable from the mesh, signatures re-verify, and a
 //! lost cache bumps the self GENERATION so regenerated sequence numbers never alias old ones.
+//! That disposability is also the schema-migration story: a layout-version mismatch wipes the
+//! cache and lets the mesh resync it, rather than migrating in place.
 //! Feasibility is verified on apply (an exporter's claim is never trusted) and re-verified at
 //! use, which is what makes "remove a trusted key" degrade cleanly: rows go inert, not away.
 
@@ -30,6 +42,9 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/narshare.mesh.v1.rs"));
 }
 
+/// On-disk layout version. The cache is disposable by design, so a mismatch (or the pre-shard
+/// single-file layout) wipes the directory and lets the mesh resync — no migrations.
+const SCHEMA_VERSION: &str = "2";
 /// Journal rows retained per origin beyond the min-watermark rule — the backstop that keeps one
 /// dead or long-offline peer from pinning the journal forever. Stragglers land on the snapshot
 /// path, which must exist anyway.
@@ -49,10 +64,19 @@ const RESPONSE_BYTES_CAP: usize = 24 << 20;
 /// (effectively fresh). The best-rate yardstick and mean-loss decay toward 0 the same way.
 const MW_HALF_LIFE_SECS: f64 = 86_400.0;
 
+/// One origin's storage: its clock, journal, and paths, in its own SQLite file. The `rw`
+/// connection serializes that origin's writes (which the protocol already serializes
+/// logically); `ro` gives lookups and sync responses WAL snapshot reads that never queue
+/// behind an apply.
+struct Shard {
+    rw: Mutex<Connection>,
+    ro: Mutex<Connection>,
+}
+
 pub struct Index {
-    conn: Mutex<Connection>,
-    /// Read-only sibling for lookups (see open()); never used for writes.
-    reader: Mutex<Connection>,
+    /// meta.db: self generation, trust anchor, watermarks, persisted MW state.
+    meta: Mutex<Connection>,
+    shards: HashMap<String, Shard>,
     pub self_name: String,
     /// Configured origin universe: self + peers. Anything else is rejected and reaped.
     origin_set: HashSet<String>,
@@ -74,6 +98,44 @@ pub enum Apply {
     NeedSnapshot,
 }
 
+/// Origin names are config-supplied strings; keep the common case readable on disk and make
+/// the rest unambiguous (hex never collides with the readable form because of the prefix).
+fn shard_file_name(origin: &str) -> String {
+    let safe = origin
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if safe && !origin.starts_with('.') && !origin.is_empty() {
+        format!("{origin}.db")
+    } else {
+        format!("x{}.db", hex::encode(origin))
+    }
+}
+
+fn open_conn(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // FULL, deliberately: the sync protocol treats every seq a peer has OBSERVED as
+    // permanent — with NORMAL, a power loss can revert the WAL past a seq a peer already
+    // pulled, and re-issuing those numbers with different events diverges that peer until
+    // the paths independently change. Write rate is one transaction per diff/apply, so the
+    // fsync is noise. (The pull-side self-clock regression check is the backstop for the
+    // same failure arriving via other roads, e.g. a restored disk image.)
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
+}
+
+fn open_conn_ro(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening {} read-only", path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
+}
+
 impl Index {
     pub fn open(
         dir: &Path,
@@ -81,49 +143,42 @@ impl Index {
         peer_names: &[String],
         trusted: TrustedKeys,
     ) -> Result<Self> {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating cache dir {}", dir.display()))?;
-        let conn = Connection::open(dir.join("index.db"))
-            .with_context(|| format!("opening {}/index.db", dir.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        // FULL, deliberately: the sync protocol treats every seq a peer has OBSERVED as
-        // permanent — with NORMAL, a power loss can revert the WAL past a seq a peer already
-        // pulled, and re-issuing those numbers with different events diverges that peer until
-        // the paths independently change. Write rate is one transaction per diff/apply, so the
-        // fsync is noise. (The pull-side self-clock regression check is the backstop for the
-        // same failure arriving via other roads, e.g. a restored disk image.)
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch(
+        let origins_dir = dir.join("origins");
+        std::fs::create_dir_all(&origins_dir)
+            .with_context(|| format!("creating cache dir {}", origins_dir.display()))?;
+
+        // Layout versioning by wipe-and-resync: the pre-shard single-file layout, or any
+        // future schema bump, deletes the disposable cache (self generation reminting is the
+        // designed consequence; peers snapshot us back up).
+        let meta_path = dir.join("meta.db");
+        let stored_schema: Option<String> = if meta_path.exists() {
+            let c = open_conn(&meta_path)?;
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            )?;
+            c.query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| r.get(0))
+                .optional()?
+        } else {
+            None
+        };
+        if dir.join("index.db").exists() || stored_schema.as_deref() != Some(SCHEMA_VERSION) {
+            if dir.join("index.db").exists() || stored_schema.is_some() {
+                info!("mesh index layout changed: wiping the (disposable) cache for resync");
+            }
+            for entry in std::fs::read_dir(dir)? {
+                let p = entry?.path();
+                if p.is_dir() {
+                    std::fs::remove_dir_all(&p)?;
+                } else {
+                    std::fs::remove_file(&p)?;
+                }
+            }
+            std::fs::create_dir_all(&origins_dir)?;
+        }
+
+        let meta = open_conn(&meta_path)?;
+        meta.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS origins (
-                 name TEXT PRIMARY KEY,
-                 generation INTEGER NOT NULL,
-                 seq INTEGER NOT NULL,
-                 tail_seq INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS narinfos (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 hash_part TEXT NOT NULL,
-                 store_path TEXT NOT NULL,
-                 nar_hash BLOB NOT NULL,
-                 nar_size INTEGER NOT NULL,
-                 refs TEXT NOT NULL,
-                 ca TEXT NOT NULL,
-                 sigs TEXT NOT NULL,
-                 UNIQUE (store_path, nar_hash));
-             CREATE INDEX IF NOT EXISTS narinfos_hash ON narinfos(hash_part);
-             CREATE INDEX IF NOT EXISTS narinfos_nar ON narinfos(nar_hash);
-             CREATE TABLE IF NOT EXISTS holders (
-                 origin TEXT NOT NULL,
-                 store_path TEXT NOT NULL,
-                 narinfo INTEGER NOT NULL,
-                 PRIMARY KEY (origin, store_path));
-             CREATE INDEX IF NOT EXISTS holders_narinfo ON holders(narinfo);
-             CREATE TABLE IF NOT EXISTS journal (
-                 origin TEXT NOT NULL,
-                 seq INTEGER NOT NULL,
-                 event BLOB NOT NULL,
-                 PRIMARY KEY (origin, seq));
              CREATE TABLE IF NOT EXISTS watermarks (
                  peer TEXT NOT NULL,
                  origin TEXT NOT NULL,
@@ -134,11 +189,16 @@ impl Index {
                  weight REAL NOT NULL,
                  updated INTEGER NOT NULL);",
         )?;
+        meta.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema', ?1)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [SCHEMA_VERSION],
+        )?;
 
         // Self generation: minted once per database lifetime. A lost cache mints a new one, so
         // regenerated (gen, seq) pairs never alias what peers saw before the loss.
-        let gen: Option<String> =
-            conn.query_row("SELECT value FROM meta WHERE key = 'self_generation'", [], |r| {
+        let gen: Option<String> = meta
+            .query_row("SELECT value FROM meta WHERE key = 'self_generation'", [], |r| {
                 r.get(0)
             })
             .optional()?;
@@ -151,91 +211,128 @@ impl Index {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(1);
-                conn.execute(
+                meta.execute(
                     "INSERT INTO meta (key, value) VALUES ('self_generation', ?1)",
                     [g.to_string()],
                 )?;
                 g
             }
         };
-        conn.execute(
-            "INSERT INTO origins (name, generation, seq, tail_seq) VALUES (?1, ?2, 0, 0)
-             ON CONFLICT (name) DO NOTHING",
-            // Through i64, like every other generation column access: the two's-complement
-            // round-trip preserves the full u64 range (rusqlite rejects raw u64 > i64::MAX).
-            params![self_name, self_gen as i64],
-        )?;
-        for p in peer_names {
-            conn.execute(
-                "INSERT INTO origins (name, generation, seq, tail_seq) VALUES (?1, 0, 0, 0)
-                 ON CONFLICT (name) DO NOTHING",
-                params![p],
+
+        let mut origin_set: HashSet<String> = peer_names.iter().cloned().collect();
+        origin_set.insert(self_name.to_owned());
+
+        // Reap origins that left the config: their shard files, and — crucially — their
+        // watermark contribution, which would otherwise pin journal compaction forever.
+        let expected: HashSet<String> = origin_set.iter().map(|o| shard_file_name(o)).collect();
+        for entry in std::fs::read_dir(&origins_dir)? {
+            let p = entry?.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+            let base = name.trim_end_matches("-wal").trim_end_matches("-shm");
+            if !expected.contains(base) {
+                info!("dropping departed origin shard {name:?} from the index");
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        {
+            let names: Vec<String> = origin_set.iter().cloned().collect();
+            let placeholders = vec!["?"; names.len()].join(",");
+            meta.execute(
+                &format!(
+                    "DELETE FROM watermarks WHERE peer NOT IN ({placeholders}) \
+                     OR origin NOT IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(names.iter().chain(names.iter())),
             )?;
         }
 
-        // Reap origins that left the config: their rows, journals, and — crucially — their
-        // watermark contribution, which would otherwise pin journal compaction forever.
-        let mut origin_set: HashSet<String> = peer_names.iter().cloned().collect();
-        origin_set.insert(self_name.to_owned());
-        let known: Vec<String> = conn
-            .prepare("SELECT name FROM origins")?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for o in known {
-            if !origin_set.contains(&o) {
-                info!("dropping departed origin {o:?} from the index");
-                wipe_origin_tx(&conn, &o)?;
-                conn.execute("DELETE FROM origins WHERE name = ?1", [&o])?;
-                conn.execute("DELETE FROM watermarks WHERE peer = ?1 OR origin = ?1", [&o])?;
+        // Open every origin's shard (self + peers), creating schemas as needed.
+        let mut shards = HashMap::new();
+        for origin in &origin_set {
+            let path = origins_dir.join(shard_file_name(origin));
+            let rw = open_conn(&path)?;
+            rw.execute_batch(
+                "CREATE TABLE IF NOT EXISTS clock (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     generation INTEGER NOT NULL,
+                     seq INTEGER NOT NULL,
+                     tail_seq INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS paths (
+                     store_path TEXT PRIMARY KEY,
+                     hash_part TEXT NOT NULL,
+                     nar_hash BLOB NOT NULL,
+                     nar_size INTEGER NOT NULL,
+                     refs TEXT NOT NULL,
+                     ca TEXT NOT NULL,
+                     sigs TEXT NOT NULL);
+                 CREATE INDEX IF NOT EXISTS paths_hash ON paths(hash_part);
+                 CREATE INDEX IF NOT EXISTS paths_nar ON paths(nar_hash);
+                 CREATE TABLE IF NOT EXISTS journal (
+                     seq INTEGER PRIMARY KEY,
+                     event BLOB NOT NULL);",
+            )?;
+            rw.execute(
+                "INSERT INTO clock (id, generation, seq, tail_seq) VALUES (1, 0, 0, 0)
+                 ON CONFLICT (id) DO NOTHING",
+                [],
+            )?;
+            if origin == self_name {
+                // meta's self_generation is authoritative (heals a torn bump too).
+                rw.execute(
+                    "UPDATE clock SET generation = ?1 WHERE id = 1",
+                    params![self_gen as i64],
+                )?;
             }
+            let ro = open_conn_ro(&path)?;
+            shards.insert(origin.clone(), Shard { rw: Mutex::new(rw), ro: Mutex::new(ro) });
         }
 
         // A changed trust anchor voids every peer origin's clock: events applied under the old
         // anchor may have been skipped as infeasible (they are journaled at their ORIGIN, not
         // here), and a clock that already covers those seqs would answer "up to date" forever —
-        // re-adding a key must force full snapshots instead. Holders/narinfos stay (incoming
-        // snapshots wipe-replace them, and use-time feasibility keeps them honest meanwhile);
-        // the self origin needs nothing, because the own-db differ re-exports newly-feasible
-        // paths on its own.
+        // re-adding a key must force full snapshots instead. Paths stay (incoming snapshots
+        // wipe-replace them, and use-time feasibility keeps them honest meanwhile); the self
+        // origin needs nothing, because the own-db differ re-exports newly-feasible paths on
+        // its own.
         let anchor = trusted.anchor_digest();
-        let stored_anchor: Option<String> = conn
+        let stored_anchor: Option<String> = meta
             .query_row("SELECT value FROM meta WHERE key = 'trust_anchor'", [], |r| r.get(0))
             .optional()?;
         if stored_anchor.as_deref() != Some(anchor.as_str()) {
             if stored_anchor.is_some() {
                 info!("trust anchor changed: forcing a full resync of every peer origin");
-                conn.execute(
-                    "UPDATE origins SET generation = 0, seq = 0, tail_seq = 0 WHERE name != ?1",
-                    [self_name],
-                )?;
-                conn.execute("DELETE FROM journal WHERE origin != ?1", [self_name])?;
+                for (origin, shard) in &shards {
+                    if origin == self_name {
+                        continue;
+                    }
+                    let conn = shard.rw.lock().unwrap();
+                    conn.execute_batch(
+                        "UPDATE clock SET generation = 0, seq = 0, tail_seq = 0 WHERE id = 1;
+                         DELETE FROM journal;",
+                    )?;
+                }
             }
-            conn.execute(
+            meta.execute(
                 "INSERT INTO meta (key, value) VALUES ('trust_anchor', ?1)
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 [&anchor],
             )?;
         }
 
-        // A read-only sibling connection for the hot lookups: WAL gives it snapshot reads
-        // while a sync apply holds the writer, so narinfo/nar latency is independent of how
-        // busy the mesh is. (A single shared connection behind one Mutex would forfeit
-        // exactly that property.)
-        let reader = Connection::open_with_flags(
-            dir.join("index.db"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("opening {}/index.db read-only", dir.display()))?;
-        reader.busy_timeout(std::time::Duration::from_secs(5))?;
-
         Ok(Self {
-            conn: Mutex::new(conn),
-            reader: Mutex::new(reader),
+            meta: Mutex::new(meta),
+            shards,
             self_name: self_name.to_owned(),
             origin_set,
             peer_names: peer_names.to_vec(),
             trusted,
         })
+    }
+
+    fn shard(&self, origin: &str) -> Result<&Shard> {
+        self.shards
+            .get(origin)
+            .with_context(|| format!("no shard for origin {origin:?}"))
     }
 
     pub fn is_known_origin(&self, name: &str) -> bool {
@@ -254,44 +351,45 @@ impl Index {
         self.trusted.any_sig_valid(&proto_to_remote(n))
     }
 
+    fn clock_of(conn: &Connection) -> Result<(u64, u64, u64)> {
+        let (g, s, t): (i64, i64, i64) = conn.query_row(
+            "SELECT generation, seq, tail_seq FROM clock WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok((g as u64, s as u64, t as u64))
+    }
+
     /// Our full clock vector, for sync requests (doubles as the ack that drives compaction).
-    /// Served by the read-only connection: pull loops call this on the runtime, and it must
-    /// not queue behind a long apply transaction.
+    /// Read-only shard connections: never queues behind an apply, and cross-origin atomicity
+    /// is not needed (each clock pairs with its own origin's independent stream).
     pub fn clock_vector(&self) -> Result<Vec<proto::OriginClock>> {
-        let conn = self.reader.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT name, generation, seq FROM origins")?;
-        let v = stmt
-            .query_map([], |r| {
-                Ok(proto::OriginClock {
-                    origin: r.get(0)?,
-                    generation: r.get::<_, i64>(1)? as u64,
-                    seq: r.get::<_, i64>(2)? as u64,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+        let mut v = Vec::with_capacity(self.shards.len());
+        for (origin, shard) in &self.shards {
+            let conn = shard.ro.lock().unwrap();
+            let (generation, seq, _) = Self::clock_of(&conn)?;
+            v.push(proto::OriginClock { origin: origin.clone(), generation, seq });
+        }
         Ok(v)
     }
 
     /// Record what `peer` proved it has seen (its sync request's clock vector).
     pub fn record_watermarks(&self, peer: &str, clocks: &[proto::OriginClock]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
         for c in clocks {
             if !self.origin_set.contains(&c.origin) {
                 continue;
             }
             // Only meaningful if the peer is on the same generation we are; a stale-generation
             // watermark must not unblock compaction of a journal it has not actually seen.
-            let ours: Option<(i64, i64)> = conn
-                .query_row(
-                    "SELECT generation, seq FROM origins WHERE name = ?1",
-                    [&c.origin],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            if ours.map(|(g, _)| g as u64) != Some(c.generation) {
+            let ours = {
+                let conn = self.shard(&c.origin)?.ro.lock().unwrap();
+                Self::clock_of(&conn)?.0
+            };
+            if ours != c.generation {
                 continue;
             }
-            conn.execute(
+            let meta = self.meta.lock().unwrap();
+            meta.execute(
                 "INSERT INTO watermarks (peer, origin, seq) VALUES (?1, ?2, ?3)
                  ON CONFLICT (peer, origin) DO UPDATE SET seq = MAX(seq, excluded.seq)",
                 params![peer, c.origin, c.seq as i64],
@@ -301,8 +399,8 @@ impl Index {
     }
 
     /// Build the per-origin answer for a sync request: up-to-date, journal suffix, or snapshot.
-    /// Runs on the read-only connection inside one deferred transaction — a consistent WAL
-    /// snapshot, concurrent with (never behind) sync applies on the writer.
+    /// Each origin is read under its own shard's read-only snapshot — per-origin consistency is
+    /// exactly what the protocol needs, and applies to OTHER origins proceed concurrently.
     pub fn respond(&self, req: &proto::SyncRequest) -> Result<Vec<proto::OriginUpdate>> {
         self.respond_budgeted(req, RESPONSE_BYTES_CAP)
     }
@@ -314,16 +412,17 @@ impl Index {
     ) -> Result<Vec<proto::OriginUpdate>> {
         let have: HashMap<&str, &proto::OriginClock> =
             req.have.iter().map(|c| (c.origin.as_str(), c)).collect();
-        let conn = self.reader.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
-        let origins: Vec<(String, i64, i64, i64)> = tx
-            .prepare_cached("SELECT name, generation, seq, tail_seq FROM origins")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-            .collect::<rusqlite::Result<_>>()?;
         let mut out = Vec::new();
         let mut used = 0usize;
-        for (name, gen, seq, tail) in origins {
-            let (gen, seq, tail) = (gen as u64, seq as u64, tail as u64);
+        // Sorted iteration: deterministic budget allocation across rounds (HashMap order
+        // would defer a different suffix each time and confuse debugging).
+        let mut names: Vec<&String> = self.shards.keys().collect();
+        names.sort();
+        for name in names {
+            let shard = &self.shards[name];
+            let conn = shard.ro.lock().unwrap();
+            let tx = conn.unchecked_transaction()?;
+            let (gen, seq, tail) = Self::clock_of(&tx)?;
             if gen == 0 {
                 continue; // we know nothing about this origin yet
             }
@@ -335,7 +434,7 @@ impl Index {
             }
             if their_gen == gen && their_seq >= seq {
                 out.push(proto::OriginUpdate {
-                    origin: name,
+                    origin: name.clone(),
                     generation: gen,
                     seq,
                     truncated: false,
@@ -347,7 +446,7 @@ impl Index {
             // an empty truncated suffix makes the puller come straight back for another round.
             if used >= budget {
                 out.push(proto::OriginUpdate {
-                    origin: name,
+                    origin: name.clone(),
                     generation: gen,
                     seq,
                     truncated: true,
@@ -363,9 +462,9 @@ impl Index {
                 let mut bytes = 0usize;
                 let mut truncated = false;
                 let mut stmt = tx.prepare_cached(
-                    "SELECT seq, event FROM journal WHERE origin = ?1 AND seq > ?2 ORDER BY seq",
+                    "SELECT seq, event FROM journal WHERE seq > ?1 ORDER BY seq",
                 )?;
-                let mut rows = stmt.query(params![name, their_seq as i64])?;
+                let mut rows = stmt.query(params![their_seq as i64])?;
                 while let Some(row) = rows.next()? {
                     let blob: Vec<u8> = row.get(1)?;
                     if bytes + blob.len() > SUFFIX_BYTES_CAP && !events.is_empty() {
@@ -378,23 +477,22 @@ impl Index {
                     );
                 }
                 used += bytes;
-                let update = proto::OriginUpdate {
+                out.push(proto::OriginUpdate {
                     origin: name.clone(),
                     generation: gen,
                     seq,
                     truncated,
                     body: Some(proto::origin_update::Body::Suffix(proto::Suffix { events })),
-                };
-                out.push(update);
+                });
                 continue;
             } else {
                 // Their watermark predates our tail, or their generation is stale: snapshot.
-                let held = snapshot_tx(&tx, &name)?;
+                let held = snapshot_rows(&tx)?;
                 used += held.iter().map(prost::Message::encoded_len).sum::<usize>();
                 proto::origin_update::Body::Snapshot(proto::Snapshot { held })
             };
             out.push(proto::OriginUpdate {
-                origin: name,
+                origin: name.clone(),
                 generation: gen,
                 seq,
                 truncated: false,
@@ -404,7 +502,8 @@ impl Index {
         Ok(out)
     }
 
-    /// Apply one origin's journal suffix. Idempotent; last-writer-wins per (origin, path).
+    /// Apply one origin's journal suffix. Idempotent; last-writer-wins per path (a plain
+    /// UPSERT — the shard holds only this origin's rows).
     pub fn apply_suffix(
         &self,
         origin: &str,
@@ -415,8 +514,7 @@ impl Index {
             bail!("suffix for unexpected origin {origin:?}");
         }
         // Feasibility (an ed25519 verify per signed add) needs no database: do it BEFORE
-        // taking the write lock, so a large apply cannot hold every other index user hostage
-        // for the crypto's duration.
+        // taking the shard's write lock. (Applies for OTHER origins don't contend at all.)
         let feasible: Vec<bool> = events
             .iter()
             .map(|e| match &e.op {
@@ -424,16 +522,10 @@ impl Index {
                 _ => true,
             })
             .collect();
-        let mut conn = self.conn.lock().unwrap();
+        let shard = self.shard(origin)?;
+        let mut conn = shard.rw.lock().unwrap();
         let tx = conn.transaction()?;
-        let (our_gen, mut our_seq): (u64, u64) = {
-            let (g, s): (i64, i64) = tx.query_row(
-                "SELECT generation, seq FROM origins WHERE name = ?1",
-                [origin],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            (g as u64, s as u64)
-        };
+        let (our_gen, mut our_seq, _) = Self::clock_of(&tx)?;
         if generation < our_gen {
             return Ok(Apply::Applied(0)); // stale relay; ignore
         }
@@ -442,8 +534,8 @@ impl Index {
                 // We know nothing yet: adopting a generation via a from-zero suffix is
                 // identical to snapshotting an empty state and replaying.
                 tx.execute(
-                    "UPDATE origins SET generation = ?2 WHERE name = ?1",
-                    params![origin, generation as i64],
+                    "UPDATE clock SET generation = ?1 WHERE id = 1",
+                    params![generation as i64],
                 )?;
             } else {
                 // The origin regenerated (cache loss): our copy is void. A suffix cannot
@@ -460,17 +552,14 @@ impl Index {
                 return Ok(Apply::NeedSnapshot); // gap: suffix does not connect
             }
             tx.execute(
-                "INSERT OR REPLACE INTO journal (origin, seq, event) VALUES (?1, ?2, ?3)",
-                params![origin, e.seq as i64, e.encode_to_vec()],
+                "INSERT OR REPLACE INTO journal (seq, event) VALUES (?1, ?2)",
+                params![e.seq as i64, e.encode_to_vec()],
             )?;
             apply_op_tx(&tx, origin, e, *feas)?;
             our_seq = e.seq;
             applied += 1;
         }
-        tx.execute(
-            "UPDATE origins SET seq = ?2 WHERE name = ?1",
-            params![origin, our_seq as i64],
-        )?;
+        tx.execute("UPDATE clock SET seq = ?1 WHERE id = 1", params![our_seq as i64])?;
         tx.commit()?;
         Ok(Apply::Applied(applied))
     }
@@ -489,36 +578,30 @@ impl Index {
         // Verify outside the write lock (see apply_suffix) — this is the path where it matters
         // most: a first-contact snapshot of a large signed origin is thousands of verifies.
         let feasible: Vec<bool> = held.iter().map(|n| self.feasible(n)).collect();
-        let mut conn = self.conn.lock().unwrap();
+        let shard = self.shard(origin)?;
+        let mut conn = shard.rw.lock().unwrap();
         let tx = conn.transaction()?;
-        let (our_gen, our_seq): (u64, u64) = {
-            let (g, s): (i64, i64) = tx.query_row(
-                "SELECT generation, seq FROM origins WHERE name = ?1",
-                [origin],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            (g as u64, s as u64)
-        };
+        let (our_gen, our_seq, _) = Self::clock_of(&tx)?;
         if generation < our_gen || (generation == our_gen && seq < our_seq) {
             // Stale relay — including the concurrent-pull race where another peer's loop
             // advanced this origin past `seq` while this snapshot was in flight; wiping to the
             // older state would silently drop the newer events.
             return Ok(0);
         }
-        wipe_origin_tx(&tx, origin)?;
+        tx.execute_batch("DELETE FROM paths; DELETE FROM journal;")?;
         let mut inserted = 0usize;
         for (n, feas) in held.iter().zip(&feasible) {
             if !feas {
                 debug!("snapshot of {origin}: skipping infeasible {}", n.store_path);
                 continue;
             }
-            hold_tx(&tx, origin, n)?;
+            upsert_path_tx(&tx, n)?;
             inserted += 1;
         }
         // We have state as of `seq` but no journal history: suffixes we can serve start there.
         tx.execute(
-            "UPDATE origins SET generation = ?2, seq = ?3, tail_seq = ?3 WHERE name = ?1",
-            params![origin, generation as i64, seq as i64],
+            "UPDATE clock SET generation = ?1, seq = ?2, tail_seq = ?2 WHERE id = 1",
+            params![generation as i64, seq as i64],
         )?;
         tx.commit()?;
         Ok(inserted)
@@ -536,17 +619,18 @@ impl Index {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1);
         let g = nanos.max(floor.saturating_add(1));
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE meta SET value = ?1 WHERE key = 'self_generation'",
-            [g.to_string()],
-        )?;
-        tx.execute(
-            "UPDATE origins SET generation = ?2 WHERE name = ?1",
-            params![self.self_name, g as i64],
-        )?;
-        tx.commit()?;
+        // meta first (authoritative), then the shard clock; a crash in between is healed at
+        // open, where meta's value is re-stamped onto the shard.
+        {
+            let meta = self.meta.lock().unwrap();
+            meta.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'self_generation'",
+                [g.to_string()],
+            )?;
+        }
+        let shard = self.shard(&self.self_name)?;
+        let conn = shard.rw.lock().unwrap();
+        conn.execute("UPDATE clock SET generation = ?1 WHERE id = 1", params![g as i64])?;
         Ok(g)
     }
 
@@ -559,35 +643,31 @@ impl Index {
     /// cannot go stale between phases.
     pub fn sync_own_db(&self, db: &StoreDb) -> Result<usize> {
         let candidates = db.feasible_candidates()?;
+        let shard = self.shard(&self.self_name)?;
 
-        // Phase 1: snapshot what we currently export (brief lock).
+        // Phase 1: snapshot what we currently export (brief read).
         let held: HashMap<String, (Vec<u8>, String)> = {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare_cached(
-                "SELECT h.store_path, n.nar_hash, n.sigs FROM holders h
-                 JOIN narinfos n ON n.id = h.narinfo WHERE h.origin = ?1",
-            )?;
+            let conn = shard.ro.lock().unwrap();
+            let mut stmt =
+                conn.prepare_cached("SELECT store_path, nar_hash, sigs FROM paths")?;
             let held = stmt
-                .query_map([&self.self_name], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+                .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
                 .collect::<rusqlite::Result<_>>()?;
             held
         };
 
-        // Phase 2: diff, with the ed25519 verifies for changed rows done lock-free.
+        // Phase 2: diff, with the ed25519 verifies for changed rows done lock-free. The self
+        // shard contains EXACTLY what we exported (no cross-origin sig merging exists in the
+        // sharded layout), so plain equality is the honest change test — it also catches
+        // signature removal.
         let mut adds: Vec<proto::Narinfo> = Vec::new();
         let mut kept: HashSet<&str> = HashSet::with_capacity(candidates.len());
         for info in &candidates {
             let changed = match held.get(&info.path) {
                 Some((hash, sigs)) => {
-                    // Sig comparison is SUBSET, not equality: peers holding the same
-                    // (path, narhash) merge their sig sets into the shared row (hold_tx), so
-                    // the stored set can be a strict superset of ours forever — an equality
-                    // check would re-emit such paths on every diff, and since every emission
-                    // hints the mesh and every application re-hints, the whole mesh would spin
-                    // on pull/hint churn with unbounded journal growth.
                     let stored: HashSet<&str> = sigs.split_whitespace().collect();
-                    hash[..] != info.nar_hash[..]
-                        || info.sigs.iter().any(|s| !stored.contains(s.as_str()))
+                    let ours: HashSet<&str> = info.sigs.iter().map(String::as_str).collect();
+                    hash[..] != info.nar_hash[..] || stored != ours
                 }
                 None => true,
             };
@@ -628,18 +708,15 @@ impl Index {
             return Ok(0);
         }
 
-        // Phase 3: write everything in one transaction.
-        let mut conn = self.conn.lock().unwrap();
+        // Phase 3: write everything in one transaction on the self shard.
+        let mut conn = shard.rw.lock().unwrap();
         let tx = conn.transaction()?;
-        let mut seq: u64 = tx
-            .query_row("SELECT seq FROM origins WHERE name = ?1", [&self.self_name], |r| {
-                r.get::<_, i64>(0).map(|s| s as u64)
-            })?;
+        let (_, mut seq, _) = Self::clock_of(&tx)?;
         let mut emitted = 0usize;
         let mut emit = |tx: &Connection, e: proto::Event| -> Result<()> {
             tx.execute(
-                "INSERT INTO journal (origin, seq, event) VALUES (?1, ?2, ?3)",
-                params![self.self_name, e.seq as i64, e.encode_to_vec()],
+                "INSERT INTO journal (seq, event) VALUES (?1, ?2)",
+                params![e.seq as i64, e.encode_to_vec()],
             )?;
             apply_op_tx(tx, &self.self_name, &e, true)?;
             emitted += 1;
@@ -653,119 +730,112 @@ impl Index {
             seq += 1;
             emit(&tx, proto::Event { seq, op: Some(proto::event::Op::Remove(path)) })?;
         }
-        tx.execute(
-            "UPDATE origins SET seq = ?2 WHERE name = ?1",
-            params![self.self_name, seq as i64],
-        )?;
+        tx.execute("UPDATE clock SET seq = ?1 WHERE id = 1", params![seq as i64])?;
         tx.commit()?;
         Ok(emitted)
     }
 
     /// Compact journals: to the minimum watermark across all configured peers (the ack rule),
-    /// with the size backstop so a straggler cannot pin retention forever.
+    /// with the size backstop so a straggler cannot pin retention forever. Per-shard
+    /// transactions; origins compact independently.
     pub fn compact(&self) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        // One transaction: a crash between the journal DELETE and the tail_seq UPDATE would
-        // otherwise leave a silent gap that costs the next requester a wasted round.
-        let tx = conn.transaction()?;
-        let origins: Vec<(String, i64, i64)> = tx
-            .prepare("SELECT name, seq, tail_seq FROM origins")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        for (origin, seq, tail) in origins {
+        // Watermarks first (brief meta read), then each shard on its own lock.
+        let marks: HashMap<(String, String), i64> = {
+            let meta = self.meta.lock().unwrap();
+            let mut stmt = meta.prepare_cached("SELECT peer, origin, seq FROM watermarks")?;
+            let m = stmt
+                .query_map([], |r| {
+                    Ok(((r.get(0)?, r.get(1)?), r.get(2)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            m
+        };
+        for (origin, shard) in &self.shards {
+            let mut conn = shard.rw.lock().unwrap();
+            let tx = conn.transaction()?;
+            let (_, seq, tail) = Self::clock_of(&tx)?;
+            let (seq, tail) = (seq as i64, tail as i64);
             let mut floor: i64 = seq;
             for peer in &self.peer_names {
-                let w: Option<i64> = tx
-                    .query_row(
-                        "SELECT seq FROM watermarks WHERE peer = ?1 AND origin = ?2",
-                        params![peer, origin],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                floor = floor.min(w.unwrap_or(0));
+                let w = marks.get(&(peer.clone(), origin.clone())).copied().unwrap_or(0);
+                floor = floor.min(w);
             }
             // Backstop: never retain more than JOURNAL_BACKSTOP events regardless of acks.
             floor = floor.max(seq - (JOURNAL_BACKSTOP as i64).min(seq));
             if floor > tail {
-                tx.execute(
-                    "DELETE FROM journal WHERE origin = ?1 AND seq <= ?2",
-                    params![origin, floor],
-                )?;
-                tx.execute(
-                    "UPDATE origins SET tail_seq = ?2 WHERE name = ?1",
-                    params![origin, floor],
-                )?;
+                tx.execute("DELETE FROM journal WHERE seq <= ?1", params![floor])?;
+                tx.execute("UPDATE clock SET tail_seq = ?1 WHERE id = 1", params![floor])?;
             }
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(())
     }
 
     /// Lookup by store-path hash part, feasibility re-verified at use.
     pub fn lookup_hash_part(&self, hash_part: &str) -> Result<Vec<Found>> {
-        self.lookup("SELECT id FROM narinfos WHERE hash_part = ?1", hash_part)
+        self.lookup_merged(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT store_path, nar_hash, nar_size, refs, ca, sigs FROM paths \
+                 WHERE hash_part = ?1",
+            )?;
+            let v = stmt
+                .query_map([hash_part], row_to_narinfo)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(v)
+        })
     }
 
     /// Lookup by narhash (NAR requests after a proxy restart included — the index persists).
     pub fn lookup_nar_hash(&self, nar_hash: &[u8; 32]) -> Result<Vec<Found>> {
-        let conn = self.reader.lock().unwrap();
-        let ids: Vec<i64> = conn
-            .prepare_cached("SELECT id FROM narinfos WHERE nar_hash = ?1")?
-            .query_map(params![&nar_hash[..]], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        self.found_from_ids(&conn, &ids)
-    }
-
-    fn lookup(&self, sql: &str, key: &str) -> Result<Vec<Found>> {
-        let conn = self.reader.lock().unwrap();
-        let ids: Vec<i64> = conn
-            .prepare_cached(sql)?
-            .query_map([key], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        self.found_from_ids(&conn, &ids)
-    }
-
-    fn found_from_ids(&self, conn: &Connection, ids: &[i64]) -> Result<Vec<Found>> {
-        let mut out = Vec::new();
-        for &id in ids {
-            let n: proto::Narinfo = conn.prepare_cached(
-                "SELECT store_path, nar_hash, nar_size, refs, ca, sigs FROM narinfos WHERE id = ?1",
-            )?.query_row(
-                [id],
-                |r| {
-                    Ok(proto::Narinfo {
-                        store_path: r.get(0)?,
-                        nar_hash: r.get(1)?,
-                        nar_size: r.get::<_, i64>(2)? as u64,
-                        references: r
-                            .get::<_, String>(3)?
-                            .split_whitespace()
-                            .map(str::to_owned)
-                            .collect(),
-                        ca: r.get(4)?,
-                        sigs: r
-                            .get::<_, String>(5)?
-                            .split_whitespace()
-                            .map(str::to_owned)
-                            .collect(),
-                    })
-                },
+        self.lookup_merged(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT store_path, nar_hash, nar_size, refs, ca, sigs FROM paths \
+                 WHERE nar_hash = ?1",
             )?;
-            // Re-verify at use: a key removed from the anchor makes its rows inert, and
-            // re-adding it wakes them — nothing is deleted on trust changes.
-            if !self.feasible(&n) {
-                continue;
+            let v = stmt
+                .query_map(params![&nar_hash[..]], row_to_narinfo)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(v)
+        })
+    }
+
+    /// Fan a per-shard query out over every origin and merge by (store_path, nar_hash):
+    /// holders collect, signature sets union — the read-time equivalent of what the shared-
+    /// table layout did at write time, minus all of its coupling.
+    fn lookup_merged<F>(&self, per_shard: F) -> Result<Vec<Found>>
+    where
+        F: Fn(&Connection) -> Result<Vec<proto::Narinfo>>,
+    {
+        let mut merged: Vec<(proto::Narinfo, Vec<String>)> = Vec::new();
+        for (origin, shard) in &self.shards {
+            let rows = {
+                let conn = shard.ro.lock().unwrap();
+                per_shard(&conn)?
+            };
+            for n in rows {
+                match merged
+                    .iter_mut()
+                    .find(|(m, _)| m.store_path == n.store_path && m.nar_hash == n.nar_hash)
+                {
+                    Some((m, holders)) => {
+                        for s in n.sigs {
+                            if !m.sigs.contains(&s) {
+                                m.sigs.push(s);
+                            }
+                        }
+                        holders.push(origin.clone());
+                    }
+                    None => merged.push((n, vec![origin.clone()])),
+                }
             }
-            let holders: Vec<String> = conn
-                .prepare_cached("SELECT origin FROM holders WHERE narinfo = ?1")?
-                .query_map([id], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            if holders.is_empty() {
-                continue;
-            }
-            out.push(Found { info: proto_to_remote(&n), holders });
         }
-        Ok(out)
+        // Re-verify at use: a key removed from the anchor makes its rows inert, and
+        // re-adding it wakes them — nothing is deleted on trust changes.
+        Ok(merged
+            .into_iter()
+            .filter(|(n, _)| self.feasible(n))
+            .map(|(n, holders)| Found { info: proto_to_remote(&n), holders })
+            .collect())
     }
 
     /// Persist the MW pool's learned state, stamped now. Keyed by peer NAME — indices are not
@@ -778,16 +848,16 @@ impl Index {
         avg_loss: f64,
     ) -> Result<()> {
         let now = unix_now() as i64;
-        let conn = self.conn.lock().unwrap();
+        let meta = self.meta.lock().unwrap();
         for (name, w) in peers.iter().zip(weights) {
-            conn.execute(
+            meta.execute(
                 "INSERT INTO mw_state (peer, weight, updated) VALUES (?1, ?2, ?3)
                  ON CONFLICT (peer) DO UPDATE SET weight = excluded.weight,
                                                   updated = excluded.updated",
                 params![name, w, now],
             )?;
         }
-        conn.execute(
+        meta.execute(
             "INSERT INTO meta (key, value) VALUES ('mw_globals', ?1)
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             [format!("{best_rate} {avg_loss} {now}")],
@@ -799,8 +869,8 @@ impl Index {
     /// (uniform weights, zero yardstick) by staleness. None when nothing was ever saved.
     pub fn load_mw(&self, peers: &[String]) -> Result<Option<(Vec<f64>, f64, f64)>> {
         let now = unix_now() as i64;
-        let conn = self.conn.lock().unwrap();
-        let rows: HashMap<String, (f64, i64)> = conn
+        let meta = self.meta.lock().unwrap();
+        let rows: HashMap<String, (f64, i64)> = meta
             .prepare("SELECT peer, weight, updated FROM mw_state")?
             .query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?
             .collect::<rusqlite::Result<_>>()?;
@@ -810,7 +880,7 @@ impl Index {
         // Reap rows for peers that left the config.
         for name in rows.keys() {
             if !peers.contains(name) {
-                conn.execute("DELETE FROM mw_state WHERE peer = ?1", [name])?;
+                meta.execute("DELETE FROM mw_state WHERE peer = ?1", [name])?;
             }
         }
         let decay = |age: i64| 0.5f64.powf((age.max(0) as f64) / MW_HALF_LIFE_SECS);
@@ -828,7 +898,7 @@ impl Index {
         if !any {
             return Ok(None);
         }
-        let globals: Option<String> = conn
+        let globals: Option<String> = meta
             .query_row("SELECT value FROM meta WHERE key = 'mw_globals'", [], |r| r.get(0))
             .optional()?;
         let (best_rate, avg_loss) = match globals.as_deref().map(|g| {
@@ -851,10 +921,10 @@ impl Index {
     /// Test hook: age every persisted MW stamp backwards.
     #[cfg(test)]
     pub fn age_mw(&self, secs: i64) {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE mw_state SET updated = updated - ?1", [secs]).unwrap();
+        let meta = self.meta.lock().unwrap();
+        meta.execute("UPDATE mw_state SET updated = updated - ?1", [secs]).unwrap();
         if let Ok(g) =
-            conn.query_row("SELECT value FROM meta WHERE key = 'mw_globals'", [], |r| {
+            meta.query_row("SELECT value FROM meta WHERE key = 'mw_globals'", [], |r| {
                 r.get::<_, String>(0)
             })
         {
@@ -864,7 +934,7 @@ impl Index {
                 it.next().unwrap().to_owned(),
                 it.next().unwrap().parse::<i64>().unwrap(),
             );
-            conn.execute(
+            meta.execute(
                 "UPDATE meta SET value = ?1 WHERE key = 'mw_globals'",
                 [format!("{br} {al} {}", up - secs)],
             )
@@ -873,47 +943,52 @@ impl Index {
     }
 
     /// Full introspection for the status endpoint: per-origin clocks, journal and holding
-    /// sizes, narinfo total, watermarks. Read-only connection, one consistent snapshot.
+    /// sizes, narinfo total, watermarks. Read-only connections throughout.
     pub fn status(&self) -> Result<serde_json::Value> {
-        let conn = self.reader.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
-        let journal: HashMap<String, i64> = tx
-            .prepare_cached("SELECT origin, COUNT(*) FROM journal GROUP BY origin")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        let holdings: HashMap<String, i64> = tx
-            .prepare_cached("SELECT origin, COUNT(*) FROM holders GROUP BY origin")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        let origins: Vec<serde_json::Value> = tx
-            .prepare_cached("SELECT name, generation, seq, tail_seq FROM origins ORDER BY name")?
-            .query_map([], |r| {
-                let name: String = r.get(0)?;
-                Ok(serde_json::json!({
-                    "name": name.clone(),
-                    "generation": r.get::<_, i64>(1)? as u64,
-                    "seq": r.get::<_, i64>(2)? as u64,
-                    "tail_seq": r.get::<_, i64>(3)? as u64,
-                    "journal_len": journal.get(&name).copied().unwrap_or(0),
-                    "holdings": holdings.get(&name).copied().unwrap_or(0),
-                }))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        let narinfos: i64 =
-            tx.query_row("SELECT COUNT(*) FROM narinfos", [], |r| r.get(0))?;
-        let watermarks: Vec<serde_json::Value> = tx
-            .prepare_cached("SELECT peer, origin, seq FROM watermarks ORDER BY peer, origin")?
-            .query_map([], |r| {
-                Ok(serde_json::json!({
-                    "peer": r.get::<_, String>(0)?,
-                    "origin": r.get::<_, String>(1)?,
-                    "seq": r.get::<_, i64>(2)? as u64,
-                }))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+        let mut origins: Vec<serde_json::Value> = Vec::new();
+        let mut names: Vec<&String> = self.shards.keys().collect();
+        names.sort();
+        let mut distinct: HashSet<(String, Vec<u8>)> = HashSet::new();
+        for name in names {
+            let shard = &self.shards[name];
+            let conn = shard.ro.lock().unwrap();
+            let (generation, seq, tail_seq) = Self::clock_of(&conn)?;
+            let journal_len: i64 =
+                conn.query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))?;
+            let holdings: i64 =
+                conn.query_row("SELECT COUNT(*) FROM paths", [], |r| r.get(0))?;
+            let mut stmt = conn.prepare_cached("SELECT store_path, nar_hash FROM paths")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                distinct.insert((row.get(0)?, row.get(1)?));
+            }
+            origins.push(serde_json::json!({
+                "name": name,
+                "generation": generation,
+                "seq": seq,
+                "tail_seq": tail_seq,
+                "journal_len": journal_len,
+                "holdings": holdings,
+            }));
+        }
+        let watermarks: Vec<serde_json::Value> = {
+            let meta = self.meta.lock().unwrap();
+            let mut stmt = meta
+                .prepare_cached("SELECT peer, origin, seq FROM watermarks ORDER BY peer, origin")?;
+            let v = stmt
+                .query_map([], |r| {
+                    Ok(serde_json::json!({
+                        "peer": r.get::<_, String>(0)?,
+                        "origin": r.get::<_, String>(1)?,
+                        "seq": r.get::<_, i64>(2)? as u64,
+                    }))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            v
+        };
         Ok(serde_json::json!({
             "self": self.self_name,
-            "narinfos": narinfos,
+            "narinfos": distinct.len(),
             "origins": origins,
             "watermarks": watermarks,
         }))
@@ -921,29 +996,30 @@ impl Index {
 
     /// (generation, seq) of an origin as we know it.
     pub fn origin_clock(&self, origin: &str) -> Result<(u64, u64)> {
-        let conn = self.reader.lock().unwrap();
-        let (g, s): (i64, i64) = conn.query_row(
-            "SELECT generation, seq FROM origins WHERE name = ?1",
-            [origin],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        Ok((g as u64, s as u64))
+        let conn = self.shard(origin)?.ro.lock().unwrap();
+        let (g, s, _) = Self::clock_of(&conn)?;
+        Ok((g, s))
     }
 
     #[cfg(test)]
     pub fn count_narinfos(&self) -> usize {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM narinfos", [], |r| r.get::<_, i64>(0)).unwrap()
-            as usize
+        let mut distinct: HashSet<(String, Vec<u8>)> = HashSet::new();
+        for shard in self.shards.values() {
+            let conn = shard.ro.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT store_path, nar_hash FROM paths").unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                distinct.insert((row.get(0).unwrap(), row.get(1).unwrap()));
+            }
+        }
+        distinct.len()
     }
 
     #[cfg(test)]
     pub fn journal_len(&self, origin: &str) -> usize {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM journal WHERE origin = ?1", [origin], |r| {
-            r.get::<_, i64>(0)
-        })
-        .unwrap() as usize
+        let conn = self.shard(origin).unwrap().ro.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM journal", [], |r| r.get::<_, i64>(0)).unwrap()
+            as usize
     }
 }
 
@@ -954,27 +1030,30 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Fold one journal event into the tables. `feasible` is the caller's PRE-COMPUTED verdict for
-/// add events (the ed25519 verify happens outside the write lock); removes ignore it.
+/// Fold one journal event into the shard's paths table. `feasible` is the caller's
+/// PRE-COMPUTED verdict for add events (the ed25519 verify happens outside the write lock);
+/// removes ignore it. LWW per path is a plain UPSERT: the shard holds only its own origin's
+/// rows, so there is nothing to merge and nothing to orphan-collect.
 fn apply_op_tx(tx: &Connection, origin: &str, e: &proto::Event, feasible: bool) -> Result<()> {
     match &e.op {
         Some(proto::event::Op::Add(n)) => {
             if feasible {
-                hold_tx(tx, origin, n)?;
+                upsert_path_tx(tx, n)?;
             } else {
                 // Journaled verbatim for faithful relay, but never enters our tables.
                 debug!("origin {origin}: infeasible add for {} ignored", n.store_path);
-                unhold_tx(tx, origin, &n.store_path)?;
+                tx.execute("DELETE FROM paths WHERE store_path = ?1", [&n.store_path])?;
             }
         }
-        Some(proto::event::Op::Remove(path)) => unhold_tx(tx, origin, path)?,
+        Some(proto::event::Op::Remove(path)) => {
+            tx.execute("DELETE FROM paths WHERE store_path = ?1", [path])?;
+        }
         None => {}
     }
     Ok(())
 }
 
-/// Upsert the narinfo row (merging signatures) and point `origin`'s holding at it.
-fn hold_tx(tx: &Connection, origin: &str, n: &proto::Narinfo) -> Result<()> {
+fn upsert_path_tx(tx: &Connection, n: &proto::Narinfo) -> Result<()> {
     let hash_part = n
         .store_path
         .rsplit('/')
@@ -983,134 +1062,43 @@ fn hold_tx(tx: &Connection, origin: &str, n: &proto::Narinfo) -> Result<()> {
         .get(..32)
         .unwrap_or("")
         .to_owned();
-    let refs = n.references.join(" ");
-    let existing: Option<(i64, String)> = tx
-        .query_row(
-            "SELECT id, sigs FROM narinfos WHERE store_path = ?1 AND nar_hash = ?2",
-            params![n.store_path, n.nar_hash],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let id = match existing {
-        Some((id, sigs)) => {
-            // Merge signatures: different origins may have retained different sig sets.
-            // (The own-db differ compares by SUBSET for exactly this reason — the merged
-            // set never shrinks back to any one origin's view.)
-            let mut set: Vec<&str> = sigs.split_whitespace().collect();
-            for s in &n.sigs {
-                if !set.contains(&s.as_str()) {
-                    set.push(s);
-                }
-            }
-            tx.execute(
-                "UPDATE narinfos SET sigs = ?2 WHERE id = ?1",
-                params![id, set.join(" ")],
-            )?;
-            id
-        }
-        None => {
-            tx.execute(
-                "INSERT INTO narinfos (hash_part, store_path, nar_hash, nar_size, refs, ca, sigs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    hash_part,
-                    n.store_path,
-                    n.nar_hash,
-                    n.nar_size as i64,
-                    refs,
-                    n.ca,
-                    n.sigs.join(" ")
-                ],
-            )?;
-            tx.last_insert_rowid()
-        }
-    };
-    // LWW per (origin, path): displace any prior holding of this path.
-    let prior: Option<i64> = tx
-        .query_row(
-            "SELECT narinfo FROM holders WHERE origin = ?1 AND store_path = ?2",
-            params![origin, n.store_path],
-            |r| r.get(0),
-        )
-        .optional()?;
     tx.execute(
-        "INSERT OR REPLACE INTO holders (origin, store_path, narinfo) VALUES (?1, ?2, ?3)",
-        params![origin, n.store_path, id],
+        "INSERT OR REPLACE INTO paths (store_path, hash_part, nar_hash, nar_size, refs, ca, sigs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            n.store_path,
+            hash_part,
+            n.nar_hash,
+            n.nar_size as i64,
+            n.references.join(" "),
+            n.ca,
+            n.sigs.join(" ")
+        ],
     )?;
-    if let Some(old) = prior {
-        if old != id {
-            gc_if_orphaned_tx(tx, old)?;
-        }
-    }
     Ok(())
 }
 
-/// Drop a holder edge and orphan-GC the narinfo it pointed at.
-fn unhold_tx(tx: &Connection, origin: &str, store_path: &str) -> Result<()> {
-    let prior: Option<i64> = tx
-        .query_row(
-            "SELECT narinfo FROM holders WHERE origin = ?1 AND store_path = ?2",
-            params![origin, store_path],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(id) = prior {
-        tx.execute(
-            "DELETE FROM holders WHERE origin = ?1 AND store_path = ?2",
-            params![origin, store_path],
-        )?;
-        gc_if_orphaned_tx(tx, id)?;
-    }
-    Ok(())
+fn row_to_narinfo(r: &rusqlite::Row) -> rusqlite::Result<proto::Narinfo> {
+    Ok(proto::Narinfo {
+        store_path: r.get(0)?,
+        nar_hash: r.get(1)?,
+        nar_size: r.get::<_, i64>(2)? as u64,
+        references: r
+            .get::<_, String>(3)?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+        ca: r.get(4)?,
+        sigs: r.get::<_, String>(5)?.split_whitespace().map(str::to_owned).collect(),
+    })
 }
 
-/// "When no peer has a derivation corresponding to the narinfo, the narinfo (and its
-/// signatures) can be garbage collected."
-fn gc_if_orphaned_tx(tx: &Connection, narinfo_id: i64) -> Result<()> {
-    let holders: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM holders WHERE narinfo = ?1",
-        [narinfo_id],
-        |r| r.get(0),
-    )?;
-    if holders == 0 {
-        tx.execute("DELETE FROM narinfos WHERE id = ?1", [narinfo_id])?;
-    }
-    Ok(())
-}
-
-fn wipe_origin_tx(tx: &Connection, origin: &str) -> Result<()> {
-    let held: Vec<i64> = tx
-        .prepare("SELECT narinfo FROM holders WHERE origin = ?1")?
-        .query_map([origin], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    tx.execute("DELETE FROM holders WHERE origin = ?1", [origin])?;
-    for id in held {
-        gc_if_orphaned_tx(tx, id)?;
-    }
-    tx.execute("DELETE FROM journal WHERE origin = ?1", [origin])?;
-    Ok(())
-}
-
-fn snapshot_tx(conn: &Connection, origin: &str) -> Result<Vec<proto::Narinfo>> {
+fn snapshot_rows(conn: &Connection) -> Result<Vec<proto::Narinfo>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT n.store_path, n.nar_hash, n.nar_size, n.refs, n.ca, n.sigs
-         FROM holders h JOIN narinfos n ON n.id = h.narinfo WHERE h.origin = ?1",
+        "SELECT store_path, nar_hash, nar_size, refs, ca, sigs FROM paths",
     )?;
     let v = stmt
-        .query_map([origin], |r| {
-            Ok(proto::Narinfo {
-                store_path: r.get(0)?,
-                nar_hash: r.get(1)?,
-                nar_size: r.get::<_, i64>(2)? as u64,
-                references: r
-                    .get::<_, String>(3)?
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect(),
-                ca: r.get(4)?,
-                sigs: r.get::<_, String>(5)?.split_whitespace().map(str::to_owned).collect(),
-            })
-        })?
+        .query_map([], row_to_narinfo)?
         .collect::<rusqlite::Result<_>>()?;
     Ok(v)
 }
@@ -1127,7 +1115,6 @@ pub fn proto_to_remote(n: &proto::Narinfo) -> RemoteNarinfo {
         sigs: n.sigs.clone(),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1406,8 +1393,11 @@ mod tests {
             .filter(|u| u.origin != "x")
             .filter(|u| matches!(u.body, Some(proto::origin_update::Body::Snapshot(_))))
             .count();
+        // Only a/b matter here too: the responder's own (empty-state) origin may also be
+        // deferred once the budget is spent — a harmless extra round for zero bytes.
         let deferred: Vec<_> = ups
             .iter()
+            .filter(|u| u.origin != "x")
             .filter(|u| {
                 u.truncated
                     && matches!(&u.body,
@@ -1511,6 +1501,64 @@ mod tests {
         assert_eq!(b.count_narinfos(), 1, "rows persist; snapshots will wipe-replace them");
         // Our own clock is untouched — the differ re-exports newly-feasible paths itself.
         assert!(b.origin_clock("b").unwrap().0 > 0);
+    }
+
+    #[test]
+    #[ignore] // measurement bench: cargo test --release shard_apply -- --ignored --nocapture
+    fn shard_apply_parallelism() {
+        // The sharding claim, measured: snapshot applies for DIFFERENT origins run on
+        // separate files/locks, so a full-mesh resync storm costs max(apply) wall time, not
+        // sum(apply).
+        let rows = |origin: u8| -> Vec<proto::Narinfo> {
+            (0..20_000u32)
+                .map(|i| proto::Narinfo {
+                    store_path: format!(
+                        "/nix/store/{:08}o{origin:02}{}-pkg-{i}",
+                        i,
+                        "z".repeat(22)
+                    ),
+                    nar_hash: {
+                        let mut h = [origin; 32];
+                        h[..4].copy_from_slice(&i.to_le_bytes());
+                        h.to_vec()
+                    },
+                    nar_size: 1000,
+                    references: vec![],
+                    ca: "fixed:r:sha256:dummy".into(),
+                    sigs: vec![],
+                })
+                .collect()
+        };
+        let snaps: Vec<Vec<proto::Narinfo>> = (1..=4).map(rows).collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let seq_idx = idx(dir.path(), "s", &["a", "b", "c", "d"]);
+        let t0 = std::time::Instant::now();
+        for (i, name) in ["a", "b", "c", "d"].iter().enumerate() {
+            seq_idx.apply_snapshot(name, 1, 1, &snaps[i]).unwrap();
+        }
+        let sequential = t0.elapsed();
+
+        let par_idx = idx(dir.path(), "p", &["a", "b", "c", "d"]);
+        let t0 = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for (i, name) in ["a", "b", "c", "d"].iter().enumerate() {
+                let par_idx = &par_idx;
+                let snap = &snaps[i];
+                s.spawn(move || par_idx.apply_snapshot(name, 1, 1, snap).unwrap());
+            }
+        });
+        let parallel = t0.elapsed();
+        println!(
+            "[shard] 4 origins x 20k-row snapshots: sequential {sequential:?}, \
+             parallel {parallel:?} ({:.2}x)",
+            sequential.as_secs_f64() / parallel.as_secs_f64()
+        );
+        assert_eq!(par_idx.count_narinfos(), 80_000);
+        assert!(
+            parallel < sequential,
+            "parallel applies must beat sequential: {parallel:?} vs {sequential:?}"
+        );
     }
 
     #[test]
