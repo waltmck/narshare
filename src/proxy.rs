@@ -141,11 +141,16 @@ async fn cache_info(State(st): State<Arc<ProxyState>>) -> Response {
 }
 
 async fn get_narinfo(State(st): State<Arc<ProxyState>>, UrlPath(file): UrlPath<String>) -> Response {
+    st.fetch.stats.narinfo_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let miss = || {
+        st.fetch.stats.narinfo_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        StatusCode::NOT_FOUND.into_response()
+    };
     let Some(hash_part) = file.strip_suffix(".narinfo") else {
-        return StatusCode::NOT_FOUND.into_response();
+        return miss();
     };
     if hash_part.len() != 32 || !hash_part.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        return StatusCode::NOT_FOUND.into_response();
+        return miss();
     }
     let rows = {
         let index = st.index.clone();
@@ -157,7 +162,7 @@ async fn get_narinfo(State(st): State<Arc<ProxyState>>, UrlPath(file): UrlPath<S
                 // makes nix retry with backoff, a 404 falls through to its other substituters
                 // instantly. Log loudly, degrade to a miss.
                 error!("index lookup failed (answering 404): {e:#}");
-                return StatusCode::NOT_FOUND.into_response();
+                return miss();
             }
         }
     };
@@ -173,12 +178,12 @@ async fn get_narinfo(State(st): State<Arc<ProxyState>>, UrlPath(file): UrlPath<S
             // Roaming epoch: a recent min_bandwidth abort means big paths should go straight
             // to the builder — refuse at lookup time.
             if st.fetch.refuses_while_roaming(row.info.nar_size) {
-                return StatusCode::NOT_FOUND.into_response();
+                return miss();
             }
             ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], rewrite_for_client(&row.info))
                 .into_response()
         }
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => miss(),
     }
 }
 
@@ -188,13 +193,18 @@ async fn get_nar(
     method: axum::http::Method,
     headers: HeaderMap,
 ) -> Response {
+    st.fetch.stats.nar_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let miss = || {
+        st.fetch.stats.nar_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        StatusCode::NOT_FOUND.into_response()
+    };
     let nar_hash: [u8; 32] = match file
         .strip_suffix(".nar")
         .and_then(|h| nixbase32::decode(h, 32))
         .map(|v| <[u8; 32]>::try_from(v).unwrap())
     {
         Some(h) => h,
-        None => return StatusCode::NOT_FOUND.into_response(),
+        None => return miss(),
     };
     let rows = {
         let index = st.index.clone();
@@ -205,7 +215,7 @@ async fn get_nar(
             Ok(rows) => rows,
             Err(e) => {
                 error!("index lookup failed (answering 404): {e:#}");
-                return StatusCode::NOT_FOUND.into_response();
+                return miss();
             }
         }
     };
@@ -213,7 +223,7 @@ async fn get_nar(
     // them is a byte source for the same NAR. Union the sources; take metadata from the row
     // with the widest holder set.
     let Some(best) = rows.iter().max_by_key(|r| r.holders.len()) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return miss();
     };
     let mut sources = Vec::new();
     for row in &rows {
@@ -224,12 +234,12 @@ async fn get_nar(
         }
     }
     if sources.is_empty() {
-        return StatusCode::NOT_FOUND.into_response();
+        return miss();
     }
 
     let size = best.info.nar_size;
     if st.fetch.refuses_while_roaming(size) {
-        return StatusCode::NOT_FOUND.into_response();
+        return miss();
     }
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let (start, end, status) = match parse_range(range, size) {

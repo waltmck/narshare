@@ -128,6 +128,13 @@ pub struct Stats {
     /// Transfers that ran from a manifest plan (vs plain striping).
     pub manifest_plans: AtomicU64,
 
+    // Proxy lookup counters — the observable that answers "did nix even ask us, and what
+    // did we say" (its absence made a production 404-vs-not-consulted question unanswerable).
+    pub narinfo_requests: AtomicU64,
+    pub narinfo_misses: AtomicU64,
+    pub nar_requests: AtomicU64,
+    pub nar_misses: AtomicU64,
+
     /// Hedged (duplicate) attempts launched — the insurance spend, in requests…
     pub hedges: AtomicU64,
     /// …its exact byte premium, counted at LAUNCH (one of the two copies is always

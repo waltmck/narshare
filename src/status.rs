@@ -80,6 +80,12 @@ async fn status(State(ctx): State<Arc<StatusCtx>>) -> Response {
                 "observations": observations,
             },
             "roaming_ms_remaining": st.fetch.roaming_ms_remaining(),
+            "lookups": {
+                "narinfo": s.narinfo_requests.load(Relaxed),
+                "narinfo_misses": s.narinfo_misses.load(Relaxed),
+                "nar": s.nar_requests.load(Relaxed),
+                "nar_misses": s.nar_misses.load(Relaxed),
+            },
             "transfers": {
                 "active": s.active_transfers(),
                 "started": s.transfers_started.load(Relaxed),

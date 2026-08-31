@@ -31,6 +31,16 @@ use tracing::{debug, info, warn};
 /// heals with no new writes (hints only fire on changes) — and an up-to-date round trip is
 /// under a kilobyte, so a tight timer costs nothing even on cellular.
 const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// While a peer's origin is entirely UNKNOWN (generation 0) and the process is young, pull on
+/// this tight cadence instead. A freshly wiped cache (layout migration, cache loss, first
+/// boot) otherwise leaves a multi-minute window where the proxy serves 404s for paths a
+/// perfectly reachable peer holds — measured in production: a propnix FOD went to a
+/// credential-demanding BUILD five minutes after a layout migration because the 60 s cadence
+/// had not yet resynced the only holder. Dead peers stay cheap: the breaker still gates the
+/// actual pulls, so the fast tick mostly no-ops against them.
+const CATCHUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long after startup the catch-up cadence may apply.
+const CATCHUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(180);
 /// Own-db diff cadence when inotify is unavailable (and the safety-net re-scan besides).
 const OWN_DB_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Burst coalescing for db events, LEADING-edge: the first event triggers a diff after at most
@@ -54,6 +64,8 @@ pub struct Sync {
     kick_rxs: std::sync::Mutex<Vec<Option<mpsc::Receiver<()>>>>,
     hint_tx: mpsc::Sender<()>,
     hint_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+    /// Process start, for the catch-up cadence window.
+    started: std::time::Instant,
     /// The nix db's data_version as of the last completed diff (i64::MIN = never diffed).
     /// The differ's cheap gate: PRAGMA data_version moves only when another connection
     /// COMMITS, so timer rescans and reader-generated inotify chatter on an unchanged store
@@ -102,6 +114,7 @@ impl Sync {
             kick_rxs: std::sync::Mutex::new(kick_rxs),
             hint_tx,
             hint_rx: std::sync::Mutex::new(Some(hint_rx)),
+            started: std::time::Instant::now(),
             last_data_version: std::sync::atomic::AtomicI64::new(i64::MIN),
             stats: SyncStats::default(),
         })
@@ -198,7 +211,13 @@ impl Sync {
                         Some(proto::origin_update::Body::Snapshot(snap)) => {
                             let n =
                                 index.apply_snapshot(&origin, up.generation, up.seq, &snap.held)?;
-                            debug!("origin {origin}: snapshot applied ({n} rows)");
+                            // INFO, deliberately: snapshot applies are rare, major state
+                            // transitions, and the one timestamp that answers "when did this
+                            // node learn that origin" during an incident.
+                            info!(
+                                "origin {origin}: snapshot applied ({n} rows, gen {}, seq {})",
+                                up.generation, up.seq
+                            );
                             Ok((true, false, 0, true))
                         }
                     }
@@ -283,17 +302,50 @@ impl Sync {
         mut kick: mpsc::Receiver<()>,
         mut shutdown: watch::Receiver<()>,
     ) {
+        let mut was_ok = true;
         loop {
             if self.peers.list[idx].available() {
                 match self.pull_from(idx).await {
-                    Ok(true) => self.hint_peers(), // news travels transitively
-                    Ok(false) => {}
-                    Err(e) => debug!("sync with {}: {e:#}", self.peers.list[idx].name),
+                    Ok(changed) => {
+                        if !was_ok {
+                            info!("sync with {} recovered", self.peers.list[idx].name);
+                        }
+                        was_ok = true;
+                        if changed {
+                            self.hint_peers(); // news travels transitively
+                        }
+                    }
+                    Err(e) => {
+                        // WARN on the TRANSITION into failure only (a dead peer's steady
+                        // failures stay at debug): a pull that reaches the peer but dies in
+                        // decode/apply was previously invisible at info — which made a
+                        // production "the index stayed empty for 5+ minutes while the peer
+                        // was reachable" incident undiagnosable from the journal.
+                        if was_ok {
+                            warn!("sync with {} failing: {e:#}", self.peers.list[idx].name);
+                        } else {
+                            debug!("sync with {}: {e:#}", self.peers.list[idx].name);
+                        }
+                        was_ok = false;
+                    }
                 }
             }
+            // Catch-up: an origin we know NOTHING about yet gets chased tightly while the
+            // process is young (see CATCHUP_INTERVAL).
+            let interval = if self.started.elapsed() < CATCHUP_WINDOW
+                && self
+                    .index
+                    .origin_clock(&self.peers.list[idx].name)
+                    .map(|(g, _)| g == 0)
+                    .unwrap_or(false)
+            {
+                CATCHUP_INTERVAL
+            } else {
+                SYNC_INTERVAL
+            };
             tokio::select! {
                 _ = shutdown.changed() => return,
-                _ = tokio::time::sleep(SYNC_INTERVAL) => {}
+                _ = tokio::time::sleep(interval) => {}
                 Some(()) = kick.recv() => {
                     // Pull immediately; queued repeats coalesce (an up-to-date pull is <1 KB,
                     // so an extra round costs nothing).
