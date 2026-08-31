@@ -96,6 +96,11 @@ in
     nix.settings = lib.mkIf (cfg.addToSubstituters && cfg.config ? proxy) {
       substituters = [ "http://${cfg.config.proxy.listen}" ];
       fallback = true;
+      # Nix caches narinfo 404s for an hour by default. Mesh holdings change
+      # minute-to-minute (a peer wakes, resyncs, or indexes a fresh build), so a
+      # cached miss turns "retry now that the peer is up" into a silent hour-long
+      # outage for that path. Re-querying the local proxy is nearly free.
+      narinfo-cache-negative-ttl = lib.mkDefault 30;
     };
   };
 }
