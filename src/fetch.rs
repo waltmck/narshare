@@ -69,11 +69,14 @@ const MAX_FAILURE_STREAK: u32 = 30;
 /// asymptotically stable weights are unchanged by hedging. ν shapes how tightly the insurance
 /// concentrates on collapsed weights.
 ///
-/// ν tuned empirically (mw_tune_sweep): ν=1 (the linear ramp) beat ν=3 and ν=6 on uninsured
-/// tails in every η row (1 vs 4 vs 8 per 100 at η=0.7) at no measurable duplicate cost —
-/// hedge chunks are sized for the SLOW peer, so broad insurance is nearly free; larger ν only
-/// re-exposes the drifted mid-weight picks the insurance exists for.
-const HEDGE_NU: f64 = 1.0;
+/// ν tuned empirically, twice. The first sweep (at SHARE=0.02, with a waste counter that
+/// missed losers landing post-transfer) favored ν=1; re-measured at the adopted SHARE=0.005
+/// with the launch-time hedge_bytes premium (mw_hedge_cost), the linear ramp pays a ~3.5%
+/// duplicate-byte premium at WEIGHT PARITY — where the "slow" peer is not slow and duplicates
+/// are full-size chunks — for zero tail benefit (0-1 tails/100 at every ν∈{1,2,3}: with the
+/// drift tamed, the floor anchor h(W_MIN)=1, not ν, carries the ping insurance). ν=3
+/// concentrates the premium to ~0 at parity while keeping floor pings fully insured.
+const HEDGE_NU: f64 = 3.0;
 
 fn hedge_prob(n: usize, share: f64, floor_share: f64, nu: f64) -> f64 {
     let uniform = 1.0 / n as f64;
@@ -127,7 +130,12 @@ pub struct Stats {
 
     /// Hedged (duplicate) attempts launched — the insurance spend, in requests…
     pub hedges: AtomicU64,
-    /// …and the bytes a losing twin delivered after its range was already served (discarded).
+    /// …its exact byte premium, counted at LAUNCH (one of the two copies is always
+    /// discarded, so every hedged launch costs its length in duplicate wire — counting
+    /// observed losers instead undercounts, because losers landing after their transfer
+    /// ended are never seen by the accounting loop)…
+    pub hedge_bytes: AtomicU64,
+    /// …and the bytes of losing twins the transfer loop actually observed and discarded.
     pub hedged_waste_bytes: AtomicU64,
 }
 
@@ -1148,6 +1156,7 @@ pub async fn run_transfer(
             }
             if let Some(slot) = partner_slot {
                 ctx.stats.hedges.fetch_add(1, Ordering::Relaxed);
+                ctx.stats.hedge_bytes.fetch_add(len, Ordering::Relaxed);
                 next_attempt += 1;
                 let peer = slot.peer;
                 let d_at = spawn_attempt(&mut workers, peer, slot, next_attempt, true);

@@ -153,10 +153,16 @@ its LAST attempt dies undelivered, and a losing twin's bytes are dropped (counte
 capability swap + warm striped 64:1 and 2:1): grid η ∈ {0.4, 0.7, 1.2} × ν ∈ {1, 3, 6}, plus
 supplementary fixed-share rows.
 
-- **ν = 1** (the linear ramp) beat ν = 3 and ν = 6 on uninsured tails in every η row (1 vs 4
-  vs 8 per 100 at η = 0.7) at no measurable cost — hedge chunks are sized for the slow peer,
-  so broad insurance is nearly free, and larger ν only re-exposes the drifted mid-weight picks
-  the insurance exists for.
+- **ν = 3** — a conclusion that took two rounds of measurement to get right. The first sweep
+  (at SHARE = 0.02, with a waste counter that missed losers landing after their transfer
+  ended) favored ν = 1: the linear ramp cut tails 1 vs 4 vs 8 per 100 because drift-inflated
+  mid-weights dominated. Re-measured at the adopted SHARE = 0.005 with the launch-time
+  `hedge_bytes` premium (`mw_hedge_cost`), ν = 1 pays a **3.5% duplicate-byte premium at
+  weight parity** — where the "slow" peer is not slow and duplicates are full-size chunks;
+  it first surfaced as a byte-exact accounting test flaking on a double-fetched chunk — for
+  zero tail benefit (0–1 tails/100 at every ν ∈ {1,2,3}: with the drift tamed, the floor
+  anchor h(W_MIN) = 1, not ν, carries the ping insurance). ν = 3 concentrates the premium to
+  ~0 at parity while keeping floor pings fully insured.
 - **η = 0.7** stands: 1.2 collapses and tracks faster (stale picks 12 vs 18) but dents the
   warm striped median (79–83%); 0.4 loses to drift everywhere.
 - **The binding constraint was the fixed-share drift, not η or ν.** At SHARE = 0.02 with two

@@ -931,9 +931,50 @@ mod tests {
         let worst = sorted[4];
         let w_slow = client.state.fetch.pool.snapshot().0[1];
         let s = &client.state.fetch.stats;
-        let waste_pct = 100.0 * s.hedged_waste_bytes.load(Ordering::Relaxed) as f64
+        // Premium counted at hedge LAUNCH: observed-loser bytes undercount (losers landing
+        // after their transfer ended are invisible to the accounting loop).
+        let waste_pct = 100.0 * s.hedge_bytes.load(Ordering::Relaxed) as f64
             / s.remote_bytes.load(Ordering::Relaxed).max(1) as f64;
         (median_pct, worst, w_slow, waste_pct)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // measurement bench: cargo test --release mw_hedge_cost -- --ignored --nocapture
+    async fn mw_hedge_cost() {
+        // The insurance premium near WEIGHT PARITY: with the linear ramp (nu=1), a peer whose
+        // weight jitters microscopically below uniform still hedges a few percent of draws —
+        // and near parity the "slow" peer is not slow, so duplicates are full-size chunks.
+        // Measured with the launch-time hedge_bytes counter (the sweep's original waste
+        // column undercounted: losers landing post-transfer were never observed).
+        const MB: u64 = 1_000_000;
+        for nu in [1.0f64, 2.0, 3.0] {
+            let link_a = FluidLink::new(32 * MB);
+            let link_b = FluidLink::new(32 * MB);
+            let small = bytes::Bytes::from(vec![0x37u8; 256 * 1024]);
+            let url_a = spawn_router(throttled_peer(link_a.clone(), small.clone())).await;
+            let url_b = spawn_router(throttled_peer(link_b.clone(), small.clone())).await;
+            let client =
+                spawn_client("c", &[("a", &url_a), ("b", &url_b)], "", TrustedKeys::none())
+                    .await;
+            client.state.fetch.set_nu(nu);
+            let nar32 = seed_two_holders(&client, &small, "par");
+            let http = reqwest::Client::new();
+            let url = format!("{}/nar/{nar32}.nar", client.url);
+            for _ in 0..300 {
+                let b = http.get(&url).send().await.unwrap().bytes().await.unwrap();
+                assert_eq!(b.len(), small.len());
+            }
+            let s = &client.state.fetch.stats;
+            let seq_premium = 100.0 * s.hedge_bytes.load(Ordering::Relaxed) as f64
+                / s.remote_bytes.load(Ordering::Relaxed).max(1) as f64;
+            let (med11, _, _, striped_premium) =
+                tune_striped_cell(0.7, nu, 0.005, 32 * MB, 32 * MB, 3).await;
+            let (_, _, tails, _, _) = tune_seq_cell(0.7, nu, 0.005).await;
+            println!(
+                "[hedge] nu={nu}: parity premium seq {seq_premium:.2}% / striped-1:1 \
+                 {striped_premium:.2}% (med {med11:.0}% of single); 64:1 tails {tails}/100"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1349,6 +1390,11 @@ mod tests {
         )
         .await;
         client.sync_all().await;
+        // This test asserts BYTE-EXACT striping accounting; hedged duplicates (which fire
+        // stochastically even near weight parity and double-fetch a chunk by design) would
+        // flake it. Hedging has its own tests — disable it here: h = ratio^∞ is 0 below the
+        // floor anchor, and the exact-floor case cannot occur with a fresh pool.
+        client.state.fetch.set_nu(f64::INFINITY);
         let http = reqwest::Client::new();
 
         let nar32 = crate::nixbase32::encode(&nar_hash);
