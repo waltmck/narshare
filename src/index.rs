@@ -44,7 +44,7 @@ pub mod proto {
 
 /// On-disk layout version. The cache is disposable by design, so a mismatch (or the pre-shard
 /// single-file layout) wipes the directory and lets the mesh resync — no migrations.
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "3";
 /// Journal rows retained per origin beyond the min-watermark rule — the backstop that keeps one
 /// dead or long-offline peer from pinning the journal forever. Stragglers land on the snapshot
 /// path, which must exist anyway.
@@ -262,11 +262,28 @@ impl Index {
                      hash_part TEXT NOT NULL,
                      nar_hash BLOB NOT NULL,
                      nar_size INTEGER NOT NULL,
-                     refs TEXT NOT NULL,
                      ca TEXT NOT NULL,
                      sigs TEXT NOT NULL);
                  CREATE INDEX IF NOT EXISTS paths_hash ON paths(hash_part);
                  CREATE INDEX IF NOT EXISTS paths_nar ON paths(nar_hash);
+                 -- References normalized: interned basenames + an ordered edge table.
+                 -- Refs text averaged 60% of a denormalized row (445B of ~730B measured on a
+                 -- 100k-path store) and the same names repeat across thousands of rows. ord
+                 -- preserves the received order byte-exactly: refs participate in the signature
+                 -- fingerprint, so rows must round-trip without re-sorting. names rows are
+                 -- never GC'd (a name is ~35B; shards are disposable and wipe on migration).
+                 CREATE TABLE IF NOT EXISTS names (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL UNIQUE);
+                 CREATE TABLE IF NOT EXISTS refs (
+                     path_id INTEGER NOT NULL,
+                     ord INTEGER NOT NULL,
+                     name_id INTEGER NOT NULL,
+                     PRIMARY KEY (path_id, ord)) WITHOUT ROWID;
+                 CREATE TRIGGER IF NOT EXISTS paths_del AFTER DELETE ON paths
+                 BEGIN
+                     DELETE FROM refs WHERE path_id = OLD.rowid;
+                 END;
                  CREATE TABLE IF NOT EXISTS journal (
                      seq INTEGER PRIMARY KEY,
                      event BLOB NOT NULL);",
@@ -588,7 +605,7 @@ impl Index {
             // older state would silently drop the newer events.
             return Ok(0);
         }
-        tx.execute_batch("DELETE FROM paths; DELETE FROM journal;")?;
+        tx.execute_batch("DELETE FROM refs; DELETE FROM names; DELETE FROM paths; DELETE FROM journal;")?;
         let mut inserted = 0usize;
         for (n, feas) in held.iter().zip(&feasible) {
             if !feas {
@@ -775,7 +792,9 @@ impl Index {
     pub fn lookup_hash_part(&self, hash_part: &str) -> Result<Vec<Found>> {
         self.lookup_merged(|conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT store_path, nar_hash, nar_size, refs, ca, sigs FROM paths \
+                "SELECT store_path, nar_hash, nar_size, (SELECT coalesce(group_concat(nm.name, ' ' ORDER BY r.ord), '') \
+                      FROM refs r JOIN names nm ON nm.id = r.name_id \
+                      WHERE r.path_id = paths.rowid) AS refs, ca, sigs FROM paths \
                  WHERE hash_part = ?1",
             )?;
             let v = stmt
@@ -789,7 +808,9 @@ impl Index {
     pub fn lookup_nar_hash(&self, nar_hash: &[u8; 32]) -> Result<Vec<Found>> {
         self.lookup_merged(|conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT store_path, nar_hash, nar_size, refs, ca, sigs FROM paths \
+                "SELECT store_path, nar_hash, nar_size, (SELECT coalesce(group_concat(nm.name, ' ' ORDER BY r.ord), '') \
+                      FROM refs r JOIN names nm ON nm.id = r.name_id \
+                      WHERE r.path_id = paths.rowid) AS refs, ca, sigs FROM paths \
                  WHERE nar_hash = ?1",
             )?;
             let v = stmt
@@ -1062,19 +1083,38 @@ fn upsert_path_tx(tx: &Connection, n: &proto::Narinfo) -> Result<()> {
         .get(..32)
         .unwrap_or("")
         .to_owned();
+    // ON CONFLICT UPDATE, not OR REPLACE: REPLACE deletes and reinserts, which would move
+    // the rowid the refs edges are keyed by (and fire the cleanup trigger under the row).
     tx.execute(
-        "INSERT OR REPLACE INTO paths (store_path, hash_part, nar_hash, nar_size, refs, ca, sigs)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO paths (store_path, hash_part, nar_hash, nar_size, ca, sigs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (store_path) DO UPDATE SET
+             hash_part = excluded.hash_part, nar_hash = excluded.nar_hash,
+             nar_size = excluded.nar_size, ca = excluded.ca, sigs = excluded.sigs",
         params![
             n.store_path,
             hash_part,
             n.nar_hash,
             n.nar_size as i64,
-            n.references.join(" "),
             n.ca,
             n.sigs.join(" ")
         ],
     )?;
+    let path_id: i64 = tx.query_row(
+        "SELECT rowid FROM paths WHERE store_path = ?1",
+        [&n.store_path],
+        |r| r.get(0),
+    )?;
+    tx.prepare_cached("DELETE FROM refs WHERE path_id = ?1")?.execute([path_id])?;
+    let mut intern = tx.prepare_cached("INSERT OR IGNORE INTO names (name) VALUES (?1)")?;
+    let mut edge = tx.prepare_cached(
+        "INSERT INTO refs (path_id, ord, name_id)
+         VALUES (?1, ?2, (SELECT id FROM names WHERE name = ?3))",
+    )?;
+    for (ord, name) in n.references.iter().enumerate() {
+        intern.execute([name])?;
+        edge.execute(params![path_id, ord as i64, name])?;
+    }
     Ok(())
 }
 
@@ -1095,7 +1135,9 @@ fn row_to_narinfo(r: &rusqlite::Row) -> rusqlite::Result<proto::Narinfo> {
 
 fn snapshot_rows(conn: &Connection) -> Result<Vec<proto::Narinfo>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT store_path, nar_hash, nar_size, refs, ca, sigs FROM paths",
+        "SELECT store_path, nar_hash, nar_size, (SELECT coalesce(group_concat(nm.name, ' ' ORDER BY r.ord), '') \
+                      FROM refs r JOIN names nm ON nm.id = r.name_id \
+                      WHERE r.path_id = paths.rowid) AS refs, ca, sigs FROM paths",
     )?;
     let v = stmt
         .query_map([], row_to_narinfo)?
@@ -1172,6 +1214,29 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].holders, vec!["a".to_string()]);
         assert_eq!(rows[0].info.nar_hash, [2u8; 32]);
+    }
+
+    #[test]
+    fn normalized_refs_round_trip_in_order_and_replace_on_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = idx(dir.path(), "b", &["a"]);
+        // Deliberately NOT sorted: refs participate in the signature fingerprint, so the
+        // edge table must reproduce the received order byte-exactly, never re-sort.
+        let mut n = ni("-p", 1);
+        n.references = vec!["zzz-late".into(), "aaa-early".into(), "mmm-mid".into()];
+        assert!(matches!(b.apply_suffix("a", 1, &[add(1, n)]).unwrap(), Apply::Applied(1)));
+        let found = b.lookup_hash_part(&"x".repeat(32)).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].info.references, ["zzz-late", "aaa-early", "mmm-mid"]);
+
+        // Re-adding the path with different refs must fully replace its edges — a shrunken
+        // list must not leave stale tail edges behind.
+        let mut n2 = ni("-p", 2);
+        n2.references = vec!["only-one".into()];
+        assert!(matches!(b.apply_suffix("a", 1, &[add(2, n2)]).unwrap(), Apply::Applied(1)));
+        let found = b.lookup_hash_part(&"x".repeat(32)).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].info.references, ["only-one"]);
     }
 
     #[test]
