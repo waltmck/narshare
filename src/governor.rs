@@ -106,7 +106,11 @@ impl Governor {
         self.samples.clear();
 
         if let Some(prev) = self.prev {
-            let change = if prev > 0.0 { (reading - prev) / prev } else { 1.0 };
+            let change = if prev > 0.0 {
+                (reading - prev) / prev
+            } else {
+                1.0
+            };
             if change < -NOISE {
                 self.dir = -self.dir; // that step made things worse — turn round
             } else if change.abs() <= NOISE {
@@ -116,7 +120,11 @@ impl Governor {
         }
         self.prev = Some(reading);
 
-        let factor = if self.dir > 0.0 { STEP_UP } else { 1.0 / STEP_UP };
+        let factor = if self.dir > 0.0 {
+            STEP_UP
+        } else {
+            1.0 / STEP_UP
+        };
         let mut next = self.limit * factor;
         // A probe must move the thing it measures: the workers use the ROUNDED limit, so where a
         // multiplicative step rounds to the same integer, force the integer to move — otherwise
@@ -153,7 +161,10 @@ mod tests {
             g.observe(t, Pressure::Network, 32, 0);
         }
         let settled = g.limit();
-        assert!(settled >= knee / 2 && settled <= knee * 3, "expected ~{knee}, got {settled}");
+        assert!(
+            settled >= knee / 2 && settled <= knee * 3,
+            "expected ~{knee}, got {settled}"
+        );
     }
 
     #[test]
@@ -244,7 +255,11 @@ mod tests {
         for _ in 0..10 {
             g.observe(50.0, Pressure::Network, 0, 1);
         }
-        assert!(g.limit() >= 24, "a 1-event epoch must not back off, fell to {}", g.limit());
+        assert!(
+            g.limit() >= 24,
+            "a 1-event epoch must not back off, fell to {}",
+            g.limit()
+        );
     }
 
     #[test]

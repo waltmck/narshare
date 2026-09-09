@@ -80,7 +80,9 @@ impl TrustedKeys {
         let mut extra: Vec<String> = Vec::new();
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
-            let Some((k, v)) = line.split_once('=') else { continue };
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
             match k.trim() {
                 "trusted-public-keys" | "binary-cache-public-keys" => {
                     base = Some(v.split_whitespace().map(str::to_owned).collect());
@@ -96,28 +98,6 @@ impl TrustedKeys {
         Ok(Self::parse(&entries))
     }
 
-    /// A stable digest of the key set (order-independent). The index stores it so a CHANGED
-    /// anchor at startup can force a full peer resync: events applied under the old anchor may
-    /// have been skipped as infeasible, and those rows would otherwise stay missing until their
-    /// origin happened to re-export them.
-    pub fn anchor_digest(&self) -> String {
-        use sha2::{Digest, Sha256};
-        let mut entries: Vec<String> = self
-            .keys
-            .iter()
-            .map(|(name, pk)| {
-                format!("{name}:{}", base64::engine::general_purpose::STANDARD.encode(**pk))
-            })
-            .collect();
-        entries.sort();
-        let mut h = Sha256::new();
-        for e in &entries {
-            h.update(e.as_bytes());
-            h.update(b"\n");
-        }
-        hex::encode(h.finalize())
-    }
-
     /// Does any of this narinfo's signatures verify under any trusted key? Key names must match
     /// AND the ed25519 signature must check out over the fingerprint — a name alone is
     /// spoofable, and a corrupt signature would only be rejected by nix after the whole
@@ -128,11 +108,15 @@ impl TrustedKeys {
         }
         let fp = fingerprint(info);
         for sig in &info.sigs {
-            let Some((name, b64)) = sig.split_once(':') else { continue };
+            let Some((name, b64)) = sig.split_once(':') else {
+                continue;
+            };
             let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) else {
                 continue;
             };
-            let Ok(sig) = ed25519_compact::Signature::from_slice(&raw) else { continue };
+            let Ok(sig) = ed25519_compact::Signature::from_slice(&raw) else {
+                continue;
+            };
             for (kname, pk) in &self.keys {
                 if kname == name && pk.verify(fp.as_bytes(), &sig).is_ok() {
                     return true;
@@ -146,9 +130,16 @@ impl TrustedKeys {
 /// The signed fingerprint, exactly as nix computes it (path-info.cc): references are FULL store
 /// paths, sorted; the store dir is taken from the path itself (the narinfo carries basenames).
 pub(crate) fn fingerprint(info: &RemoteNarinfo) -> String {
-    let store_dir = info.store_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("/nix/store");
-    let mut refs: Vec<String> =
-        info.references.iter().map(|b| format!("{store_dir}/{b}")).collect();
+    let store_dir = info
+        .store_path
+        .rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or("/nix/store");
+    let mut refs: Vec<String> = info
+        .references
+        .iter()
+        .map(|b| format!("{store_dir}/{b}"))
+        .collect();
     refs.sort();
     format!(
         "1;{};sha256:{};{};{}",
@@ -192,7 +183,10 @@ mod tests {
     fn verifies_a_real_cache_nixos_org_signature() {
         let keys = TrustedKeys::parse(&[NIX_DEFAULT_KEY.to_owned()]);
         assert_eq!(keys.len(), 1);
-        assert!(keys.any_sig_valid(&golden()), "fingerprint must match nix's exactly");
+        assert!(
+            keys.any_sig_valid(&golden()),
+            "fingerprint must match nix's exactly"
+        );
     }
 
     #[test]
@@ -200,7 +194,10 @@ mod tests {
         let keys = TrustedKeys::parse(&[NIX_DEFAULT_KEY.to_owned()]);
         // Untrusted key name.
         let mut info = golden();
-        info.sigs = vec![format!("evil-1:{}", golden().sigs[0].split_once(':').unwrap().1)];
+        info.sigs = vec![format!(
+            "evil-1:{}",
+            golden().sigs[0].split_once(':').unwrap().1
+        )];
         assert!(!keys.any_sig_valid(&info));
         // Corrupt signature bytes.
         let mut info = golden();

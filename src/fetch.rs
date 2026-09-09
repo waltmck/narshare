@@ -184,7 +184,10 @@ impl PeerLimit {
     fn new(max: usize) -> Self {
         let start = 2.min(max);
         Self {
-            state: Mutex::new(LimState { inflight: 0, limit: start }),
+            state: Mutex::new(LimState {
+                inflight: 0,
+                limit: start,
+            }),
             governor: Mutex::new(Governor::new(start, 1, max)),
             epoch: Mutex::new(Epoch {
                 started: Instant::now(),
@@ -232,13 +235,25 @@ impl PeerLimit {
         if e.started.elapsed() >= EPOCH {
             let secs = e.started.elapsed().as_secs_f64();
             let throughput = e.bytes as f64 / secs;
-            let pressure =
-                if e.blocked && e.bytes == 0 { Pressure::ConsumerBound } else { Pressure::Network };
+            let pressure = if e.blocked && e.bytes == 0 {
+                Pressure::ConsumerBound
+            } else {
+                Pressure::Network
+            };
             let (ok_n, err_n) = (e.ok, e.err);
-            *e = Epoch { started: Instant::now(), bytes: 0, ok: 0, err: 0, blocked: false };
+            *e = Epoch {
+                started: Instant::now(),
+                bytes: 0,
+                ok: 0,
+                err: 0,
+                blocked: false,
+            };
             drop(e);
-            let new_limit =
-                self.governor.lock().unwrap().observe(throughput, pressure, ok_n, err_n);
+            let new_limit = self
+                .governor
+                .lock()
+                .unwrap()
+                .observe(throughput, pressure, ok_n, err_n);
             self.state.lock().unwrap().limit = new_limit;
         }
     }
@@ -320,9 +335,16 @@ impl FetchCtx {
         let n = peer_cfgs.len().max(1);
         Self {
             pool: crate::pool::HostPool::new(n),
-            limits: (0..n).map(|_| PeerLimit::new(cfg.per_peer_connections.max(1))).collect(),
+            limits: (0..n)
+                .map(|_| PeerLimit::new(cfg.per_peer_connections.max(1)))
+                .collect(),
             net: (0..n)
-                .map(|_| Mutex::new(PeerNet { rate: 0.0, level: ENC_SEED }))
+                .map(|_| {
+                    Mutex::new(PeerNet {
+                        rate: 0.0,
+                        level: ENC_SEED,
+                    })
+                })
                 .collect(),
             tally: (0..n).map(|_| PeerTally::default()).collect(),
             encodings: peer_cfgs.iter().map(|p| p.encoding.clone()).collect(),
@@ -364,7 +386,11 @@ impl FetchCtx {
         }
         let r = bytes as f64 / secs;
         let mut net = self.net[peer].lock().unwrap();
-        net.rate = if net.rate == 0.0 { r } else { 0.7 * net.rate + 0.3 * r };
+        net.rate = if net.rate == 0.0 {
+            r
+        } else {
+            0.7 * net.rate + 0.3 * r
+        };
     }
 
     fn chunk_size(&self, peer: usize) -> u64 {
@@ -418,7 +444,11 @@ impl FetchCtx {
                 // The peer's disk is the pacer: the level can neither help nor hurt. Hold.
             } else if u_enc < ENC_CLIMB_BELOW && u_dec < ENC_SATURATED {
                 // Wire-bound with encoder slack: buy ratio with idle CPU.
-                let step = if u_enc < ENC_SLACK { ENC_STEP_UP_FAST } else { ENC_STEP_UP };
+                let step = if u_enc < ENC_SLACK {
+                    ENC_STEP_UP_FAST
+                } else {
+                    ENC_STEP_UP
+                };
                 net.level = (net.level + step).min(ENC_MAX);
             }
             return;
@@ -433,7 +463,11 @@ impl FetchCtx {
             // The peer's disk is the bottleneck: the level can neither help nor hurt. Hold.
         } else if enc < transfer * ENC_CLIMB_BELOW && decode < transfer {
             // The wire is the bottleneck and compression has slack: buy ratio with idle CPU.
-            let step = if enc < transfer * ENC_SLACK { ENC_STEP_UP_FAST } else { ENC_STEP_UP };
+            let step = if enc < transfer * ENC_SLACK {
+                ENC_STEP_UP_FAST
+            } else {
+                ENC_STEP_UP
+            };
             net.level = (net.level + step).min(ENC_MAX);
         }
         // Otherwise: near the knee — hold.
@@ -494,8 +528,11 @@ impl FetchCtx {
         if self.cfg_min_bw == 0 {
             return false;
         }
-        let active =
-            self.roaming_until.lock().unwrap().is_some_and(|until| Instant::now() < until);
+        let active = self
+            .roaming_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| Instant::now() < until);
         active && nar_size > self.threshold_bytes()
     }
 
@@ -513,7 +550,10 @@ enum SpanExec {
     Lit { lit_off: usize, len: u64 },
     /// Bytes fetched from peers, emitted as they stream in; buffered whole only when later
     /// occurrences will replay them.
-    Fetch { len: u64, retain: Option<(usize, usize)> },
+    Fetch {
+        len: u64,
+        retain: Option<(usize, usize)>,
+    },
     /// A later occurrence of a retained segment.
     Replay { unique: usize, len: u64 },
 }
@@ -528,7 +568,13 @@ struct Plan {
 
 fn fallback_plan(start: u64, end: u64) -> Plan {
     Plan {
-        spans: vec![(start, SpanExec::Fetch { len: end - start, retain: None })],
+        spans: vec![(
+            start,
+            SpanExec::Fetch {
+                len: end - start,
+                retain: None,
+            },
+        )],
         lits: Bytes::new(),
         ranges: vec![(start, end - start)],
     }
@@ -536,13 +582,22 @@ fn fallback_plan(start: u64, end: u64) -> Plan {
 
 /// Turn a manifest into an execution plan: literals local, distinct segments fetched once,
 /// duplicates replayed under the retention budget. `window` bounds the largest verifiable span.
-fn manifest_plan(m: &Manifest, info: &RemoteNarinfo, budget: u64, window: u64) -> anyhow::Result<Plan> {
+fn manifest_plan(
+    m: &Manifest,
+    info: &RemoteNarinfo,
+    budget: u64,
+    window: u64,
+) -> anyhow::Result<Plan> {
     if m.nar_hash != format!("sha256:{}", nixbase32::encode(&info.nar_hash)) {
         anyhow::bail!("manifest narhash disagrees with narinfo");
     }
     let layout = manifest::synth_layout(m)?;
     if layout.nar_size != info.nar_size {
-        anyhow::bail!("manifest NarSize {} != narinfo {}", layout.nar_size, info.nar_size);
+        anyhow::bail!(
+            "manifest NarSize {} != narinfo {}",
+            layout.nar_size,
+            info.nar_size
+        );
     }
 
     // Dedup plan over the segment occurrences, in NAR order. The hashes are dedup KEYS, not
@@ -559,7 +614,11 @@ fn manifest_plan(m: &Manifest, info: &RemoteNarinfo, budget: u64, window: u64) -
     for span in &layout.spans {
         if let SpanKind::Segment { hash } = &span.kind {
             if span.len > window {
-                anyhow::bail!("manifest segment ({} B) exceeds window ({} B)", span.len, window);
+                anyhow::bail!(
+                    "manifest segment ({} B) exceeds window ({} B)",
+                    span.len,
+                    window
+                );
             }
             if let Some(&prev) = len_of.get(hash) {
                 if prev != span.len {
@@ -579,9 +638,13 @@ fn manifest_plan(m: &Manifest, info: &RemoteNarinfo, budget: u64, window: u64) -
     let mut seg_i = 0;
     for span in &layout.spans {
         match &span.kind {
-            SpanKind::Lit { lit_off } => {
-                spans.push((span.nar_off, SpanExec::Lit { lit_off: *lit_off, len: span.len }))
-            }
+            SpanKind::Lit { lit_off } => spans.push((
+                span.nar_off,
+                SpanExec::Lit {
+                    lit_off: *lit_off,
+                    len: span.len,
+                },
+            )),
             SpanKind::Segment { .. } => {
                 let step = steps[seg_i];
                 seg_i += 1;
@@ -605,14 +668,22 @@ fn manifest_plan(m: &Manifest, info: &RemoteNarinfo, budget: u64, window: u64) -
                             _ => ranges.push((span.nar_off, span.len)),
                         }
                     }
-                    dedup::Step::Cached { unique } => {
-                        spans.push((span.nar_off, SpanExec::Replay { unique, len: span.len }))
-                    }
+                    dedup::Step::Cached { unique } => spans.push((
+                        span.nar_off,
+                        SpanExec::Replay {
+                            unique,
+                            len: span.len,
+                        },
+                    )),
                 }
             }
         }
     }
-    Ok(Plan { spans, lits: layout.lits, ranges })
+    Ok(Plan {
+        spans,
+        lits: layout.lits,
+        ranges,
+    })
 }
 
 // ------------------------------------------------------------------------------------------
@@ -737,7 +808,9 @@ impl Emitter {
                     if remaining == 0 {
                         self.held.remove(&unique);
                     }
-                    stats.replayed_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    stats
+                        .replayed_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     self.emit(out, bytes).await?;
                     self.span_i += 1;
                 }
@@ -757,7 +830,10 @@ impl Emitter {
                     self.span_emitted = 0;
                     self.span_i += 1;
                 }
-                SpanExec::Fetch { len, retain: Some((unique, retain_for)) } => {
+                SpanExec::Fetch {
+                    len,
+                    retain: Some((unique, retain_for)),
+                } => {
                     // Retained span: assembled whole so later occurrences can replay it.
                     let (len, unique, retain_for) = (*len, *unique, *retain_for);
                     let Some(slices) = take_span(&mut self.buffered, off, off + len) else {
@@ -795,7 +871,9 @@ impl Emitter {
                 let got = self.hasher.clone().finalize();
                 if got[..] != self.nar_hash {
                     warn!("NarHash mismatch on reconstruction — aborting stream");
-                    let _ = out.send(Err(std::io::Error::other("NarHash mismatch"))).await;
+                    let _ = out
+                        .send(Err(std::io::Error::other("NarHash mismatch")))
+                        .await;
                     return Err(EmitEnd::HashMismatch);
                 }
             }
@@ -862,12 +940,18 @@ async fn acquire_manifest(
     info: &RemoteNarinfo,
     peer_ids: &[usize],
 ) -> Option<Manifest> {
-    let avail: Vec<usize> =
-        peer_ids.iter().copied().filter(|&p| st.peers.list[p].available()).collect();
+    let avail: Vec<usize> = peer_ids
+        .iter()
+        .copied()
+        .filter(|&p| st.peers.list[p].available())
+        .collect();
     let mut tried = Vec::new();
     for _ in 0..2 {
-        let candidates: Vec<usize> =
-            avail.iter().copied().filter(|p| !tried.contains(p)).collect();
+        let candidates: Vec<usize> = avail
+            .iter()
+            .copied()
+            .filter(|p| !tried.contains(p))
+            .collect();
         let p = st.fetch.pool.pick_among(&candidates)?;
         tried.push(p);
         if let Some(m) = st.peers.fetch_manifest(p, &info.nar_hash).await {
@@ -967,7 +1051,9 @@ pub async fn run_transfer(
             return;
         }
         Ok(Pump::Finished) => {
-            ctx.stats.transfers_completed.fetch_add(1, Ordering::Relaxed);
+            ctx.stats
+                .transfers_completed
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         Ok(Pump::NeedData) => {}
@@ -1021,8 +1107,11 @@ pub async fn run_transfer(
                 }
                 break;
             }
-            let avail: Vec<usize> =
-                peer_ids.iter().copied().filter(|&p| st.peers.list[p].available()).collect();
+            let avail: Vec<usize> = peer_ids
+                .iter()
+                .copied()
+                .filter(|&p| st.peers.list[p].available())
+                .collect();
             // One weighted draw — the weights ARE the routing distribution (no capacity
             // conditioning; docs/regret.md). The hedge decision happens BEFORE the capacity
             // check: an insured chunk whose primary is busy proceeds on the partner alone
@@ -1030,39 +1119,45 @@ pub async fn run_transfer(
             // coming; queuing more behind it would park the transfer on the least-trusted
             // peer), while an UNinsured busy draw parks — the deliberate policy for peers the
             // weights trust.
-            let Some(drawn) = ctx.pool.pick_among(&avail) else { break }; // no live holders
+            let Some(drawn) = ctx.pool.pick_among(&avail) else {
+                break;
+            }; // no live holders
             let (share, floor_share) = ctx.pool.hedge_shares(&avail, drawn);
             let h = hedge_prob(avail.len(), share, floor_share, ctx.nu());
             let hedge_fired = avail.len() >= 2 && h > 0.0 && ctx.pool.chance(h);
             #[cfg_attr(not(test), allow(unused_mut))] // mutated only by the bench A/B lever
             let mut primary_slot = if ctx.limits[drawn].try_acquire() {
-                Some(Slot { st: st.clone(), peer: drawn })
+                Some(Slot {
+                    st: st.clone(),
+                    peer: drawn,
+                })
             } else {
                 None
             };
             let partner_slot = if hedge_fired {
-                let others: Vec<usize> =
-                    avail.iter().copied().filter(|&q| q != drawn).collect();
+                let others: Vec<usize> = avail.iter().copied().filter(|&q| q != drawn).collect();
                 match ctx.pool.pick_among(&others) {
                     // Opportunistic: a busy partner skips the hedge (the insurance must
                     // never delay anything).
-                    Some(q) if ctx.limits[q].try_acquire() => {
-                        Some(Slot { st: st.clone(), peer: q })
-                    }
+                    Some(q) if ctx.limits[q].try_acquire() => Some(Slot {
+                        st: st.clone(),
+                        peer: q,
+                    }),
                     _ => None,
                 }
             } else {
                 None
             };
             #[cfg(test)]
-            if primary_slot.is_none()
-                && BENCH_WORK_CONSERVING.load(Ordering::Relaxed)
-            {
+            if primary_slot.is_none() && BENCH_WORK_CONSERVING.load(Ordering::Relaxed) {
                 primary_slot = avail
                     .iter()
                     .copied()
                     .find(|&q| ctx.limits[q].try_acquire())
-                    .map(|q| Slot { st: st.clone(), peer: q });
+                    .map(|q| Slot {
+                        st: st.clone(),
+                        peer: q,
+                    });
             }
             if primary_slot.is_none() && partner_slot.is_none() {
                 // Every launchable path is capacity-blocked: wait for a release, not a timer.
@@ -1119,7 +1214,8 @@ pub async fn run_transfer(
                     let started = Instant::now();
                     let result = match tokio::time::timeout(
                         deadline,
-                        stc.peers.fetch_range(peer, &url, off, off + len, level, &prog),
+                        stc.peers
+                            .fetch_range(peer, &url, off, off + len, level, &prog),
                     )
                     .await
                     {
@@ -1150,7 +1246,9 @@ pub async fn run_transfer(
                             ctx.tally[peer].bytes.fetch_add(len, Ordering::Relaxed);
                             ctx.limits[peer].observe(true, len);
                             ctx.stats.remote_bytes.fetch_add(len, Ordering::Relaxed);
-                            ctx.stats.wire_bytes.fetch_add(chunk.wire, Ordering::Relaxed);
+                            ctx.stats
+                                .wire_bytes
+                                .fetch_add(chunk.wire, Ordering::Relaxed);
                         }
                         Err(_) => {
                             ctx.tally[peer].chunks_err.fetch_add(1, Ordering::Relaxed);
@@ -1159,7 +1257,15 @@ pub async fn run_transfer(
                         }
                     }
                     drop(slot); // free the slot (and notify) before reporting
-                    let _ = dtx.send(Done { off, len, peer, attempt, result }).await;
+                    let _ = dtx
+                        .send(Done {
+                            off,
+                            len,
+                            peer,
+                            attempt,
+                            result,
+                        })
+                        .await;
                 };
                 if detached {
                     tokio::spawn(fut);
@@ -1169,9 +1275,10 @@ pub async fn run_transfer(
                 deadline_at
             };
 
-            let fl = inflight
-                .entry(off)
-                .or_insert(Flight { attempts: Vec::new(), delivered: false });
+            let fl = inflight.entry(off).or_insert(Flight {
+                attempts: Vec::new(),
+                delivered: false,
+            });
             // BOTH members of a hedged pair are detached: whichever loses must outlive the
             // transfer (which the winner may complete) to deliver its measurement — in the
             // common case the LOSER IS THE PRIMARY (the slow ping the partner just beat), and
@@ -1199,8 +1306,10 @@ pub async fn run_transfer(
         // — a hung request belongs to its own detector (deadline → requeue → strike), and the
         // watchdog's question ("has the WHOLE transfer gone silent past patience?") is only
         // well-posed once nothing is legally in flight.
-        if let Some(d) =
-            inflight.values().flat_map(|f| f.attempts.iter().map(|&(_, d)| d)).max()
+        if let Some(d) = inflight
+            .values()
+            .flat_map(|f| f.attempts.iter().map(|&(_, d)| d))
+            .max()
         {
             wake = wake.max(d);
         }
@@ -1455,12 +1564,16 @@ mod tests {
     #[test]
     fn hedge_probability_shape() {
         let fs2 = 0.03 / 1.03; // floor share against one full-weight partner
-        // At or above the uniform share, never hedge — including the single-holder case and
-        // a set of equally-weak peers (nothing better to hedge onto).
+                               // At or above the uniform share, never hedge — including the single-holder case and
+                               // a set of equally-weak peers (nothing better to hedge onto).
         assert_eq!(hedge_prob(1, 1.0, 0.03, 3.0), 0.0);
         assert_eq!(hedge_prob(2, 0.5, fs2, 3.0), 0.0);
         assert_eq!(hedge_prob(4, 0.30, 0.01, 3.0), 0.0);
-        assert_eq!(hedge_prob(2, 0.5, 0.5, 3.0), 0.0, "all-floor set: numerator dies first");
+        assert_eq!(
+            hedge_prob(2, 0.5, 0.5, 3.0),
+            0.0,
+            "all-floor set: numerator dies first"
+        );
         // AT the weight floor: fully insured, exactly.
         assert_eq!(hedge_prob(2, fs2, fs2, 3.0), 1.0);
         // A mid-recovery peer is barely insured (ν concentrates the budget at the bottom).
@@ -1500,7 +1613,10 @@ mod tests {
     }
 
     fn chunk_piped(enc_ms: u64, read_ms: u64, decode_ms: u64) -> crate::peers::Chunk {
-        crate::peers::Chunk { pipelined: true, ..chunk_timed(enc_ms, read_ms, decode_ms) }
+        crate::peers::Chunk {
+            pipelined: true,
+            ..chunk_timed(enc_ms, read_ms, decode_ms)
+        }
     }
 
     #[test]

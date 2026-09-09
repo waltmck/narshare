@@ -14,7 +14,13 @@ hex = "0.4"
 humantime-serde = "1"
 lru = "0.12"
 libc = "0.2"
+# Read-only access to Nix's own database only — the mesh index lives in rocksdb or postgres.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Mesh-index backend: embedded, zero-dependency default.
+rocksdb = "0.23"
+# Mesh-index backend: shared-table concurrency done natively. Sync client, deliberately —
+# every index call site already runs under spawn_blocking.
+postgres = "0.19"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 tokio-stream = { version = "0.1", features = ["time"] }

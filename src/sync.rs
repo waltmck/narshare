@@ -122,8 +122,8 @@ impl Sync {
 
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
-            .route("/narshare/v1/sync", post(handle_sync))
-            .route("/narshare/v1/sync-hint", post(handle_hint))
+            .route("/narshare/v2/sync", post(handle_sync))
+            .route("/narshare/v2/sync-hint", post(handle_hint))
             .with_state(self.clone())
     }
 
@@ -147,7 +147,7 @@ impl Sync {
                 requester: self.index.self_name.clone(),
                 have: self.index.clock_vector()?,
             };
-            let resp = self.peers.sync_pull(idx, &req).await?;
+            let mut resp = self.peers.sync_pull(idx, &req).await?;
             let expect = &self.peers.list[idx].name;
             if &resp.responder != expect {
                 bail!(
@@ -157,6 +157,16 @@ impl Sync {
                     resp.responder,
                     expect
                 );
+            }
+            // Facts first: a snapshot-bearing response carries the responder's retained
+            // attestations, and the snapshots' holdings should land on known facts.
+            if !resp.attests.is_empty() {
+                let index = self.index.clone();
+                let atts = std::mem::take(&mut resp.attests);
+                let n = tokio::task::spawn_blocking(move || index.merge_attests(&atts))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("attest merge task died: {e}"))??;
+                changed_any |= n > 0;
             }
             let mut truncated = false;
             for up in resp.origins {
@@ -190,40 +200,47 @@ impl Sync {
                 let index = self.index.clone();
                 let origin = up.origin.clone();
                 // (changed, truncated, suffix events applied, snapshot applied)
-                let out = tokio::task::spawn_blocking(move || -> Result<(bool, bool, u64, bool)> {
-                    match up.body {
-                        None | Some(proto::origin_update::Body::UpToDate(_)) => {
-                            Ok((false, false, 0, false))
-                        }
-                        Some(proto::origin_update::Body::Suffix(sfx)) => {
-                            match index.apply_suffix(&origin, up.generation, &sfx.events)? {
-                                Apply::Applied(n) => Ok((n > 0, up.truncated, n as u64, false)),
-                                Apply::NeedSnapshot => {
-                                    // Shouldn't happen against a consistent responder (it
-                                    // decides suffix-vs-snapshot from OUR clock); keep the
-                                    // truncated flag — a budget-deferred origin arrives as an
-                                    // empty truncated suffix and must trigger the next round.
-                                    warn!("origin {origin}: suffix did not connect to our state");
-                                    Ok((false, up.truncated, 0, false))
+                let out =
+                    tokio::task::spawn_blocking(move || -> Result<(bool, bool, u64, bool)> {
+                        match up.body {
+                            None | Some(proto::origin_update::Body::UpToDate(_)) => {
+                                Ok((false, false, 0, false))
+                            }
+                            Some(proto::origin_update::Body::Suffix(sfx)) => {
+                                match index.apply_suffix(&origin, up.generation, &sfx.events)? {
+                                    Apply::Applied(n) => Ok((n > 0, up.truncated, n as u64, false)),
+                                    Apply::NeedSnapshot => {
+                                        // Shouldn't happen against a consistent responder (it
+                                        // decides suffix-vs-snapshot from OUR clock); keep the
+                                        // truncated flag — a budget-deferred origin arrives as an
+                                        // empty truncated suffix and must trigger the next round.
+                                        warn!(
+                                            "origin {origin}: suffix did not connect to our state"
+                                        );
+                                        Ok((false, up.truncated, 0, false))
+                                    }
                                 }
                             }
+                            Some(proto::origin_update::Body::Snapshot(snap)) => {
+                                let n = index.apply_snapshot(
+                                    &origin,
+                                    up.generation,
+                                    up.seq,
+                                    &snap.held,
+                                )?;
+                                // INFO, deliberately: snapshot applies are rare, major state
+                                // transitions, and the one timestamp that answers "when did this
+                                // node learn that origin" during an incident.
+                                info!(
+                                    "origin {origin}: snapshot applied ({n} rows, gen {}, seq {})",
+                                    up.generation, up.seq
+                                );
+                                Ok((true, false, 0, true))
+                            }
                         }
-                        Some(proto::origin_update::Body::Snapshot(snap)) => {
-                            let n =
-                                index.apply_snapshot(&origin, up.generation, up.seq, &snap.held)?;
-                            // INFO, deliberately: snapshot applies are rare, major state
-                            // transitions, and the one timestamp that answers "when did this
-                            // node learn that origin" during an incident.
-                            info!(
-                                "origin {origin}: snapshot applied ({n} rows, gen {}, seq {})",
-                                up.generation, up.seq
-                            );
-                            Ok((true, false, 0, true))
-                        }
-                    }
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("apply task died: {e}"))??;
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("apply task died: {e}"))??;
                 changed_any |= out.0;
                 truncated |= out.1;
                 self.stats.suffix_events_applied.fetch_add(out.2, Relaxed);
@@ -254,7 +271,9 @@ impl Sync {
     /// store is byte-for-byte as last diffed and the whole scan is skipped.
     pub async fn export_own_db(&self) -> Result<usize> {
         use std::sync::atomic::Ordering::Relaxed;
-        let Some(db) = self.db.clone() else { return Ok(0) };
+        let Some(db) = self.db.clone() else {
+            return Ok(0);
+        };
         let v = {
             let db = db.clone();
             tokio::task::spawn_blocking(move || db.data_version())
@@ -486,9 +505,12 @@ async fn handle_sync(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> Response
         // The request's clock vector IS the ack stream: record it, then answer, then use the
         // fresh watermarks to compact opportunistically.
         index.record_watermarks(&req.requester, &req.have)?;
-        let origins = index.respond(&req)?;
-        let resp =
-            proto::SyncResponse { responder: index.self_name.clone(), origins };
+        let bundle = index.respond(&req)?;
+        let resp = proto::SyncResponse {
+            responder: index.self_name.clone(),
+            origins: bundle.origins,
+            attests: bundle.attests,
+        };
         let z = zstd::stream::encode_all(&resp.encode_to_vec()[..], 3)
             .context("compressing sync response")?;
         index.compact()?;
@@ -498,12 +520,10 @@ async fn handle_sync(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> Response
     .unwrap_or_else(|e| Err(anyhow::anyhow!("sync respond task died: {e}")));
     match out {
         Ok(z) => {
-            s.stats.sync_requests_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (
-                [(header::CONTENT_TYPE, "application/x-narshare-sync")],
-                z,
-            )
-                .into_response()
+            s.stats
+                .sync_requests_served
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ([(header::CONTENT_TYPE, "application/x-narshare-sync")], z).into_response()
         }
         Err(e) => {
             warn!("sync response failed: {e:#}");
@@ -520,7 +540,9 @@ async fn handle_hint(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> StatusCo
         return StatusCode::BAD_REQUEST;
     };
     if let Some(idx) = s.peers.idx_of(&hint.from) {
-        s.stats.hints_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        s.stats
+            .hints_received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = s.kicks[idx].try_send(());
     }
     StatusCode::OK

@@ -32,8 +32,12 @@ pub struct Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum Node {
-    Dir { entries: Vec<(String, Node)> },
-    Symlink { target: String },
+    Dir {
+        entries: Vec<(String, Node)>,
+    },
+    Symlink {
+        target: String,
+    },
     Regular {
         #[serde(default)]
         executable: bool,
@@ -69,7 +73,11 @@ pub fn build_tree(root: &Path, segment_bytes: u64) -> Result<Node> {
             segments.push(blake3::hash(&buf[..n]).to_hex().to_string());
             remaining -= n as u64;
         }
-        Ok(Node::Regular { executable: md.mode() & 0o100 != 0, len, segments })
+        Ok(Node::Regular {
+            executable: md.mode() & 0o100 != 0,
+            len,
+            segments,
+        })
     } else if ft.is_dir() {
         let mut names: Vec<_> = fs::read_dir(root)?
             .map(|e| e.map(|e| e.file_name()))
@@ -121,14 +129,27 @@ pub fn synth_layout(m: &Manifest) -> Result<Layout> {
     if m.segment_bytes == 0 {
         bail!("manifest segment_bytes is 0");
     }
-    let mut b = Synth { lits: Vec::new(), spans: Vec::new(), off: 0, open_lit: None };
+    let mut b = Synth {
+        lits: Vec::new(),
+        spans: Vec::new(),
+        off: 0,
+        open_lit: None,
+    };
     b.tok(b"nix-archive-1");
     b.node(&m.root, m.segment_bytes, 0)?;
     b.close_lit();
     if b.off != m.nar_size {
-        bail!("manifest layout is {} bytes but claims NarSize {}", b.off, m.nar_size);
+        bail!(
+            "manifest layout is {} bytes but claims NarSize {}",
+            b.off,
+            m.nar_size
+        );
     }
-    Ok(Layout { nar_size: b.off, lits: Bytes::from(b.lits), spans: b.spans })
+    Ok(Layout {
+        nar_size: b.off,
+        lits: Bytes::from(b.lits),
+        spans: b.spans,
+    })
 }
 
 struct Synth {
@@ -173,7 +194,11 @@ impl Synth {
 
     fn segment(&mut self, hash: [u8; 32], len: u64) {
         self.close_lit();
-        self.spans.push(Span { nar_off: self.off, len, kind: SpanKind::Segment { hash } });
+        self.spans.push(Span {
+            nar_off: self.off,
+            len,
+            kind: SpanKind::Segment { hash },
+        });
         self.off += len;
     }
 
@@ -189,7 +214,11 @@ impl Synth {
                 self.tok(b"target");
                 self.tok(target.as_bytes());
             }
-            Node::Regular { executable, len, segments } => {
+            Node::Regular {
+                executable,
+                len,
+                segments,
+            } => {
                 self.tok(b"regular");
                 if *executable {
                     self.tok(b"executable");
@@ -199,7 +228,10 @@ impl Synth {
                 self.raw_lit(&len.to_le_bytes());
                 let expect = len.div_ceil(segment_bytes.max(1));
                 if segments.len() as u64 != expect {
-                    bail!("file of {len} bytes has {} segments, expected {expect}", segments.len());
+                    bail!(
+                        "file of {len} bytes has {} segments, expected {expect}",
+                        segments.len()
+                    );
                 }
                 let mut remaining = *len;
                 for seg in segments {
@@ -208,8 +240,9 @@ impl Synth {
                         bail!("manifest declares a zero-length segment");
                     }
                     let raw = hex::decode(seg).context("bad segment hash hex")?;
-                    let hash =
-                        <[u8; 32]>::try_from(raw.as_slice()).ok().context("bad segment hash len")?;
+                    let hash = <[u8; 32]>::try_from(raw.as_slice())
+                        .ok()
+                        .context("bad segment hash len")?;
                     self.segment(hash, slen);
                     remaining -= slen;
                 }
@@ -317,9 +350,8 @@ mod tests {
             let mut rebuilt = Vec::new();
             for span in &layout.spans {
                 match &span.kind {
-                    SpanKind::Lit { lit_off } => rebuilt.extend_from_slice(
-                        &layout.lits[*lit_off..*lit_off + span.len as usize],
-                    ),
+                    SpanKind::Lit { lit_off } => rebuilt
+                        .extend_from_slice(&layout.lits[*lit_off..*lit_off + span.len as usize]),
                     SpanKind::Segment { hash } => {
                         let bytes =
                             &real[span.nar_off as usize..(span.nar_off + span.len) as usize];
@@ -333,7 +365,10 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(rebuilt, real, "layout must reproduce the NAR (sb={segment_bytes})");
+            assert_eq!(
+                rebuilt, real,
+                "layout must reproduce the NAR (sb={segment_bytes})"
+            );
         }
     }
 

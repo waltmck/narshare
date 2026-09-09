@@ -38,15 +38,28 @@ enum Src {
 /// One resolved piece of a requested range, ready to emit.
 pub enum Slice {
     Lit(Bytes),
-    File { path: Arc<PathBuf>, off: u64, len: u64 },
+    File {
+        path: Arc<PathBuf>,
+        off: u64,
+        len: u64,
+    },
 }
 
 pub fn build(root: &Path) -> Result<SeekTable> {
-    let mut b = Builder { lits: Vec::new(), segs: Vec::new(), off: 0, open_lit: None };
+    let mut b = Builder {
+        lits: Vec::new(),
+        segs: Vec::new(),
+        off: 0,
+        open_lit: None,
+    };
     b.tok(b"nix-archive-1");
     b.node(root)?;
     b.close_lit();
-    Ok(SeekTable { nar_size: b.off, lits: Bytes::from(b.lits), segs: b.segs })
+    Ok(SeekTable {
+        nar_size: b.off,
+        lits: Bytes::from(b.lits),
+        segs: b.segs,
+    })
 }
 
 struct Builder {
@@ -91,20 +104,22 @@ impl Builder {
         self.segs.push(Seg {
             nar_off: self.off,
             len,
-            src: Src::File { path: Arc::new(path.to_owned()), file_off: 0 },
+            src: Src::File {
+                path: Arc::new(path.to_owned()),
+                file_off: 0,
+            },
         });
         self.off += len;
     }
 
     fn node(&mut self, path: &Path) -> Result<()> {
-        let md = fs::symlink_metadata(path)
-            .with_context(|| format!("stat {}", path.display()))?;
+        let md = fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
         let ft = md.file_type();
         self.tok(b"(");
         self.tok(b"type");
         if ft.is_symlink() {
-            let target = fs::read_link(path)
-                .with_context(|| format!("readlink {}", path.display()))?;
+            let target =
+                fs::read_link(path).with_context(|| format!("readlink {}", path.display()))?;
             self.tok(b"symlink");
             self.tok(b"target");
             self.tok(target.as_os_str().as_bytes());
@@ -173,9 +188,11 @@ impl SeekTable {
                 let lo = lit_off + skip as usize;
                 Slice::Lit(self.lits.slice(lo..lo + len as usize))
             }
-            Src::File { path, file_off } => {
-                Slice::File { path: path.clone(), off: file_off + skip, len }
-            }
+            Src::File { path, file_off } => Slice::File {
+                path: path.clone(),
+                off: file_off + skip,
+                len,
+            },
         })
     }
 
@@ -254,7 +271,10 @@ mod tests {
             .output();
         match nix {
             Ok(out) if out.status.success() => {
-                assert_eq!(ours, out.stdout, "NAR bytes differ from `nix nar dump-path`");
+                assert_eq!(
+                    ours, out.stdout,
+                    "NAR bytes differ from `nix nar dump-path`"
+                );
             }
             _ => eprintln!("skipping differential test: `nix` unavailable"),
         }
@@ -268,7 +288,11 @@ mod tests {
         fs::write(&f, b"0123456789").unwrap();
         let table = build(&f).unwrap();
         let ours = materialize(&table, 0, table.nar_size);
-        if let Ok(out) = Command::new("nix").args(["nar", "dump-path", "--"]).arg(&f).output() {
+        if let Ok(out) = Command::new("nix")
+            .args(["nar", "dump-path", "--"])
+            .arg(&f)
+            .output()
+        {
             if out.status.success() {
                 assert_eq!(ours, out.stdout);
             }
@@ -300,7 +324,10 @@ mod tests {
             .unwrap_or(u64::MAX);
         let table = Arc::new(build(Path::new(&root)).unwrap());
         let total = table.nar_size.min(limit);
-        println!("{root}: NAR {} bytes, measuring {} bytes", table.nar_size, total);
+        println!(
+            "{root}: NAR {} bytes, measuring {} bytes",
+            table.nar_size, total
+        );
 
         #[derive(Clone, Copy)]
         enum Mode {
@@ -386,14 +413,15 @@ mod tests {
                                     if buf.len() == sz as usize {
                                         out += zstd::stream::encode_all(&buf[..], level)
                                             .unwrap()
-                                            .len() as u64;
+                                            .len()
+                                            as u64;
                                         buf.clear();
                                     }
                                 }
                             });
                             if !buf.is_empty() {
-                                out += zstd::stream::encode_all(&buf[..], level).unwrap().len()
-                                    as u64;
+                                out +=
+                                    zstd::stream::encode_all(&buf[..], level).unwrap().len() as u64;
                             }
                             out
                         }

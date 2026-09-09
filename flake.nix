@@ -19,8 +19,14 @@
             fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./proto ./build.rs ];
           };
           cargoLock.lockFile = ./Cargo.lock;
-          # prost-build compiles proto/mesh.proto at build time.
-          nativeBuildInputs = [ pkgs.protobuf ];
+          # prost-build compiles proto/mesh.proto at build time; bindgenHook serves
+          # librocksdb-sys' bindgen. ROCKSDB_LIB_DIR links the cached nixpkgs rocksdb
+          # instead of compiling the crate's bundled C++ (same major version, and the C API
+          # is append-only across minors); drop the env var to fall back to the bundled build.
+          nativeBuildInputs = [ pkgs.protobuf pkgs.rustPlatform.bindgenHook ];
+          buildInputs = [ pkgs.rocksdb ];
+          env.ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
+          env.ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
           # Differential tests exec `nix`/compare against the real store; they skip themselves
           # when `nix` is absent, so the sandboxed check phase runs the pure tests only.
           meta = {
@@ -33,7 +39,14 @@
 
       devShells = eachSystem (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer protobuf ];
+          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer protobuf
+            # postgres index-backend tests boot a throwaway cluster when initdb is available
+            postgresql ];
+          # librocksdb-sys runs bindgen at build time; the LIB/INCLUDE dirs make it link
+          # the cached nixpkgs rocksdb instead of compiling its bundled C++.
+          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
+          ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
         };
       });
 

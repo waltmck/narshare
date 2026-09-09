@@ -207,7 +207,13 @@ impl Peers {
             .connect_timeout(Duration::from_secs(3))
             .build()
             .context("building http client")?;
-        Ok(Self { list, client, cap, breaker_failures, breaker_cooldown })
+        Ok(Self {
+            list,
+            client,
+            cap,
+            breaker_failures,
+            breaker_cooldown,
+        })
     }
 
     pub fn idx_of(&self, name: &str) -> Option<usize> {
@@ -222,7 +228,7 @@ impl Peers {
         req: &proto::SyncRequest,
     ) -> Result<proto::SyncResponse> {
         let peer = &self.list[idx];
-        let url = peer.base.join("narshare/v1/sync").context("bad sync url")?;
+        let url = peer.base.join("narshare/v2/sync").context("bad sync url")?;
         let exchange = async {
             let resp = self
                 .client
@@ -239,7 +245,9 @@ impl Peers {
                 use std::io::Read;
                 let mut dec = zstd::stream::read::Decoder::new(&body[..])?;
                 let mut out = Vec::new();
-                dec.by_ref().take(SYNC_RAW_CAP as u64 + 1).read_to_end(&mut out)?;
+                dec.by_ref()
+                    .take(SYNC_RAW_CAP as u64 + 1)
+                    .read_to_end(&mut out)?;
                 if out.len() > SYNC_RAW_CAP {
                     bail!("sync response exceeds decompressed cap");
                 }
@@ -268,8 +276,13 @@ impl Peers {
     /// Fire-and-forget "I have news — pull from me."
     pub async fn hint(&self, idx: usize, from: &str) {
         let peer = &self.list[idx];
-        let Ok(url) = peer.base.join("narshare/v1/sync-hint") else { return };
-        let body = proto::SyncHint { from: from.to_owned() }.encode_to_vec();
+        let Ok(url) = peer.base.join("narshare/v2/sync-hint") else {
+            return;
+        };
+        let body = proto::SyncHint {
+            from: from.to_owned(),
+        }
+        .encode_to_vec();
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
             self.client.post(url).body(body).send(),
@@ -343,7 +356,10 @@ impl Peers {
                 }
             }
         };
-        tokio::time::timeout(self.cap, exchange).await.ok().flatten()
+        tokio::time::timeout(self.cap, exchange)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Fetch one chunk [start, end) of a NAR from a specific peer, optionally zstd-framed on the
@@ -414,20 +430,23 @@ impl Peers {
             // can expand into an unbounded allocation. Read at most want+1 bytes; a frame that
             // produces more is rejected below by the exact-length check.
             let name = peer.name.clone();
-            let (raw, decode) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Duration)> {
-                use std::io::Read;
-                let t0 = Instant::now();
-                let mut dec = zstd::stream::read::Decoder::new(&body[..])
-                    .with_context(|| format!("peer {name}: bad zstd frame"))?;
-                let mut out = Vec::with_capacity(want);
-                dec.by_ref()
-                    .take(want as u64 + 1)
-                    .read_to_end(&mut out)
-                    .with_context(|| format!("peer {name}: bad zstd frame"))?;
-                Ok((out, t0.elapsed()))
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("peer {}: decode task died: {e}", self.list[peer_idx].name))??;
+            let (raw, decode) =
+                tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Duration)> {
+                    use std::io::Read;
+                    let t0 = Instant::now();
+                    let mut dec = zstd::stream::read::Decoder::new(&body[..])
+                        .with_context(|| format!("peer {name}: bad zstd frame"))?;
+                    let mut out = Vec::with_capacity(want);
+                    dec.by_ref()
+                        .take(want as u64 + 1)
+                        .read_to_end(&mut out)
+                        .with_context(|| format!("peer {name}: bad zstd frame"))?;
+                    Ok((out, t0.elapsed()))
+                })
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("peer {}: decode task died: {e}", self.list[peer_idx].name)
+                })??;
             (Bytes::from(raw), decode)
         } else {
             (body, Duration::ZERO)
@@ -441,6 +460,13 @@ impl Peers {
             );
         }
         peer.record_ok(); // a delivered chunk closes any half-open breaker
-        Ok(Chunk { bytes, wire, srv_read, srv_encode, decode, pipelined })
+        Ok(Chunk {
+            bytes,
+            wire,
+            srv_read,
+            srv_encode,
+            decode,
+            pipelined,
+        })
     }
 }

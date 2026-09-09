@@ -18,7 +18,7 @@ fn warn_once(e: &anyhow::Error) {
 }
 
 /// A feasible-candidate row as the differ sees it: everything change detection needs,
-/// references deliberately omitted (see feasible_candidates).
+/// references deliberately omitted (see candidates).
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub id: i64,
@@ -148,20 +148,17 @@ impl StoreDb {
              WHERE path >= ?1 AND path < ?2 LIMIT 1",
         )?;
         let row = stmt
-            .query_row(
-                [&lo, &hi],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, Option<i64>>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                    ))
-                },
-            )
+            .query_row([&lo, &hi], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
             .optional()?;
         row.map(|(id, path, hash, sz, drv, sigs, ca)| {
             Self::info_from_row(&conn, id, path, hash, sz, drv, sigs, ca)
@@ -169,18 +166,18 @@ impl StoreDb {
         .transpose()
     }
 
-    /// Rows that could be mesh-feasible (CA, or carrying signatures) — the candidate set the
-    /// index differ exports from. DELIBERATELY without references: fetching them is one JOIN
-    /// query per row (~100k queries on a real store, ~10 CPU-seconds per diff, measured), and
-    /// the differ's change detection needs only (hash, sigs). Callers fetch references via
-    /// references_of() for the handful of rows that actually changed. Signature validity is
-    /// the caller's check.
-    pub fn feasible_candidates(&self) -> Result<Vec<Candidate>> {
+    /// EVERY valid path, as the index differ's candidate set. Deliberately unfiltered:
+    /// possession is trust-free (bytes are keyed and verified by NAR hash), so even a local,
+    /// unsigned, non-CA rebuild is a legitimate byte source for content some OTHER node holds
+    /// a believable fact about — the attestation filter (CA or signatures) is the differ's
+    /// job, per row. DELIBERATELY without references: fetching them is one JOIN query per row
+    /// (~100k queries on a real store, ~10 CPU-seconds per diff, measured), and change
+    /// detection needs only (hash, sigs). Callers fetch references via references_of() for
+    /// the handful of rows that actually changed.
+    pub fn candidates(&self) -> Result<Vec<Candidate>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, path, hash, narSize, sigs, ca, deriver FROM ValidPaths \
-             WHERE (sigs IS NOT NULL AND sigs != '') OR (ca IS NOT NULL AND ca != '')",
-        )?;
+        let mut stmt = conn
+            .prepare_cached("SELECT id, path, hash, narSize, sigs, ca, deriver FROM ValidPaths")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -286,7 +283,10 @@ impl StoreDb {
             map
         };
         let found = map.get(nar_hash).cloned();
-        *guard = Some(NarIndex { built: std::time::Instant::now(), map });
+        *guard = Some(NarIndex {
+            built: std::time::Instant::now(),
+            map,
+        });
         Ok(found)
     }
 
@@ -325,20 +325,17 @@ impl StoreDb {
              WHERE hash = ?1 OR hash = ?2 LIMIT 1",
         )?;
         let row = stmt
-            .query_row(
-                [&b16, &b32],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, Option<i64>>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                    ))
-                },
-            )
+            .query_row([&b16, &b32], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
             .optional()?;
         row.map(|(id, path, hash, sz, drv, sigs, ca)| {
             Self::info_from_row(&conn, id, path, hash, sz, drv, sigs, ca)
@@ -355,6 +352,8 @@ pub mod tests {
     pub fn fake_db(dir: &Path, rows: &[(&str, [u8; 32], u64, Option<&str>)]) -> std::path::PathBuf {
         let db = dir.join("db.sqlite");
         let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF;")
+            .unwrap();
         conn.execute_batch(
             "CREATE TABLE ValidPaths (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -370,6 +369,7 @@ pub mod tests {
                  PRIMARY KEY (referrer, reference));",
         )
         .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
         for (path, nar_hash, nar_size, ca) in rows {
             conn.execute(
                 "INSERT INTO ValidPaths (path, hash, registrationTime, narSize, ca) \
@@ -383,6 +383,7 @@ pub mod tests {
             )
             .unwrap();
         }
+        conn.execute_batch("COMMIT").unwrap();
         db
     }
 
@@ -399,16 +400,25 @@ pub mod tests {
     /// Attach signatures to a fake-db row (space-separated, as nix stores them).
     pub fn set_sigs(db: &Path, path: &str, sigs: &str) {
         let conn = Connection::open(db).unwrap();
-        conn.execute("UPDATE ValidPaths SET sigs = ?2 WHERE path = ?1", rusqlite::params![path, sigs])
-            .unwrap();
+        conn.execute(
+            "UPDATE ValidPaths SET sigs = ?2 WHERE path = ?1",
+            rusqlite::params![path, sigs],
+        )
+        .unwrap();
     }
 
-    /// Simulate an in-place rebuild that lost feasibility: strip the row's CA and sigs.
-    pub fn clear_feasibility(db: &Path, path: &str) {
+    /// Register a row into an existing fake db (an in-place rebuild registers anew).
+    pub fn insert_path(db: &Path, path: &str, nar_hash: [u8; 32], nar_size: u64, ca: Option<&str>) {
         let conn = Connection::open(db).unwrap();
         conn.execute(
-            "UPDATE ValidPaths SET sigs = NULL, ca = NULL WHERE path = ?1",
-            [path],
+            "INSERT INTO ValidPaths (path, hash, registrationTime, narSize, ca) \
+             VALUES (?1, ?2, 0, ?3, ?4)",
+            rusqlite::params![
+                path,
+                format!("sha256:{}", hex::encode(nar_hash)),
+                nar_size as i64,
+                ca
+            ],
         )
         .unwrap();
     }
@@ -416,7 +426,8 @@ pub mod tests {
     /// Simulate a GC: drop a row from the fake db.
     pub fn delete_path(db: &Path, path: &str) {
         let conn = Connection::open(db).unwrap();
-        conn.execute("DELETE FROM ValidPaths WHERE path = ?1", [path]).unwrap();
+        conn.execute("DELETE FROM ValidPaths WHERE path = ?1", [path])
+            .unwrap();
     }
 
     #[test]
@@ -425,14 +436,19 @@ pub mod tests {
         let hash = [7u8; 32];
         let hp = "0fb2hr6wamcr5f9my5w3slxlv95p4xwn"; // 32-char store-path hash part
         let path = format!("/nix/store/{hp}-foo-1.0");
-        let db_path =
-            fake_db(dir.path(), &[(&path, hash, 1234, Some("fixed:r:sha256:abcd"))]);
+        let db_path = fake_db(
+            dir.path(),
+            &[(&path, hash, 1234, Some("fixed:r:sha256:abcd"))],
+        );
         let db = StoreDb::open(&db_path, "/nix/store").unwrap();
 
         let info = db
             .by_hash_part("0fb2hr6wamcr5f9my5w3slxlv95p4xwn8lz8vzbcqmgj9jbb5243")
             .unwrap();
-        assert!(info.is_none(), "52-char narhash is not a 32-char path hash part");
+        assert!(
+            info.is_none(),
+            "52-char narhash is not a 32-char path hash part"
+        );
 
         let info = db.by_hash_part(hp).unwrap().unwrap();
         assert_eq!(info.path, path);

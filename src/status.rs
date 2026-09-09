@@ -30,7 +30,9 @@ pub struct StatusCtx {
 }
 
 pub fn router(ctx: Arc<StatusCtx>) -> Router {
-    Router::new().route("/narshare/v1/status", get(status)).with_state(ctx)
+    Router::new()
+        .route("/narshare/v1/status", get(status))
+        .with_state(ctx)
 }
 
 async fn status(State(ctx): State<Arc<StatusCtx>>) -> Response {
@@ -152,5 +154,9 @@ async fn status(State(ctx): State<Arc<StatusCtx>>) -> Response {
         "sync": sync,
         "serve": serve,
     });
-    ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }

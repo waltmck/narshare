@@ -163,16 +163,33 @@ impl HostPool {
     pub fn restore(&self, weights: &[f64], best_rate: f64, avg_loss: f64) {
         let mut st = self.state.lock().unwrap();
         for (w, &v) in st.weight.iter_mut().zip(weights) {
-            *w = if v.is_finite() { v.clamp(W_MIN, 1.0) } else { 1.0 };
+            *w = if v.is_finite() {
+                v.clamp(W_MIN, 1.0)
+            } else {
+                1.0
+            };
         }
-        st.best_rate = if best_rate.is_finite() { best_rate.max(0.0) } else { 0.0 };
-        st.avg_loss = if avg_loss.is_finite() { avg_loss.clamp(0.0, 1.0) } else { 0.0 };
+        st.best_rate = if best_rate.is_finite() {
+            best_rate.max(0.0)
+        } else {
+            0.0
+        };
+        st.avg_loss = if avg_loss.is_finite() {
+            avg_loss.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
     }
 
     /// (weights, best_rate, avg_loss, observation count) — for the persistence layer.
     pub fn snapshot(&self) -> (Vec<f64>, f64, f64, u64) {
         let st = self.state.lock().unwrap();
-        (st.weight.clone(), st.best_rate, st.avg_loss, st.observations)
+        (
+            st.weight.clone(),
+            st.best_rate,
+            st.avg_loss,
+            st.observations,
+        )
     }
 
     #[cfg(test)]
@@ -252,10 +269,20 @@ mod tests {
             pool.record_failure(1);
         }
         let w = pool.weights();
-        assert!(w[1] < 0.05, "dead peer should collapse to near the floor, got {w:?}");
+        assert!(
+            w[1] < 0.05,
+            "dead peer should collapse to near the floor, got {w:?}"
+        );
         let s = share_all(&pool, 20_000);
-        assert!(s[1] < 0.06, "dead peer should get a small share, got {}", s[1]);
-        assert!(s[1] > 0.0, "…but never zero, or it could never be found healthy again");
+        assert!(
+            s[1] < 0.06,
+            "dead peer should get a small share, got {}",
+            s[1]
+        );
+        assert!(
+            s[1] > 0.0,
+            "…but never zero, or it could never be found healthy again"
+        );
     }
 
     #[test]
@@ -265,18 +292,27 @@ mod tests {
             pool.record_success(0, 8 << 20, Duration::from_secs(1));
             pool.record_failure(1);
         }
-        assert!(pool.weights()[1] < 0.05, "precondition: must have collapsed");
+        assert!(
+            pool.weights()[1] < 0.05,
+            "precondition: must have collapsed"
+        );
         for _ in 0..10 {
             pool.record_success(1, 8 << 20, Duration::from_secs(1));
         }
-        assert!(pool.weights()[1] > W_MIN * 2.0, "should be climbing after 10 successes");
+        assert!(
+            pool.weights()[1] > W_MIN * 2.0,
+            "should be climbing after 10 successes"
+        );
         // With the tuned drift (SHARE=0.005, mw_tune_sweep) the late climb leans on the
         // exponential term alone, whose fuel (avg_loss) decays as successes accumulate —
         // full parity takes a couple hundred clean observations instead of forty.
         for _ in 0..200 {
             pool.record_success(1, 8 << 20, Duration::from_secs(1));
         }
-        assert!(pool.weights()[1] > 0.8, "a healthy peer must return near full weight");
+        assert!(
+            pool.weights()[1] > 0.8,
+            "a healthy peer must return near full weight"
+        );
     }
 
     #[test]
@@ -304,7 +340,10 @@ mod tests {
             counts[pool.pick_among(&[1, 2]).unwrap()] += 1;
         }
         assert_eq!(counts[0], 0);
-        assert!(counts[1] > counts[2] * 3, "restricted sampling ignored weights: {counts:?}");
+        assert!(
+            counts[1] > counts[2] * 3,
+            "restricted sampling ignored weights: {counts:?}"
+        );
         assert!(counts[2] > 0, "floor must survive restriction");
         assert!(pool.pick_among(&[]).is_none());
     }
@@ -340,7 +379,10 @@ mod tests {
             pool.record_success(1, 8 << 20, Duration::from_secs(1));
         }
         for w in pool.weights() {
-            assert!(w > 0.9, "healthy peers must not be punished by an untimeable sample");
+            assert!(
+                w > 0.9,
+                "healthy peers must not be punished by an untimeable sample"
+            );
         }
     }
 }

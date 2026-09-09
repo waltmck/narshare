@@ -56,7 +56,10 @@ const TABLE_ENTRIES: usize = 4096;
 /// aggregate. A FULL pool doubles as the "compression, not the wire, is the bottleneck" signal
 /// for the adaptive encoding's CPU half (see get_nar).
 fn encode_permits() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(2, 8)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .clamp(2, 8)
 }
 /// Concurrent manifest builds. Each is a whole-tree hashing read (minutes for a game tree); two
 /// permits let a small burst overlap without a fleet of peers saturating the disk.
@@ -142,7 +145,9 @@ impl NarCache {
         }
         self.table_bytes += built;
         while self.table_bytes > TABLE_BUDGET && self.lru.len() > 1 {
-            let Some((_, evicted)) = self.lru.pop_lru() else { break };
+            let Some((_, evicted)) = self.lru.pop_lru() else {
+                break;
+            };
             self.forget(&evicted);
         }
     }
@@ -189,7 +194,10 @@ impl ServeState {
 
     /// (big-lane permits free, small-lane permits free) — for the status endpoint.
     pub fn encode_permits_free(&self) -> (usize, usize) {
-        (self.encode_sem.available_permits(), self.encode_sem_small.available_permits())
+        (
+            self.encode_sem.available_permits(),
+            self.encode_sem_small.available_permits(),
+        )
     }
 }
 
@@ -207,17 +215,20 @@ pub fn router(state: Arc<ServeState>) -> Router {
 /// and DETACHED from any one request: a huge tree hashes for minutes while requesters time out
 /// and disconnect (axum cancels their handlers) — the result must land in the cache anyway so a
 /// later transfer finds it, instead of every retry restarting the read from scratch.
-async fn get_manifest(State(st): State<Arc<ServeState>>, UrlPath(hash): UrlPath<String>) -> Response {
-    st.stats.manifest_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+async fn get_manifest(
+    State(st): State<Arc<ServeState>>,
+    UrlPath(hash): UrlPath<String>,
+) -> Response {
+    st.stats
+        .manifest_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some(nar_hash) = nixbase32::decode(&hash, 32).map(|v| <[u8; 32]>::try_from(v).unwrap())
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let respond = |cached: Option<Bytes>| -> Response {
         match cached {
-            Some(json) => {
-                ([(header::CONTENT_TYPE, "application/json")], json).into_response()
-            }
+            Some(json) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
             // A path that cannot be manifested (e.g. a non-UTF-8 filename, which NARs allow and
             // the NAR walk serves fine) is an ABSENCE of a manifest, not a server fault: answer
             // 404 so the consumer degrades to plain striping instead of striking a healthy peer.
@@ -271,10 +282,18 @@ fn spawn_manifest_build(
     let st = st.clone();
     let root = std::path::PathBuf::from(&entry.info.path);
     let path = entry.info.path.clone();
-    let (nh, ns, sb) = (entry.info.nar_hash, entry.info.nar_size, st.cfg.segment_bytes.0);
+    let (nh, ns, sb) = (
+        entry.info.nar_hash,
+        entry.info.nar_size,
+        st.cfg.segment_bytes.0,
+    );
     tokio::spawn(async move {
-        let _permit =
-            st.manifest_sem.clone().acquire_owned().await.expect("semaphore closed");
+        let _permit = st
+            .manifest_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore closed");
         let built = match tokio::task::spawn_blocking(move || {
             manifest::build_manifest(&root, &nh, ns, sb)
                 .and_then(|m| serde_json::to_vec(&m).map_err(Into::into))
@@ -312,14 +331,20 @@ async fn cache_info(State(st): State<Arc<ServeState>>) -> Response {
     ([(header::CONTENT_TYPE, "text/x-nix-cache-info")], body).into_response()
 }
 
-async fn get_narinfo(State(st): State<Arc<ServeState>>, UrlPath(file): UrlPath<String>) -> Response {
-    st.stats.narinfo_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+async fn get_narinfo(
+    State(st): State<Arc<ServeState>>,
+    UrlPath(file): UrlPath<String>,
+) -> Response {
+    st.stats
+        .narinfo_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some(hash_part) = file.strip_suffix(".narinfo").map(str::to_owned) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let db = st.db.clone();
-    let looked_up =
-        tokio::task::spawn_blocking(move || db.by_hash_part(&hash_part)).await.unwrap();
+    let looked_up = tokio::task::spawn_blocking(move || db.by_hash_part(&hash_part))
+        .await
+        .unwrap();
     match looked_up {
         Ok(Some(info)) => (
             [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
@@ -347,11 +372,15 @@ async fn get_nar(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    st.stats.nar_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    st.stats
+        .nar_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let entry = match nar_entry(&st, nar_hash).await {
         Ok(Some(e)) => e,
         Ok(None) => {
-            st.stats.nar_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            st.stats
+                .nar_misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return StatusCode::NOT_FOUND.into_response();
         }
         Err(e) => return err500("nar lookup", e),
@@ -396,12 +425,19 @@ async fn get_nar(
                 // would be pure overhead. The WAIT for a permit is an honest CPU-pressure
                 // signal, so it is reported to the requester folded into the encode time.
                 let waited = std::time::Instant::now();
-                let _permit = st.encode_sem_small.acquire().await.expect("semaphore closed");
+                let _permit = st
+                    .encode_sem_small
+                    .acquire()
+                    .await
+                    .expect("semaphore closed");
                 let wait = waited.elapsed();
-                st.stats.chunks_encoded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 st.stats
-                    .encode_wait_us
-                    .fetch_add(wait.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    .chunks_encoded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                st.stats.encode_wait_us.fetch_add(
+                    wait.as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 return match encode_span(&st, &table, start, end, level).await {
                     Ok((frame, read_d, enc_d)) => Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
@@ -416,7 +452,10 @@ async fn get_nar(
                         // classification: disk vs CPU (pool wait + encode). Wire time is what
                         // remains of the requester's own elapsed measurement.
                         .header("x-narshare-read-us", read_d.as_micros().to_string())
-                        .header("x-narshare-encode-us", (wait + enc_d).as_micros().to_string())
+                        .header(
+                            "x-narshare-encode-us",
+                            (wait + enc_d).as_micros().to_string(),
+                        )
                         .body(Body::from(frame))
                         .unwrap(),
                     Err(e) => err500("chunk encode", e),
@@ -432,10 +471,13 @@ async fn get_nar(
                     .await
                     .expect("semaphore closed");
                 let wait = waited.elapsed();
-                st.stats.chunks_encoded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 st.stats
-                    .encode_wait_us
-                    .fetch_add(wait.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    .chunks_encoded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                st.stats.encode_wait_us.fetch_add(
+                    wait.as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 let mut resp = Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header(header::CONTENT_TYPE, "application/x-narshare-chunk")
@@ -472,7 +514,9 @@ async fn get_nar(
                     stream_encode(stc, tbl, ent, start, end, level, tx).await;
                     drop(permit);
                 });
-                return resp.body(Body::from_stream(ReceiverStream::new(rx))).unwrap();
+                return resp
+                    .body(Body::from_stream(ReceiverStream::new(rx)))
+                    .unwrap();
             }
         }
     }
@@ -500,7 +544,8 @@ async fn get_nar(
     tokio::spawn(async move {
         emit(stream_table, reader, start, end, tx).await;
     });
-    resp.body(Body::from_stream(ReceiverStream::new(rx))).unwrap()
+    resp.body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap()
 }
 
 /// Resolve narhash → PathInfo, LRU-cached both ways (the hash column is unindexed in the Nix db,
@@ -515,9 +560,14 @@ async fn nar_entry(st: &Arc<ServeState>, nar_hash: [u8; 32]) -> Result<Option<Ar
         }
     }
     let db = st.db.clone();
-    let info = tokio::task::spawn_blocking(move || db.by_nar_hash(&nar_hash)).await.unwrap()?;
+    let info = tokio::task::spawn_blocking(move || db.by_nar_hash(&nar_hash))
+        .await
+        .unwrap()?;
     let Some(info) = info else {
-        st.nar_negative.lock().unwrap().put(nar_hash, Instant::now());
+        st.nar_negative
+            .lock()
+            .unwrap()
+            .put(nar_hash, Instant::now());
         return Ok(None);
     };
     st.nar_negative.lock().unwrap().pop(&nar_hash);
@@ -561,7 +611,10 @@ async fn seek_table(
                 );
             }
             let table = Arc::new(table);
-            st.nars.lock().unwrap().account(&nar_hash, entry, table.approx_bytes());
+            st.nars
+                .lock()
+                .unwrap()
+                .account(&nar_hash, entry, table.approx_bytes());
             Ok(table)
         })
         .await
@@ -571,7 +624,11 @@ async fn seek_table(
 /// One ready-to-emit unit of a range response, in NAR order.
 enum PieceDesc {
     Lit(Bytes),
-    Read { path: Arc<std::path::PathBuf>, off: u64, len: u64 },
+    Read {
+        path: Arc<std::path::PathBuf>,
+        off: u64,
+        len: u64,
+    },
 }
 
 /// Walks [start, end) of a seek table as READ_CHUNK-sized pieces.
@@ -586,7 +643,13 @@ struct Pieces<'a> {
 
 impl<'a> Pieces<'a> {
     fn new(table: &'a SeekTable, start: u64, end: u64) -> Self {
-        Self { table, i: table.first_seg(start), start, end, file: None }
+        Self {
+            table,
+            i: table.first_seg(start),
+            start,
+            end,
+            file: None,
+        }
     }
 }
 
@@ -623,7 +686,9 @@ fn start_piece(reader: &SegmentReader, d: PieceDesc) -> Fetched {
         PieceDesc::Lit(b) => Fetched::Lit(b),
         PieceDesc::Read { path, off, len } => {
             let r = reader.clone();
-            Fetched::Read(tokio::spawn(async move { r.read(path, off, len as usize).await }))
+            Fetched::Read(tokio::spawn(async move {
+                r.read(path, off, len as usize).await
+            }))
         }
     }
 }
@@ -683,24 +748,34 @@ pub(crate) enum RangeSpec {
 /// Single-range `bytes=` parsing. Malformed or multi-range headers are ignored (200 full body,
 /// which is always legal); syntactically valid but unsatisfiable ranges get 416.
 pub(crate) fn parse_range(header: Option<&str>, size: u64) -> RangeSpec {
-    let Some(h) = header else { return RangeSpec::Full };
-    let Some(spec) = h.strip_prefix("bytes=") else { return RangeSpec::Full };
+    let Some(h) = header else {
+        return RangeSpec::Full;
+    };
+    let Some(spec) = h.strip_prefix("bytes=") else {
+        return RangeSpec::Full;
+    };
     if spec.contains(',') {
         return RangeSpec::Full;
     }
     let spec = spec.trim();
-    let Some((a, b)) = spec.split_once('-') else { return RangeSpec::Full };
+    let Some((a, b)) = spec.split_once('-') else {
+        return RangeSpec::Full;
+    };
     match (a, b) {
         ("", n) => {
             // suffix: last n bytes
-            let Ok(n) = n.parse::<u64>() else { return RangeSpec::Full };
+            let Ok(n) = n.parse::<u64>() else {
+                return RangeSpec::Full;
+            };
             if n == 0 || size == 0 {
                 return RangeSpec::Unsatisfiable;
             }
             RangeSpec::Partial(size.saturating_sub(n), size)
         }
         (a, "") => {
-            let Ok(a) = a.parse::<u64>() else { return RangeSpec::Full };
+            let Ok(a) = a.parse::<u64>() else {
+                return RangeSpec::Full;
+            };
             if a >= size {
                 return RangeSpec::Unsatisfiable;
             }
@@ -751,9 +826,11 @@ async fn stream_encode(
         // compression ratio gracefully instead of degrading the machine.
         let _nice = NiceGuard::lower(10);
         let mut busy = Duration::ZERO;
-        let mut w = ChannelWriter { tx: out, buf: Vec::with_capacity(ENCODE_FLUSH_BYTES * 2) };
-        let mut enc =
-            zstd::stream::write::Encoder::new(&mut w, level).context("zstd encoder")?;
+        let mut w = ChannelWriter {
+            tx: out,
+            buf: Vec::with_capacity(ENCODE_FLUSH_BYTES * 2),
+        };
+        let mut enc = zstd::stream::write::Encoder::new(&mut w, level).context("zstd encoder")?;
         while let Some(b) = feed_rx.blocking_recv() {
             let t = Instant::now();
             std::io::Write::write_all(&mut enc, &b).context("zstd write")?;
@@ -902,15 +979,14 @@ async fn encode_span(
     let t0 = Instant::now();
     // All reads in flight at once (only SMALL_ENCODE_SPAN spans buffer, so a handful of
     // pieces); the io pool's own semaphore is the actual concurrency bound. Assembled in order.
-    let started: Vec<Fetched> =
-        Pieces::new(table, start, end).map(|d| start_piece(&st.reader, d)).collect();
+    let started: Vec<Fetched> = Pieces::new(table, start, end)
+        .map(|d| start_piece(&st.reader, d))
+        .collect();
     let mut raw = Vec::with_capacity((end - start) as usize);
     for p in started {
         match p {
             Fetched::Lit(b) => raw.extend_from_slice(&b),
-            Fetched::Read(h) => {
-                raw.extend_from_slice(&h.await.expect("read task panicked")?)
-            }
+            Fetched::Read(h) => raw.extend_from_slice(&h.await.expect("read task panicked")?),
         }
     }
     let read_d = t0.elapsed();
@@ -943,7 +1019,7 @@ mod tests {
         assert_eq!(p(Some("bytes=50-200"), 100), (50, 100)); // clamp
         assert_eq!(p(Some("bytes=100-"), 100), (u64::MAX - 1, u64::MAX - 1)); // 416
         assert_eq!(p(Some("bytes=5-4"), 100), (u64::MAX - 1, u64::MAX - 1)); // 416
-        // u64::MAX end must clamp, not wrap to 0 (would be end < start → panic/underflow).
+                                                                             // u64::MAX end must clamp, not wrap to 0 (would be end < start → panic/underflow).
         assert_eq!(p(Some("bytes=5-18446744073709551615"), 100), (5, 100));
         assert_eq!(p(Some("bytes=0-18446744073709551615"), 100), (0, 100));
         assert_eq!(p(Some("bytes=0-1,5-6"), 100), (u64::MAX, u64::MAX)); // multi → full

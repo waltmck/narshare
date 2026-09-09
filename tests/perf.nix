@@ -109,6 +109,10 @@ in
         client.succeed(
             f"cat > /tmp/x{port}.toml <<'EOF'\n"
             'name = "xclient"\n'
+            # Own index dir per proxy: the rocksdb store is process-exclusive (unlike the
+            # old sqlite layout, which silently tolerated two proxies sharing one index).
+            "[cache]\n"
+            f'dir = "/tmp/x{port}-cache"\n'
             "[proxy]\n"
             f'listen = "127.0.0.1:{port}"\n'
             f"{extra}\n"

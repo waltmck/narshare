@@ -1,42 +1,62 @@
-// The mesh index sync protocol. Every synced set has exactly ONE writer (its origin), so each
-// origin's history is totally ordered by its own sequence counter; receivers keep one watermark
-// per (peer, origin) and apply events idempotently (last-writer-wins per (origin, store_path)).
-// Protobuf so that mesh nodes running different narshare versions keep interoperating: add
-// fields, never renumber.
+// The mesh index sync protocol, v2. Two kinds of state, deliberately separated:
+//
+//  * POSSESSION — "origin O currently holds bytes with NAR hash H". Per-origin state with
+//    exactly ONE writer (its origin), totally ordered by the origin's own sequence counter;
+//    receivers keep one watermark per (peer, origin) and apply events idempotently. Retractable
+//    (Have/Drop), snapshottable (the origin's complete current hash set).
+//
+//  * ATTESTATION — "store path P has content H (size, references), and here is why you can
+//    believe it" (a trusted signature over the narinfo fingerprint, or content addressing).
+//    Attestations are FACTS: self-verifying, never false, never retracted — a grow-only set,
+//    deduped by (store_path, nar_hash) with signature sets unioned. They ride origin journals
+//    when first introduced and travel wholesale with snapshot-bearing responses; retention
+//    (held-plus-grace) is a local policy, not a protocol concern.
+//
+// A narinfo lookup composes the two: attestations for the requested hash part yield NAR
+// hashes; current holders of those hashes are byte sources. Signatures therefore survive
+// holder churn: a host that GC'd a path (or rebuilt it bit-identically) can re-substitute it
+// from any current holder under its own old signature.
+//
+// Protobuf so mixed narshare versions interoperate across a rolling mesh upgrade: add fields,
+// never renumber. v1 (fused Add(narinfo)/Remove(path) events) is not spoken anymore; v1 and v2
+// nodes simply do not sync until upgraded (the index is disposable, so there is no migration).
 syntax = "proto3";
-package narshare.mesh.v1;
+package narshare.mesh.v2;
 
-// One feasible narinfo: CA, or carrying a signature the mesh anchor trusts. Receivers re-verify
-// feasibility on apply — an exporter's claim is never trusted.
-message Narinfo {
+// One attestation: a verifiable association of a store path with content. Verified by
+// receivers on USE (never trusted from the wire): `ca` non-empty (the consuming nix
+// re-verifies content addressing at ingestion), or any signature that verifies over the
+// narinfo fingerprint (store_path; nar_hash; nar_size; references) under the mesh anchor.
+message Attestation {
   string store_path = 1;
   bytes nar_hash = 2;             // 32-byte sha256 of the uncompressed NAR
   uint64 nar_size = 3;
-  repeated string references = 4; // basenames, narinfo-style
+  repeated string references = 4; // basenames, narinfo-style, order signature-exact
   string ca = 5;                  // empty = none
   repeated string sigs = 6;       // "keyname:base64", verbatim
 }
 
-// One journal event of an origin's holdings.
+// One journal event of an origin.
 message Event {
   uint64 seq = 1;
   oneof op {
-    Narinfo add = 2;        // origin now holds this (replaces any prior holding of store_path)
-    string remove = 3;      // store_path the origin no longer holds
+    bytes have = 2;               // origin now holds bytes with this 32-byte NAR hash
+    bytes drop = 3;               // origin no longer holds this NAR hash
+    Attestation attest = 4;       // a fact the origin introduces (usually its own export)
   }
 }
 
 // The requester's knowledge of one origin — doubles as the ack that lets the responder
-// compact its journal ("seq N seen" implies every deletion <= N was seen).
+// compact its journal ("seq N seen" implies every event <= N was seen).
 message OriginClock {
   string origin = 1;
-  uint64 generation = 2;    // 0 = nothing known
+  uint64 generation = 2;          // 0 = nothing known
   uint64 seq = 3;
 }
 
 message SyncRequest {
-  string requester = 1;               // self-declared node name (validated against config)
-  repeated OriginClock have = 2;      // full watermark vector
+  string requester = 1;           // self-declared node name (validated against config)
+  repeated OriginClock have = 2;  // full watermark vector
 }
 
 // Per-origin answer: nothing new, a journal suffix, or a full snapshot (the recovery path —
@@ -44,7 +64,7 @@ message SyncRequest {
 message OriginUpdate {
   string origin = 1;
   uint64 generation = 2;
-  uint64 seq = 3;                     // responder's current seq for this origin
+  uint64 seq = 3;                 // responder's current seq for this origin
   oneof body {
     bool up_to_date = 4;
     Suffix suffix = 5;
@@ -58,13 +78,19 @@ message Suffix {
   repeated Event events = 1;
 }
 
+// The origin's complete current possession set. Attestations are NOT per-origin state and
+// ride the response instead (SyncResponse.attests).
 message Snapshot {
-  repeated Narinfo held = 1;          // the origin's complete current holdings
+  repeated bytes held = 1;        // 32-byte NAR hashes
 }
 
 message SyncResponse {
-  string responder = 1;               // self-declared node name (validated against config)
+  string responder = 1;           // self-declared node name (validated against config)
   repeated OriginUpdate origins = 2;
+  // Populated whenever any origin update above is a snapshot: every attestation the responder
+  // retains, so the recovery path that loses journal history still learns the facts. Grow-only
+  // dedup on apply makes over-delivery harmless.
+  repeated Attestation attests = 3;
 }
 
 // "I have news — pull from me." Carries no data: pull is the only data path.

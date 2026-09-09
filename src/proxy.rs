@@ -42,7 +42,12 @@ impl ProxyState {
         peer_cfgs: &[config::Peer],
         cfg: ProxyCfg,
     ) -> Arc<Self> {
-        let st = Arc::new(Self { fetch: FetchCtx::new(peer_cfgs, &cfg), peers, index, cfg });
+        let st = Arc::new(Self {
+            fetch: FetchCtx::new(peer_cfgs, &cfg),
+            peers,
+            index,
+            cfg,
+        });
         // Warm-start the MW pool from the last run's weights (staleness-decayed by the
         // loader), so a mesh whose link shape was learned an hour ago starts learned.
         let names: Vec<String> = peer_cfgs.iter().map(|p| p.name.clone()).collect();
@@ -60,10 +65,7 @@ impl ProxyState {
     /// Persist the MW pool periodically (and once at shutdown) whenever observations were
     /// folded in — one shared pool serves every concurrent transfer, so this is the whole
     /// process's learned state.
-    pub fn spawn_weight_saver(
-        self: &Arc<Self>,
-        mut shutdown: tokio::sync::watch::Receiver<()>,
-    ) {
+    pub fn spawn_weight_saver(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<()>) {
         let st = self.clone();
         tokio::spawn(async move {
             let names: Vec<String> = st.peers.list.iter().map(|p| p.name.clone()).collect();
@@ -140,10 +142,19 @@ async fn cache_info(State(st): State<Arc<ProxyState>>) -> Response {
     ([(header::CONTENT_TYPE, "text/x-nix-cache-info")], body).into_response()
 }
 
-async fn get_narinfo(State(st): State<Arc<ProxyState>>, UrlPath(file): UrlPath<String>) -> Response {
-    st.fetch.stats.narinfo_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+async fn get_narinfo(
+    State(st): State<Arc<ProxyState>>,
+    UrlPath(file): UrlPath<String>,
+) -> Response {
+    st.fetch
+        .stats
+        .narinfo_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let miss = || {
-        st.fetch.stats.narinfo_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        st.fetch
+            .stats
+            .narinfo_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         StatusCode::NOT_FOUND.into_response()
     };
     let Some(hash_part) = file.strip_suffix(".narinfo") else {
@@ -155,7 +166,10 @@ async fn get_narinfo(State(st): State<Arc<ProxyState>>, UrlPath(file): UrlPath<S
     let rows = {
         let index = st.index.clone();
         let hp = hash_part.to_owned();
-        match tokio::task::spawn_blocking(move || index.lookup_hash_part(&hp)).await.unwrap() {
+        match tokio::task::spawn_blocking(move || index.lookup_hash_part(&hp))
+            .await
+            .unwrap()
+        {
             Ok(rows) => rows,
             Err(e) => {
                 // The index is disposable state and this substituter is consulted FIRST: a 500
@@ -180,7 +194,10 @@ async fn get_narinfo(State(st): State<Arc<ProxyState>>, UrlPath(file): UrlPath<S
             if st.fetch.refuses_while_roaming(row.info.nar_size) {
                 return miss();
             }
-            ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], rewrite_for_client(&row.info))
+            (
+                [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
+                rewrite_for_client(&row.info),
+            )
                 .into_response()
         }
         None => miss(),
@@ -193,9 +210,15 @@ async fn get_nar(
     method: axum::http::Method,
     headers: HeaderMap,
 ) -> Response {
-    st.fetch.stats.nar_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    st.fetch
+        .stats
+        .nar_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let miss = || {
-        st.fetch.stats.nar_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        st.fetch
+            .stats
+            .nar_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         StatusCode::NOT_FOUND.into_response()
     };
     let nar_hash: [u8; 32] = match file
@@ -270,9 +293,18 @@ async fn get_nar(
     }
 
     let (tx, rx) = mpsc::channel::<std::io::Result<bytes::Bytes>>(8);
-    tokio::spawn(fetch::run_transfer(st.clone(), best.info.clone(), sources, start, end, tx));
+    tokio::spawn(fetch::run_transfer(
+        st.clone(),
+        best.info.clone(),
+        sources,
+        start,
+        end,
+        tx,
+    ));
     builder
-        .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
         .unwrap()
 }
 
@@ -288,6 +320,16 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
     use std::time::Instant;
+
+    fn open_test_index(
+        cache: &Path,
+        name: &str,
+        peer_names: &[String],
+        keys: TrustedKeys,
+    ) -> Arc<Index> {
+        let store = Arc::new(crate::store::rocks::RocksStore::open(cache).unwrap());
+        Arc::new(Index::open(store, name, peer_names, keys, std::time::Duration::ZERO).unwrap())
+    }
 
     async fn spawn_router(router: Router) -> String {
         spawn_router_killable(router).await.0
@@ -341,10 +383,12 @@ mod tests {
     ) -> TestNode {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(StoreDb::open(db_path, store_dir).unwrap());
-        let peer_names: Vec<String> =
-            all.iter().filter(|n| **n != name).map(|s| s.to_string()).collect();
-        let index =
-            Arc::new(Index::open(&dir.path().join("cache"), name, &peer_names, keys).unwrap());
+        let peer_names: Vec<String> = all
+            .iter()
+            .filter(|n| **n != name)
+            .map(|s| s.to_string())
+            .collect();
+        let index = open_test_index(&dir.path().join("cache"), name, &peer_names, keys);
         index.sync_own_db(&db).unwrap();
         let scfg: ServeCfg = toml::from_str(&format!(
             "listen = \"127.0.0.1:0\"\nstore_dir = {store_dir:?}\ndb_path = {:?}",
@@ -353,8 +397,14 @@ mod tests {
         .unwrap();
         let serve_state = serve::ServeState::new(db.clone(), SegmentReader::for_tests(), scfg);
         let peers = Arc::new(
-            Peers::new(&[], std::time::Duration::from_secs(5), 3, std::time::Duration::from_secs(15), 8)
-                .unwrap(),
+            Peers::new(
+                &[],
+                std::time::Duration::from_secs(5),
+                3,
+                std::time::Duration::from_secs(15),
+                8,
+            )
+            .unwrap(),
         );
         let s = sync::Sync::new(index.clone(), peers, Some(db.clone()), None);
         let status = crate::status::router(Arc::new(crate::status::StatusCtx {
@@ -366,9 +416,14 @@ mod tests {
             serve: Some(serve_state.clone()),
         }));
         let (url, handle) =
-            spawn_router_killable(serve::router(serve_state).merge(s.router()).merge(status))
-                .await;
-        TestNode { url, index, db, handle, _dir: dir }
+            spawn_router_killable(serve::router(serve_state).merge(s.router()).merge(status)).await;
+        TestNode {
+            url,
+            index,
+            db,
+            handle,
+            _dir: dir,
+        }
     }
 
     /// The consuming side: a proxy backed by its own index, syncing from the given nodes.
@@ -378,6 +433,7 @@ mod tests {
         pub sync: Arc<sync::Sync>,
         pub index: Arc<Index>,
         pub dir: tempfile::TempDir,
+        pub handle: tokio::task::JoinHandle<()>,
     }
 
     pub(crate) async fn spawn_client(
@@ -417,8 +473,7 @@ mod tests {
             .unwrap(),
         );
         let peer_names: Vec<String> = cfg.peers.iter().map(|p| p.name.clone()).collect();
-        let index =
-            Arc::new(Index::open(&dir.path().join("cache"), name, &peer_names, keys).unwrap());
+        let index = open_test_index(&dir.path().join("cache"), name, &peer_names, keys);
         let s = sync::Sync::new(index.clone(), peers.clone(), None, None);
         let state = ProxyState::new(
             peers,
@@ -434,8 +489,15 @@ mod tests {
             sync: Some(s.clone()),
             serve: None,
         }));
-        let url = spawn_router(router(state.clone()).merge(status)).await;
-        TestClient { url, state, sync: s, index, dir }
+        let (url, handle) = spawn_router_killable(router(state.clone()).merge(status)).await;
+        TestClient {
+            url,
+            state,
+            sync: s,
+            index,
+            dir,
+            handle,
+        }
     }
 
     impl TestClient {
@@ -444,6 +506,15 @@ mod tests {
             for i in 0..self.state.peers.list.len() {
                 let _ = self.sync.pull_from(i).await;
             }
+        }
+
+        /// A REAL restart: kill the server task and drop every Arc so the rocksdb store's
+        /// process-exclusive lock is released before the same cache dir is reopened. (The v1
+        /// sqlite layout tolerated concurrent opens; rocksdb correctly does not.)
+        pub(crate) async fn shutdown(self) -> tempfile::TempDir {
+            self.handle.abort();
+            let _ = self.handle.await;
+            self.dir
         }
     }
 
@@ -454,7 +525,11 @@ mod tests {
         std::fs::write(path.join("data/blob.bin"), vec![0x5au8; 20_000]).unwrap();
         std::fs::write(path.join("readme"), b"hello\n").unwrap();
         let table = nar::build(&path).unwrap();
-        (store.to_str().unwrap().to_owned(), table.nar_size, nar_hash_of(&path))
+        (
+            store.to_str().unwrap().to_owned(),
+            table.nar_size,
+            nar_hash_of(&path),
+        )
     }
 
     /// One CA path and one non-CA path, in a fresh fake store.
@@ -502,19 +577,24 @@ mod tests {
     async fn proxy_end_to_end_via_the_index() {
         let dir = tempfile::tempdir().unwrap();
         let (store_dir, db_path, nar_size, nar_hash) = fake_store(dir.path());
-        let node =
-            spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
-        let client =
-            spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
+        let node = spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let client = spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
         client.sync_all().await;
         let http = reqwest::Client::new();
 
-        let ci = http.get(format!("{}/nix-cache-info", client.url)).send().await.unwrap();
+        let ci = http
+            .get(format!("{}/nix-cache-info", client.url))
+            .send()
+            .await
+            .unwrap();
         assert!(ci.text().await.unwrap().contains("WantMassQuery: 1"));
 
         // The CA path resolves LOCALLY (the node could even be down for this part).
         let ni = http
-            .get(format!("{}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo", client.url))
+            .get(format!(
+                "{}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo",
+                client.url
+            ))
             .send()
             .await
             .unwrap();
@@ -526,14 +606,20 @@ mod tests {
 
         // The non-CA unsigned path was never exported: infeasible, free local miss.
         let no = http
-            .get(format!("{}/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.narinfo", client.url))
+            .get(format!(
+                "{}/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.narinfo",
+                client.url
+            ))
             .send()
             .await
             .unwrap();
         assert_eq!(no.status(), 404);
         // Unknown path: also a free local miss.
         let miss = http
-            .get(format!("{}/cccccccccccccccccccccccccccccccc.narinfo", client.url))
+            .get(format!(
+                "{}/cccccccccccccccccccccccccccccccc.narinfo",
+                client.url
+            ))
             .send()
             .await
             .unwrap();
@@ -548,7 +634,11 @@ mod tests {
             .bytes()
             .await
             .unwrap();
-        let relayed = http.get(format!("{}/nar/{nar32}.nar", client.url)).send().await.unwrap();
+        let relayed = http
+            .get(format!("{}/nar/{nar32}.nar", client.url))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(relayed.status(), 200);
         let relayed = relayed.bytes().await.unwrap();
         assert_eq!(direct, relayed);
@@ -564,7 +654,11 @@ mod tests {
         assert_eq!(part.bytes().await.unwrap(), direct.slice(100..4201));
 
         let nar9 = crate::nixbase32::encode(&[9u8; 32]);
-        let miss = http.get(format!("{}/nar/{nar9}.nar", client.url)).send().await.unwrap();
+        let miss = http
+            .get(format!("{}/nar/{nar9}.nar", client.url))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(miss.status(), 404);
     }
 
@@ -606,8 +700,8 @@ mod tests {
                         let mut nf = link.next_free.lock().await;
                         let now = tokio::time::Instant::now();
                         let begin = if *nf > now { *nf } else { now };
-                        let fin = begin
-                            + std::time::Duration::from_secs_f64((end - start) as f64 / rate);
+                        let fin =
+                            begin + std::time::Duration::from_secs_f64((end - start) as f64 / rate);
                         *nf = fin;
                         fin
                     };
@@ -625,7 +719,7 @@ mod tests {
     fn seed_two_holders(client: &TestClient, payload: &bytes::Bytes, name: &str) -> String {
         use sha2::{Digest, Sha256};
         let h: [u8; 32] = Sha256::digest(payload).into();
-        let ni = proto::Narinfo {
+        let att = proto::Attestation {
             store_path: format!("/nix/store/{}-{name}", "r".repeat(32)),
             nar_hash: h.to_vec(),
             nar_size: payload.len() as u64,
@@ -633,8 +727,8 @@ mod tests {
             ca: "fixed:r:sha256:dummy".into(),
             sigs: vec![],
         };
-        client.index.apply_snapshot("a", 1, 1, std::slice::from_ref(&ni)).unwrap();
-        client.index.apply_snapshot("b", 1, 1, &[ni]).unwrap();
+        client.index.seed_fact("a", att.clone());
+        client.index.seed_fact("b", att);
         crate::nixbase32::encode(&h)
     }
 
@@ -677,7 +771,10 @@ mod tests {
         // exceed decisions. Attribution stays exact: the slow peer is never a hedge partner
         // (partners are drawn for below-uniform primaries, and the slow peer is the only one
         // below uniform here), so ok_b counts exactly the slow-primary decisions.
-        assert!((ok_a + ok_b) as usize >= T1, "at least one completion per fetch");
+        assert!(
+            (ok_a + ok_b) as usize >= T1,
+            "at least one completion per fetch"
+        );
         let ok_b = picks_b_at[T1 - 1]; // slow picks at the moment the burst ended
         let loss_b = 1.0 - 1.0 / 64.0;
         let regret = ok_b as f64 * loss_b;
@@ -744,29 +841,29 @@ mod tests {
         if let Some(rb) = rb {
             let link_b = FluidLink::new(rb);
             let url_b = spawn_router(throttled_peer(link_b, payload.clone())).await;
-            client = spawn_client("c", &[("a", &url_a), ("b", &url_b)], "", TrustedKeys::none())
-                .await;
+            client = spawn_client(
+                "c",
+                &[("a", &url_a), ("b", &url_b)],
+                "",
+                TrustedKeys::none(),
+            )
+            .await;
             nar32 = seed_two_holders(&client, &payload, "agg");
         } else {
             client = spawn_client("c", &[("a", &url_a)], "", TrustedKeys::none()).await;
             use sha2::{Digest, Sha256};
             let h: [u8; 32] = Sha256::digest(&payload).into();
-            client
-                .index
-                .apply_snapshot(
-                    "a",
-                    1,
-                    1,
-                    &[proto::Narinfo {
-                        store_path: format!("/nix/store/{}-agg", "r".repeat(32)),
-                        nar_hash: h.to_vec(),
-                        nar_size: payload.len() as u64,
-                        references: vec![],
-                        ca: "fixed:r:sha256:dummy".into(),
-                        sigs: vec![],
-                    }],
-                )
-                .unwrap();
+            client.index.seed_fact(
+                "a",
+                proto::Attestation {
+                    store_path: format!("/nix/store/{}-agg", "r".repeat(32)),
+                    nar_hash: h.to_vec(),
+                    nar_size: payload.len() as u64,
+                    references: vec![],
+                    ca: "fixed:r:sha256:dummy".into(),
+                    sigs: vec![],
+                },
+            );
             nar32 = crate::nixbase32::encode(&h);
         }
         let http = reqwest::Client::new();
@@ -775,7 +872,11 @@ mod tests {
             let b = http.get(&url).send().await.unwrap().bytes().await.unwrap();
             assert_eq!(b.len(), payload.len());
         }
-        let base_b = client.state.fetch.peer_tally(1.min(client.state.peers.list.len() - 1)).2;
+        let base_b = client
+            .state
+            .fetch
+            .peer_tally(1.min(client.state.peers.list.len() - 1))
+            .2;
         let base_a = client.state.fetch.peer_tally(0).2;
         let mut walls = Vec::new();
         for _ in 0..5 {
@@ -802,7 +903,11 @@ mod tests {
             .iter()
             .map(|w| (w * 1000.0).round() / 1000.0)
             .collect();
-        ((payload.len() as f64 / MB as f64) / median, share_b, weights)
+        (
+            (payload.len() as f64 / MB as f64) / median,
+            share_b,
+            weights,
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -816,8 +921,13 @@ mod tests {
         let payload = bytes::Bytes::from(vec![0x66u8; 256 * 1024]);
         let url_a = spawn_router(throttled_peer(link_a, payload.clone())).await;
         let url_b = spawn_router(throttled_peer(link_b, payload.clone())).await;
-        let client =
-            spawn_client("c", &[("a", &url_a), ("b", &url_b)], "", TrustedKeys::none()).await;
+        let client = spawn_client(
+            "c",
+            &[("a", &url_a), ("b", &url_b)],
+            "",
+            TrustedKeys::none(),
+        )
+        .await;
         let nar32 = seed_two_holders(&client, &payload, "hedge");
         client.state.fetch.pool.restore(&[1.0, 0.03], 64e6, 0.05);
         client.state.fetch.set_rate(0, 64e6);
@@ -852,8 +962,13 @@ mod tests {
         let payload = bytes::Bytes::from(vec![0x42u8; 256 * 1024]);
         let url_a = spawn_router(throttled_peer(link_a.clone(), payload.clone())).await;
         let url_b = spawn_router(throttled_peer(link_b.clone(), payload.clone())).await;
-        let client =
-            spawn_client("c", &[("a", &url_a), ("b", &url_b)], "", TrustedKeys::none()).await;
+        let client = spawn_client(
+            "c",
+            &[("a", &url_a), ("b", &url_b)],
+            "",
+            TrustedKeys::none(),
+        )
+        .await;
         client.state.fetch.pool.set_eta(eta);
         client.state.fetch.pool.set_share(share);
         client.state.fetch.set_nu(nu);
@@ -915,8 +1030,13 @@ mod tests {
         let payload = bytes::Bytes::from(vec![0x43u8; 32 * 1024 * 1024]);
         let url_a = spawn_router(throttled_peer(link_a, payload.clone())).await;
         let url_b = spawn_router(throttled_peer(link_b, payload.clone())).await;
-        let client =
-            spawn_client("c", &[("a", &url_a), ("b", &url_b)], "", TrustedKeys::none()).await;
+        let client = spawn_client(
+            "c",
+            &[("a", &url_a), ("b", &url_b)],
+            "",
+            TrustedKeys::none(),
+        )
+        .await;
         client.state.fetch.pool.set_eta(eta);
         client.state.fetch.pool.set_share(share);
         client.state.fetch.set_nu(nu);
@@ -963,9 +1083,13 @@ mod tests {
             let small = bytes::Bytes::from(vec![0x37u8; 256 * 1024]);
             let url_a = spawn_router(throttled_peer(link_a.clone(), small.clone())).await;
             let url_b = spawn_router(throttled_peer(link_b.clone(), small.clone())).await;
-            let client =
-                spawn_client("c", &[("a", &url_a), ("b", &url_b)], "", TrustedKeys::none())
-                    .await;
+            let client = spawn_client(
+                "c",
+                &[("a", &url_a), ("b", &url_b)],
+                "",
+                TrustedKeys::none(),
+            )
+            .await;
             client.state.fetch.set_nu(nu);
             let nar32 = seed_two_holders(&client, &small, "par");
             let http = reqwest::Client::new();
@@ -1032,7 +1156,11 @@ mod tests {
             for wc in [false, true] {
                 crate::fetch::BENCH_WORK_CONSERVING.store(wc, Ordering::SeqCst);
                 let (mbps, share_b, weights) = aggregation_run(ra, Some(rb)).await;
-                let policy = if wc { "work-conserving(old)" } else { "proportional(new)" };
+                let policy = if wc {
+                    "work-conserving(old)"
+                } else {
+                    "proportional(new)"
+                };
                 println!(
                     "[agg] {tag} {policy}: median {mbps:.1} MB/s (fluid single-best {}, \
                      sum {}); slow byte share {share_b:.1}%; learned weights {weights:?}",
@@ -1055,9 +1183,7 @@ mod tests {
     #[ignore] // measurement bench, not a correctness test
     async fn mw_regret_striped_skew() {
         const MB: u64 = 1_000_000;
-        for (ra, rb, tag, floor) in
-            [(64 * MB, MB, "64:1", 0.8), (32 * MB, 8 * MB, "4:1", 0.7)]
-        {
+        for (ra, rb, tag, floor) in [(64 * MB, MB, "64:1", 0.8), (32 * MB, 8 * MB, "4:1", 0.7)] {
             let link_a = FluidLink::new(ra);
             let link_b = FluidLink::new(rb);
             let payload = bytes::Bytes::from(vec![(ra % 251) as u8; 32 * 1024 * 1024]);
@@ -1100,7 +1226,11 @@ mod tests {
             // learned rates) and take the median of 5 fetches: a ~W_MIN-probability draw
             // still hands the slow peer one ~2 s chunk — that IS the ping — so single
             // fetches have a deliberate fat tail the median ignores.
-            client.state.fetch.pool.restore(&[1.0, 0.03], ra as f64, 0.05);
+            client
+                .state
+                .fetch
+                .pool
+                .restore(&[1.0, 0.03], ra as f64, 0.05);
             client.state.fetch.set_rate(0, ra as f64);
             client.state.fetch.set_rate(1, rb as f64);
             let mut walls = Vec::new();
@@ -1134,8 +1264,7 @@ mod tests {
     async fn status_endpoint_reports_the_whole_story() {
         let dir = tempfile::tempdir().unwrap();
         let (store_dir, db_path, nar_size, nar_hash) = fake_store(dir.path());
-        let node =
-            spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let node = spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
         let client = spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
         client.sync_all().await;
         let http = reqwest::Client::new();
@@ -1153,8 +1282,11 @@ mod tests {
         let fetch_status = |url: String| {
             let http = http.clone();
             async move {
-                let text =
-                    http.get(format!("{url}/narshare/v1/status")).send().await.unwrap();
+                let text = http
+                    .get(format!("{url}/narshare/v1/status"))
+                    .send()
+                    .await
+                    .unwrap();
                 assert_eq!(
                     text.headers()[reqwest::header::CONTENT_TYPE],
                     "application/json"
@@ -1182,8 +1314,14 @@ mod tests {
         assert_eq!(peer["breaker"]["opens_total"], 0);
         assert!(st["proxy"]["bytes"]["remote"].as_u64().unwrap() >= nar_size);
         assert!(st["sync"]["pulls_ok"].as_u64().unwrap() >= 1);
-        assert!(st["sync"]["snapshots_applied"].as_u64().unwrap() >= 1, "first contact");
-        assert!(st["serve"].is_null(), "a proxy-only node reports no serve section");
+        assert!(
+            st["sync"]["snapshots_applied"].as_u64().unwrap() >= 1,
+            "first contact"
+        );
+        assert!(
+            st["serve"].is_null(),
+            "a proxy-only node reports no serve section"
+        );
 
         // The holder's view: serve counters moved, sync requests were served, and the index
         // identity (per-origin generation/seq) agrees exactly with the client's — the
@@ -1213,8 +1351,7 @@ mod tests {
         // committing a 200 and coasting to the stall timeout.
         let dir = tempfile::tempdir().unwrap();
         let (store_dir, db_path, _nar_size, nar_hash) = fake_store(dir.path());
-        let node =
-            spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let node = spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
         let client = spawn_client(
             "c",
             &[("a", &node.url)],
@@ -1230,8 +1367,11 @@ mod tests {
         client.state.peers.strike(0); // the only holder trips its breaker
         assert_eq!(http.get(&url).send().await.unwrap().status(), 404);
         let nar32 = crate::nixbase32::encode(&nar_hash);
-        let nar =
-            http.get(format!("{}/nar/{nar32}.nar", client.url)).send().await.unwrap();
+        let nar = http
+            .get(format!("{}/nar/{nar32}.nar", client.url))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(nar.status(), 404);
 
         // Cooldown elapsed: half-open counts as available, the path serves again.
@@ -1245,27 +1385,21 @@ mod tests {
         // the persistent index answers by narhash with no peer round-trip.
         let dir = tempfile::tempdir().unwrap();
         let (store_dir, db_path, nar_size, nar_hash) = fake_store(dir.path());
-        let node =
-            spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
-        let first =
-            spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
+        let node = spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let first = spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
         first.sync_all().await;
-        let cache_dir = first.dir;
-        drop(first.state);
+        let cache_dir = first.shutdown().await;
 
         // "Restart": same cache dir, fresh everything else, NO sync.
-        let second = spawn_client_at(
-            "c",
-            &[("a", &node.url)],
-            "",
-            TrustedKeys::none(),
-            cache_dir,
-        )
-        .await;
+        let second =
+            spawn_client_at("c", &[("a", &node.url)], "", TrustedKeys::none(), cache_dir).await;
         let nar32 = crate::nixbase32::encode(&nar_hash);
         let http = reqwest::Client::new();
-        let resp =
-            http.get(format!("{}/nar/{nar32}.nar", second.url)).send().await.unwrap();
+        let resp = http
+            .get(format!("{}/nar/{nar32}.nar", second.url))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.bytes().await.unwrap().len() as u64, nar_size);
     }
@@ -1274,13 +1408,23 @@ mod tests {
     async fn mw_weights_warm_start_across_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (store_dir, db_path, _sz, _hash) = fake_store(dir.path());
-        let node =
-            spawn_node("a", &["a", "b", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let node = spawn_node(
+            "a",
+            &["a", "b", "c"],
+            &store_dir,
+            &db_path,
+            TrustedKeys::none(),
+        )
+        .await;
         // Two peers so relative weights exist (the pool renormalizes max → 1.0): "b" is dead.
         let peers: [(&str, &str); 2] = [("a", &node.url), ("b", "http://127.0.0.1:9")];
         let first = spawn_client("c", &peers, "", TrustedKeys::none()).await;
         for _ in 0..8 {
-            first.state.fetch.pool.record_success(0, 8 << 20, std::time::Duration::from_secs(1));
+            first
+                .state
+                .fetch
+                .pool
+                .record_success(0, 8 << 20, std::time::Duration::from_secs(1));
             first.state.fetch.pool.record_failure(1);
         }
         let (w, br, al, _) = first.state.fetch.pool.snapshot();
@@ -1289,14 +1433,19 @@ mod tests {
             .index
             .save_mw(&["a".to_string(), "b".to_string()], &w, br, al)
             .unwrap();
-        let cache = first.dir;
-        drop(first.state);
+        let cache = first.shutdown().await;
 
         // "Restart": same cache dir. The pool must start already knowing b is bad.
         let second = spawn_client_at("c", &peers, "", TrustedKeys::none(), cache).await;
         let (w2, br2, _, obs) = second.state.fetch.pool.snapshot();
-        assert_eq!(obs, 0, "no observations yet — this is purely restored state");
-        assert!(w2[1] < 0.1, "restored weights must reflect the learned collapse: {w2:?}");
+        assert_eq!(
+            obs, 0,
+            "no observations yet — this is purely restored state"
+        );
+        assert!(
+            w2[1] < 0.1,
+            "restored weights must reflect the learned collapse: {w2:?}"
+        );
         assert!((w2[0] - 1.0).abs() < 0.01);
         assert!(br2 > 0.0, "the yardstick survives (staleness-decayed)");
     }
@@ -1305,14 +1454,15 @@ mod tests {
     async fn gc_on_the_holder_propagates_to_a_404() {
         let dir = tempfile::tempdir().unwrap();
         let (store_dir, db_path, _nar_size, _nar_hash) = fake_store(dir.path());
-        let node =
-            spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
-        let client =
-            spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
+        let node = spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let client = spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
         client.sync_all().await;
         let http = reqwest::Client::new();
         let ok = http
-            .get(format!("{}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo", client.url))
+            .get(format!(
+                "{}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo",
+                client.url
+            ))
             .send()
             .await
             .unwrap();
@@ -1326,13 +1476,21 @@ mod tests {
         assert!(node.index.sync_own_db(&node.db).unwrap() > 0);
         client.sync_all().await;
         let gone = http
-            .get(format!("{}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo", client.url))
+            .get(format!(
+                "{}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo",
+                client.url
+            ))
             .send()
             .await
             .unwrap();
-        assert_eq!(gone.status(), 404, "a GC'd path must disappear from the mesh index");
-        // And the orphaned narinfo (with its sigs) was dropped, not retained.
-        assert_eq!(client.index.count_narinfos(), 0);
+        assert_eq!(
+            gone.status(),
+            404,
+            "a GC'd path must disappear from the mesh index"
+        );
+        // The fact lost its last holder; with the test fixtures' zero grace, the compaction
+        // that rides the pull reaped it.
+        assert_eq!(client.index.count_attestations(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1348,8 +1506,14 @@ mod tests {
         let empty_db = crate::db::tests::fake_db(bdir.path(), &[]);
         let bstore = bdir.path().join("empty");
         std::fs::create_dir_all(&bstore).unwrap();
-        let b = spawn_node("b", &all, bstore.to_str().unwrap(), &empty_db, TrustedKeys::none())
-            .await;
+        let b = spawn_node(
+            "b",
+            &all,
+            bstore.to_str().unwrap(),
+            &empty_db,
+            TrustedKeys::none(),
+        )
+        .await;
         // Drive b's pull from a deterministically.
         let b_peers = Arc::new(
             Peers::new(
@@ -1430,7 +1594,10 @@ mod tests {
         let remote = client.state.fetch.stats.remote_bytes.load(Ordering::SeqCst);
         assert_eq!(remote, nar_size);
         let wire = client.state.fetch.stats.wire_bytes.load(Ordering::SeqCst);
-        assert!(wire < remote / 2, "expected compression: wire {wire} vs remote {remote}");
+        assert!(
+            wire < remote / 2,
+            "expected compression: wire {wire} vs remote {remote}"
+        );
         // Both holders were known to the index (striping had two sources).
         let rows = client.index.lookup_nar_hash(&nar_hash).unwrap();
         assert_eq!(rows[0].holders.len(), 2);
@@ -1466,7 +1633,11 @@ mod tests {
             .await
             .unwrap();
         killer.await.unwrap();
-        assert_eq!(striped.len() as u64, nar_size, "transfer must complete via peer b");
+        assert_eq!(
+            striped.len() as u64,
+            nar_size,
+            "transfer must complete via peer b"
+        );
         use sha2::{Digest, Sha256};
         let got: [u8; 32] = Sha256::digest(&striped).into();
         assert_eq!(got, nar_hash, "bytes must be intact after failover");
@@ -1485,15 +1656,16 @@ mod tests {
             dir.path(),
             &[(&ca_path, wrong, nar_size, Some("fixed:r:sha256:dummy"))],
         );
-        let node =
-            spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
-        let client =
-            spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
+        let node = spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let client = spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
         client.sync_all().await;
         let http = reqwest::Client::new();
         let nar32 = crate::nixbase32::encode(&wrong);
-        let resp =
-            http.get(format!("{}/nar/{nar32}.nar", client.url)).send().await.unwrap();
+        let resp = http
+            .get(format!("{}/nar/{nar32}.nar", client.url))
+            .send()
+            .await
+            .unwrap();
         let body = resp.bytes().await;
         assert!(body.is_err(), "hash mismatch must abort the body");
     }
@@ -1502,8 +1674,7 @@ mod tests {
     async fn min_bandwidth_aborts_and_roaming_epoch_refuses() {
         let dir = tempfile::tempdir().unwrap();
         let (store_dir, db_path, _sz, nar_hash) = big_store(dir.path(), 3 << 20);
-        let node =
-            spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let node = spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
         let client = spawn_client(
             "c",
             &[("a", &node.url)],
@@ -1517,16 +1688,29 @@ mod tests {
         client.sync_all().await;
         let http = reqwest::Client::new();
         let nar32 = crate::nixbase32::encode(&nar_hash);
-        let resp =
-            http.get(format!("{}/nar/{nar32}.nar", client.url)).send().await.unwrap();
-        assert!(resp.bytes().await.is_err(), "below-floor transfer must abort");
-        assert!(client.state.fetch.refuses_while_roaming(3 << 20));
-        let again = http
-            .get(format!("{}/gggggggggggggggggggggggggggggggg.narinfo", client.url))
+        let resp = http
+            .get(format!("{}/nar/{nar32}.nar", client.url))
             .send()
             .await
             .unwrap();
-        assert_eq!(again.status(), 404, "roaming epoch must refuse the oversized path");
+        assert!(
+            resp.bytes().await.is_err(),
+            "below-floor transfer must abort"
+        );
+        assert!(client.state.fetch.refuses_while_roaming(3 << 20));
+        let again = http
+            .get(format!(
+                "{}/gggggggggggggggggggggggggggggggg.narinfo",
+                client.url
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            again.status(),
+            404,
+            "roaming epoch must refuse the oversized path"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1536,7 +1720,9 @@ mod tests {
         let path = store.join("hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-dup-1.0");
         std::fs::create_dir_all(&path).unwrap();
         let x: Vec<u8> = (0..4u32 << 20).map(|i| (i % 249) as u8).collect();
-        let d: Vec<u8> = (0..4u32 << 20).map(|i| (i % 247).wrapping_add(13) as u8).collect();
+        let d: Vec<u8> = (0..4u32 << 20)
+            .map(|i| (i % 247).wrapping_add(13) as u8)
+            .collect();
         std::fs::write(path.join("a-copy1"), &x).unwrap();
         std::fs::write(path.join("b-copy2"), &x).unwrap();
         std::fs::write(path.join("c-copy3"), &x).unwrap();
@@ -1553,8 +1739,7 @@ mod tests {
                 Some("fixed:r:sha256:dummy"),
             )],
         );
-        let node =
-            spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let node = spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
         let client = spawn_client(
             "c",
             &[("a", &node.url)],
@@ -1585,10 +1770,23 @@ mod tests {
         assert_eq!(deduped, direct, "dedup reconstruction must be byte-exact");
 
         let remote = client.state.fetch.stats.remote_bytes.load(Ordering::SeqCst);
-        let replayed = client.state.fetch.stats.replayed_bytes.load(Ordering::SeqCst);
+        let replayed = client
+            .state
+            .fetch
+            .stats
+            .replayed_bytes
+            .load(Ordering::SeqCst);
         let lits = client.state.fetch.stats.lit_bytes.load(Ordering::SeqCst);
-        assert_eq!(remote, 8 << 20, "each distinct blob crosses the wire exactly once");
-        assert_eq!(replayed, 8 << 20, "the two duplicate occurrences replay from retention");
+        assert_eq!(
+            remote,
+            8 << 20,
+            "each distinct blob crosses the wire exactly once"
+        );
+        assert_eq!(
+            replayed,
+            8 << 20,
+            "the two duplicate occurrences replay from retention"
+        );
         assert!(lits > 0, "framing must be synthesized locally");
     }
 
@@ -1632,28 +1830,29 @@ mod tests {
             TrustedKeys::none(),
         )
         .await;
-        client
-            .index
-            .apply_snapshot(
-                "die",
-                1,
-                1,
-                &[proto::Narinfo {
-                    store_path: "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-x".into(),
-                    nar_hash: vec![7u8; 32],
-                    nar_size: 1_000_000,
-                    references: vec![],
-                    ca: "fixed:r:sha256:dummy".into(),
-                    sigs: vec![],
-                }],
-            )
-            .unwrap();
+        client.index.seed_fact(
+            "die",
+            proto::Attestation {
+                store_path: "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-x".into(),
+                nar_hash: vec![7u8; 32],
+                nar_size: 1_000_000,
+                references: vec![],
+                ca: "fixed:r:sha256:dummy".into(),
+                sigs: vec![],
+            },
+        );
 
         let http = reqwest::Client::new();
         let started = Instant::now();
-        let resp =
-            http.get(format!("{}/nar/{nar32}.nar", client.url)).send().await.unwrap();
-        assert!(resp.bytes().await.is_err(), "stalled relay should abort the body");
+        let resp = http
+            .get(format!("{}/nar/{nar32}.nar", client.url))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.bytes().await.is_err(),
+            "stalled relay should abort the body"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "the watchdog, not a 20 s chunk deadline, must own this abort"
@@ -1690,22 +1889,17 @@ mod tests {
             TrustedKeys::none(),
         )
         .await;
-        client
-            .index
-            .apply_snapshot(
-                "slow",
-                1,
-                1,
-                &[proto::Narinfo {
-                    store_path: "/nix/store/ffffffffffffffffffffffffffffffff-y".into(),
-                    nar_hash: nar_hash.to_vec(),
-                    nar_size: SIZE as u64,
-                    references: vec![],
-                    ca: "fixed:r:sha256:dummy".into(),
-                    sigs: vec![],
-                }],
-            )
-            .unwrap();
+        client.index.seed_fact(
+            "slow",
+            proto::Attestation {
+                store_path: "/nix/store/ffffffffffffffffffffffffffffffff-y".into(),
+                nar_hash: nar_hash.to_vec(),
+                nar_size: SIZE as u64,
+                references: vec![],
+                ca: "fixed:r:sha256:dummy".into(),
+                sigs: vec![],
+            },
+        );
 
         let http = reqwest::Client::new();
         let nar32 = crate::nixbase32::encode(&nar_hash);
@@ -1741,7 +1935,11 @@ mod tests {
                 tokio::spawn(async move {
                     let payload = vec![0x77u8; SIZE];
                     for chunk in payload.chunks(2_000) {
-                        if tx.send(Ok(bytes::Bytes::copy_from_slice(chunk))).await.is_err() {
+                        if tx
+                            .send(Ok(bytes::Bytes::copy_from_slice(chunk)))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
@@ -1749,7 +1947,9 @@ mod tests {
                 });
                 Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
-                    .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+                    .body(Body::from_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(rx),
+                    ))
                     .unwrap()
             }),
         );
@@ -1763,22 +1963,17 @@ mod tests {
             TrustedKeys::none(),
         )
         .await;
-        client
-            .index
-            .apply_snapshot(
-                "drip",
-                1,
-                1,
-                &[proto::Narinfo {
-                    store_path: "/nix/store/dddddddddddddddddddddddddddddddd-slow".into(),
-                    nar_hash: nar_hash.to_vec(),
-                    nar_size: SIZE as u64,
-                    references: vec![],
-                    ca: "fixed:r:sha256:dummy".into(),
-                    sigs: vec![],
-                }],
-            )
-            .unwrap();
+        client.index.seed_fact(
+            "drip",
+            proto::Attestation {
+                store_path: "/nix/store/dddddddddddddddddddddddddddddddd-slow".into(),
+                nar_hash: nar_hash.to_vec(),
+                nar_size: SIZE as u64,
+                references: vec![],
+                ca: "fixed:r:sha256:dummy".into(),
+                sigs: vec![],
+            },
+        );
         let http = reqwest::Client::new();
         let nar32 = crate::nixbase32::encode(&nar_hash);
         let body = http
@@ -1790,7 +1985,10 @@ mod tests {
             .await
             .expect("a slow-but-alive transfer must complete, not stall out");
         assert_eq!(body.len(), SIZE);
-        assert_eq!(hex::encode::<[u8; 32]>(Sha256::digest(&body).into()), sha_hex);
+        assert_eq!(
+            hex::encode::<[u8; 32]>(Sha256::digest(&body).into()),
+            sha_hex
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1829,28 +2027,29 @@ mod tests {
             TrustedKeys::none(),
         )
         .await;
-        client
-            .index
-            .apply_snapshot(
-                "over",
-                1,
-                1,
-                &[proto::Narinfo {
-                    store_path: "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-oversized".into(),
-                    nar_hash: vec![42u8; 32],
-                    nar_size: 1_048_576,
-                    references: vec![],
-                    ca: "fixed:r:sha256:x".into(),
-                    sigs: vec![],
-                }],
-            )
-            .unwrap();
+        client.index.seed_fact(
+            "over",
+            proto::Attestation {
+                store_path: "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-oversized".into(),
+                nar_hash: vec![42u8; 32],
+                nar_size: 1_048_576,
+                references: vec![],
+                ca: "fixed:r:sha256:x".into(),
+                sigs: vec![],
+            },
+        );
         let http = reqwest::Client::new();
         let nar32 = crate::nixbase32::encode(&[42u8; 32]);
         let started = Instant::now();
-        let resp =
-            http.get(format!("{}/nar/{nar32}.nar", client.url)).send().await.unwrap();
-        assert!(resp.bytes().await.is_err(), "an over-expanding chunk must not succeed");
+        let resp = http
+            .get(format!("{}/nar/{nar32}.nar", client.url))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.bytes().await.is_err(),
+            "an over-expanding chunk must not succeed"
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(8));
     }
 
@@ -1862,14 +2061,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store_dir, db_path, nar_size, nar_hash) = big_store(dir.path(), 6 << 20);
         let db = Arc::new(StoreDb::open(&db_path, &store_dir).unwrap());
-        let index = Arc::new(
-            Index::open(
-                &dir.path().join("cache"),
-                "hangman",
-                &["c".to_string()],
-                TrustedKeys::none(),
-            )
-            .unwrap(),
+        let index = open_test_index(
+            &dir.path().join("cache"),
+            "hangman",
+            &["c".to_string()],
+            TrustedKeys::none(),
         );
         index.sync_own_db(&db).unwrap();
         let scfg: ServeCfg = toml::from_str(&format!(
@@ -1922,7 +2118,11 @@ mod tests {
             .bytes()
             .await
             .unwrap();
-        assert_eq!(body.len() as u64, nar_size, "must degrade to plain striping and finish");
+        assert_eq!(
+            body.len() as u64,
+            nar_size,
+            "must degrade to plain striping and finish"
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
@@ -1977,7 +2177,11 @@ mod tests {
                 .unwrap();
             assert_eq!(m.status(), 404, "non-UTF-8 names cannot be manifested");
         }
-        let nar = http.get(format!("{url}/nar/{nar32}.nar")).send().await.unwrap();
+        let nar = http
+            .get(format!("{url}/nar/{nar32}.nar"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(nar.status(), 200);
         assert_eq!(nar.bytes().await.unwrap().len() as u64, table.nar_size);
     }
@@ -2029,12 +2233,9 @@ mod tests {
         let table = nar::build(&path_dir).unwrap();
         let nar_hash = nar_hash_of(&path_dir);
         let store_dir = store.to_str().unwrap().to_owned();
-        let full_path =
-            format!("{store_dir}/ssssssssssssssssssssssssssssssss-signed-tool-1.0");
-        let db_path = crate::db::tests::fake_db(
-            dir.path(),
-            &[(&full_path, nar_hash, table.nar_size, None)],
-        );
+        let full_path = format!("{store_dir}/ssssssssssssssssssssssssssssssss-signed-tool-1.0");
+        let db_path =
+            crate::db::tests::fake_db(dir.path(), &[(&full_path, nar_hash, table.nar_size, None)]);
         let kp = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new([9u8; 32]));
         let info = crate::narinfo::RemoteNarinfo {
             store_path: full_path.clone(),
@@ -2059,13 +2260,19 @@ mod tests {
         let trusting = spawn_client("c", &[("a", &node.url)], "", keys()).await;
         trusting.sync_all().await;
         let ni = http
-            .get(format!("{}/ssssssssssssssssssssssssssssssss.narinfo", trusting.url))
+            .get(format!(
+                "{}/ssssssssssssssssssssssssssssssss.narinfo",
+                trusting.url
+            ))
             .send()
             .await
             .unwrap();
         assert_eq!(ni.status(), 200);
         let text = ni.text().await.unwrap();
-        assert!(text.contains("Sig: mesh-test-1:"), "signature must be relayed:\n{text}");
+        assert!(
+            text.contains("Sig: mesh-test-1:"),
+            "signature must be relayed:\n{text}"
+        );
         let nar32 = crate::nixbase32::encode(&nar_hash);
         let body = http
             .get(format!("{}/nar/{nar32}.nar", trusting.url))
@@ -2077,13 +2284,21 @@ mod tests {
             .unwrap();
         assert_eq!(body.len() as u64, table.nar_size);
 
-        // An untrusting client re-verifies at APPLY: the row never enters its index — the
-        // path costs a local miss, not a transfer.
+        // An untrusting client stores the well-formed fact for faithful relay but re-verifies
+        // at USE: the path costs a local miss, not a transfer — and re-adding the key later
+        // would wake the row without any resync.
         let untrusting = spawn_client("d", &[("a", &node.url)], "", TrustedKeys::none()).await;
         untrusting.sync_all().await;
-        assert_eq!(untrusting.index.count_narinfos(), 0);
+        assert_eq!(
+            untrusting.index.count_attestations(),
+            1,
+            "stored for relay, inert at use"
+        );
         let no = http
-            .get(format!("{}/ssssssssssssssssssssssssssssssss.narinfo", untrusting.url))
+            .get(format!(
+                "{}/ssssssssssssssssssssssssssssssss.narinfo",
+                untrusting.url
+            ))
             .send()
             .await
             .unwrap();

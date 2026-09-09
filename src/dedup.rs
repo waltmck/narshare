@@ -60,7 +60,10 @@ pub fn plan<K: Eq + Hash>(keys: &[K], sizes: &[u64], budget: u64) -> Vec<Step> {
             } else {
                 0
             };
-            steps.push(Step::Fetch { unique: u, retain_for });
+            steps.push(Step::Fetch {
+                unique: u,
+                retain_for,
+            });
         } else if resident[u] {
             steps.push(Step::Cached { unique: u });
             if p == last_pos[u] {
@@ -69,7 +72,10 @@ pub fn plan<K: Eq + Hash>(keys: &[K], sizes: &[u64], budget: u64) -> Vec<Step> {
             }
         } else {
             // A duplicate the budget could not hold: fetched again, exactly as without dedup.
-            steps.push(Step::Fetch { unique: u, retain_for: 0 });
+            steps.push(Step::Fetch {
+                unique: u,
+                retain_for: 0,
+            });
         }
     }
     steps
@@ -93,7 +99,13 @@ mod tests {
         let keys = [7u8, 1, 7, 2, 7];
         let steps = plan(&keys, &[4; 5], 1 << 20);
         assert_eq!(fetch_positions(&steps), vec![0, 1, 3]);
-        assert_eq!(steps[0], Step::Fetch { unique: 0, retain_for: 2 });
+        assert_eq!(
+            steps[0],
+            Step::Fetch {
+                unique: 0,
+                retain_for: 2
+            }
+        );
         assert_eq!(steps[2], Step::Cached { unique: 0 });
         assert_eq!(steps[4], Step::Cached { unique: 0 });
     }
@@ -102,7 +114,9 @@ mod tests {
     fn unique_segments_pass_straight_through() {
         let steps = plan(&[1u8, 2, 3, 4], &[8; 4], 1 << 20);
         assert_eq!(fetch_positions(&steps), vec![0, 1, 2, 3]);
-        assert!(steps.iter().all(|s| matches!(s, Step::Fetch { retain_for: 0, .. })));
+        assert!(steps
+            .iter()
+            .all(|s| matches!(s, Step::Fetch { retain_for: 0, .. })));
     }
 
     #[test]
@@ -110,9 +124,27 @@ mod tests {
         // Two duplicated 100-byte segments but 100 bytes of budget: only the first is retained.
         let steps = plan(&[1u8, 2, 1, 2], &[100; 4], 100);
         assert_eq!(fetch_positions(&steps), vec![0, 1, 3]);
-        assert_eq!(steps[0], Step::Fetch { unique: 0, retain_for: 1 });
-        assert_eq!(steps[1], Step::Fetch { unique: 1, retain_for: 0 });
-        assert_eq!(steps[3], Step::Fetch { unique: 1, retain_for: 0 });
+        assert_eq!(
+            steps[0],
+            Step::Fetch {
+                unique: 0,
+                retain_for: 1
+            }
+        );
+        assert_eq!(
+            steps[1],
+            Step::Fetch {
+                unique: 1,
+                retain_for: 0
+            }
+        );
+        assert_eq!(
+            steps[3],
+            Step::Fetch {
+                unique: 1,
+                retain_for: 0
+            }
+        );
     }
 
     #[test]

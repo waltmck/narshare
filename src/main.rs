@@ -15,6 +15,7 @@ mod proxy;
 mod serve;
 mod sig;
 mod status;
+mod store;
 mod sync;
 
 use anyhow::{Context, Result};
@@ -25,7 +26,11 @@ use std::time::Duration;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "narshare", version, about = "Self-contained mesh Nix substituter")]
+#[command(
+    name = "narshare",
+    version,
+    about = "Self-contained mesh Nix substituter"
+)]
 struct Cli {
     /// Path to the TOML config file.
     #[arg(short = 'c', long = "config", global = true, value_name = "FILE")]
@@ -94,16 +99,27 @@ async fn run(cfg: config::Config) -> Result<()> {
     // The mesh trust anchor and the replicated index — shared by every role.
     let trusted = sig::TrustedKeys::load(&cfg.trusted_public_keys);
     let peer_names: Vec<String> = cfg.peers.iter().map(|p| p.name.clone()).collect();
-    let idx = Arc::new(
-        index::Index::open(&cfg.cache.dir, &cfg.name, &peer_names, trusted).with_context(
-            || {
+    let idx_store: Arc<dyn store::SyncStore> = match &cfg.cache.postgres {
+        Some(url) => Arc::new(
+            store::postgres::PgStore::connect(url, "narshare", false)
+                .context("opening the postgres mesh index (cache.postgres)")?,
+        ),
+        None => Arc::new(
+            store::rocks::RocksStore::open(&cfg.cache.dir.join("index")).with_context(|| {
                 format!(
                     "opening the mesh index under {} (is [cache] dir writable?)",
                     cfg.cache.dir.display()
                 )
-            },
-        )?,
-    );
+            })?,
+        ),
+    };
+    let idx = Arc::new(index::Index::open(
+        idx_store,
+        &cfg.name,
+        &peer_names,
+        trusted,
+        cfg.cache.attestation_grace,
+    )?);
 
     let peers = if cfg.peers.is_empty() {
         None
@@ -127,8 +143,11 @@ async fn run(cfg: config::Config) -> Result<()> {
 
     if let Some(scfg) = cfg.serve {
         let listen = scfg.listen;
-        let store_dir =
-            scfg.store_dir.to_str().context("store_dir must be valid UTF-8")?.to_owned();
+        let store_dir = scfg
+            .store_dir
+            .to_str()
+            .context("store_dir must be valid UTF-8")?
+            .to_owned();
         let db = Arc::new(db::StoreDb::open(&scfg.db_path, &store_dir)?);
         nix_db_dir = scfg.db_path.parent().map(|p| p.to_path_buf());
         serve_db = Some(db.clone());

@@ -6,7 +6,11 @@ const ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 /// Number of base32 characters needed for `n` bytes.
 pub const fn encoded_len(n: usize) -> usize {
-    if n == 0 { 0 } else { (n * 8 - 1) / 5 + 1 }
+    if n == 0 {
+        0
+    } else {
+        (n * 8 - 1) / 5 + 1
+    }
 }
 
 pub fn encode(bytes: &[u8]) -> String {
@@ -17,7 +21,11 @@ pub fn encode(bytes: &[u8]) -> String {
         let i = b / 8;
         let j = b % 8;
         let lo = bytes[i] as u16 >> j;
-        let hi = if i + 1 < bytes.len() { (bytes[i + 1] as u16) << (8 - j) } else { 0 };
+        let hi = if i + 1 < bytes.len() {
+            (bytes[i + 1] as u16) << (8 - j)
+        } else {
+            0
+        };
         s.push(ALPHABET[((lo | hi) & 0x1f) as usize] as char);
     }
     s
@@ -80,7 +88,10 @@ mod tests {
         }
         assert_eq!(decode("zz", 1), None); // spill past final byte
         assert_eq!(decode("abc", 32), None); // wrong length
-        assert_eq!(decode("0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9ce3", 32), None); // 'e' not in alphabet
+        assert_eq!(
+            decode("0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9ce3", 32),
+            None
+        ); // 'e' not in alphabet
     }
 
     #[test]

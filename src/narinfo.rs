@@ -8,7 +8,10 @@ use std::fmt::Write as _;
 
 /// Basename of a store path ("<hash>-<name>").
 pub fn basename<'a>(store_path: &'a str, store_dir: &str) -> &'a str {
-    store_path.strip_prefix(store_dir).and_then(|s| s.strip_prefix('/')).unwrap_or(store_path)
+    store_path
+        .strip_prefix(store_dir)
+        .and_then(|s| s.strip_prefix('/'))
+        .unwrap_or(store_path)
 }
 
 /// Render the narinfo we serve: uncompressed NAR, URL keyed by nix32 narhash. Sig/CA pass through
@@ -23,7 +26,11 @@ pub fn format_narinfo(info: &PathInfo, store_dir: &str) -> String {
     let _ = writeln!(out, "FileSize: {}", info.nar_size);
     let _ = writeln!(out, "NarHash: sha256:{nar32}");
     let _ = writeln!(out, "NarSize: {}", info.nar_size);
-    let refs: Vec<&str> = info.references.iter().map(|r| basename(r, store_dir)).collect();
+    let refs: Vec<&str> = info
+        .references
+        .iter()
+        .map(|r| basename(r, store_dir))
+        .collect();
     let _ = writeln!(out, "References: {}", refs.join(" "));
     if let Some(d) = &info.deriver {
         let _ = writeln!(out, "Deriver: {}", basename(d, store_dir));
@@ -94,9 +101,7 @@ pub fn parse_narinfo(text: &str) -> Result<RemoteNarinfo> {
                 nar_hash = Some(<[u8; 32]>::try_from(bytes.as_slice()).unwrap());
             }
             "NarSize" => nar_size = Some(value.parse().context("bad NarSize")?),
-            "References" => {
-                references = value.split_whitespace().map(str::to_owned).collect()
-            }
+            "References" => references = value.split_whitespace().map(str::to_owned).collect(),
             "Deriver" => deriver = Some(value.to_owned()).filter(|d| !d.is_empty()),
             "CA" => ca = Some(value.to_owned()).filter(|c| !c.is_empty()),
             "Sig" if !value.is_empty() => sigs.push(value.to_owned()),
@@ -171,7 +176,10 @@ mod tests {
         assert_eq!(parsed.nar_size, 1234);
         assert_eq!(parsed.compression, "none");
         assert_eq!(parsed.ca.as_deref(), Some("fixed:r:sha256:abcd"));
-        assert_eq!(parsed.references, vec!["cccccccccccccccccccccccccccccccc-dep"]);
+        assert_eq!(
+            parsed.references,
+            vec!["cccccccccccccccccccccccccccccccc-dep"]
+        );
 
         let rewritten = rewrite_for_client(&parsed);
         // Sigs pass through verbatim — the client verifies them against its own trusted keys.

@@ -4,8 +4,16 @@ A self-contained mesh Nix substituter: every host **serves** its `/nix/store` as
 cache, **proxies** its local nix daemon's substitution through every peer — striping each NAR
 across all peers that hold it, deduplicating repeated segments within a transfer, compressing
 per-chunk on the wire, and adapting chunk sizes, stream counts, and compression levels to links
-from 500 kbit/s cellular to 10 GbE — and **replicates the mesh's catalog** (which feasible
-narinfos exist, who holds them) so lookups are answered locally at zero RTT and misses are free.
+from 500 kbit/s cellular to 10 GbE — and **replicates the mesh's catalog** so lookups are
+answered locally at zero RTT and misses are free. The catalog (sync protocol v2) keeps two
+separate kinds of state: *possession* — which peer currently holds bytes with which NAR hash,
+announced for EVERY valid path (possession is trust-free; even an unsigned local rebuild is a
+byte source for content someone else holds a believable fact about) — and *attestations* —
+verifiable store-path → content associations (a trusted signature over the
+narinfo fingerprint, or content addressing). Attestations are grow-only facts with unioned
+signature sets that outlive holdings by a configurable grace window, so a host that GC'd a path
+can re-substitute it later — from a peer that copied it, or one that rebuilt it bit-identically —
+under its own old signature.
 
 Correct by construction: narshare carries **no signing keys** and signs nothing. Peers substitute
 content-addressed paths (FODs — fetched sources, game data), which the consuming nix verifies on
@@ -13,8 +21,9 @@ ingestion — plus input-addressed paths whose upstream cache signature (e.g. ca
 retained in each peer's Nix db from the original substitution) verifies against the local
 `trusted-public-keys` from /etc/nix/nix.conf; the proxy checks the signature before spending any
 bandwidth, and nix re-verifies at ingestion. The daemon reads `/nix/store` and Nix's database
-(both read-only) and writes only the replicated mesh index under `/var/cache/narshare` — state
-it can always afford to lose (self-verifying, re-learnable; losing it costs one snapshot resync).
+(both read-only) and writes only the replicated mesh index — embedded rocksdb under
+`/var/cache/narshare` by default, or postgres via `cache.postgres` — state it can always afford
+to lose (self-verifying, re-learnable; losing it costs one snapshot resync).
 
 See [PLAN.md](PLAN.md) for the full design; `docs/perf.md` for measured numbers.
 
@@ -40,6 +49,11 @@ listen = "127.0.0.1:5051"       # what the local nix uses as a substituter
 [[peers]]
 name = "server"                 # must equal that node's own `name`
 url = "http://100.64.0.2:5050"
+
+# optional — default is embedded rocksdb under /var/cache/narshare:
+# [cache]
+# postgres = "host=/run/postgresql dbname=narshare"
+# attestation_grace = "90d"     # how long facts outlive their last holder
 ```
 
 Every node runs both roles and lists every other node; lookups are answered from the locally

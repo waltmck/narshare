@@ -1,5 +1,50 @@
 # narshare — a self-contained mesh substituter: serve + dedup + multi-peer NAR striping
 
+## Sync protocol v2 (possession / attestation split)
+
+The index protocol was rebuilt around one observation: a narinfo fuses two statements with
+different lifetimes. v2 keeps them apart.
+
+* **Possession** ("I hold bytes with NAR hash H"): per-origin single-writer journals of
+  32-byte Have/Drop events — same seq/watermark/compaction/snapshot machinery as v1, an order
+  of magnitude cheaper per event. A snapshot is the origin's bare hash set. Announced for
+  EVERY valid path, not just attestable ones: possession is trust-free (transfers verify
+  against the NAR hash), and an unsigned local copy legitimately serves content that some
+  other node holds a signature or CA fact for.
+* **Attestations** ("store path P has content H (size, refs), and here is why you can believe
+  it"): self-verifying facts — grow-only, deduped by (path, hash), signature sets unioned,
+  never retracted. They ride origin journals when introduced, and every snapshot-bearing sync
+  response carries the responder's full retained fact set (the recovery path re-teaches facts
+  whose journal history was compacted). Retention is held-plus-grace (`cache.attestation_grace`,
+  default 90 d): a fact whose hash nobody has held for the window is reaped. Trust is enforced
+  at USE only — well-formed facts are stored and relayed regardless of the current anchor, so
+  removing a trusted key makes rows inert (not deleted) and re-adding it wakes them with no
+  resync; v1's anchor-change clock-voiding is gone entirely.
+
+A lookup composes the layers: attestations for the hash part → NAR hashes → current holders.
+Consequences: signatures survive holder churn (a GC'd-then-rebuilt-bit-identical path still
+verifies under the original signature, within grace); byte-level dedup falls out (any holder of
+H serves H, whatever store path its copy is registered under); and rollout is a flag day — v1
+and v2 nodes simply do not sync (the endpoints are versioned, the index is disposable).
+
+Storage sits behind a backend trait (store/): embedded **rocksdb** by default (store-wide writer
+lock + WriteBatch atomicity), or **postgres** (`cache.postgres`; per-origin clock-row FOR UPDATE
+plus hierarchical advisory locks — global-shared + per-hash for small batches, global-exclusive
+for bulk applies — for the last-holder retention race). Durability is split by authorship: only
+SELF-origin transactions commit synchronously (rocksdb WAL fsync / `SET LOCAL
+synchronous_commit = on`), because a seq a peer observed must never be reissued with different
+events and only the origin can reissue; everything else — replicas of other origins, facts,
+watermarks — commits asynchronously, since single-writer immutability means a rolled-back
+replica can only FORGET, which the next pull re-learns. (UNLOGGED postgres tables are
+deliberately not used: crash truncation would take the self journal too. And note async
+postgres commits die with the SERVER on an OOM-kill — wal_buffers are its shared memory —
+which is exactly why self-origin transactions escalate.) Both backends wipe-and-resync on
+layout changes. sqlite remains only as the read-only window into Nix's own database.
+
+Future (noted, unimplemented): for a recursive fixed-output derivation whose .drv is in the
+local store, the expected output NAR hash is known before any attestation exists — the proxy
+could parse the drv and go straight to "who holds H" as a fallback lookup for unattested FODs.
+
 narshare is **both sides** of a mesh binary cache in one daemon, with no harmonia or other cache
 server anywhere:
 

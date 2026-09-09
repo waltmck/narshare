@@ -102,6 +102,15 @@ let
     networking.interfaces.eth2.ipv4.addresses = lib.mkForce [
       { address = peerUrlIp name; prefixLength = 24; }
     ];
+    # Control-plane resource accounting: the final status section reports each node's
+    # narshare CPU time, block IO, and peak memory for the whole chaos run — the numbers
+    # that must stay battery-safe on real devices.
+    systemd.services.narshare.serviceConfig = {
+      CPUAccounting = true;
+      IOAccounting = true;
+      MemoryAccounting = true;
+    };
+
     services.narshare = {
       enable = true;
       config = {
@@ -798,6 +807,28 @@ in
         print(
             f"[status] {m.name}: narinfos={st['index']['narinfos']} "
             f"transfers={st['proxy']['transfers']} journals=[{journals}]"
+        )
+
+    # Control-plane resource usage over the ENTIRE run, from systemd accounting inside
+    # each VM: cpu = total narshare CPU time, io = block-layer bytes (the amplification the
+    # disk actually saw), mem = peak RSS of the unit.
+    for m in (alpha, beta, noisy, client):
+        acct = dict(
+            line.split("=", 1)
+            for line in m.succeed(
+                "systemctl show narshare "
+                "-p CPUUsageNSec -p IOReadBytes -p IOWriteBytes -p MemoryPeak"
+            ).splitlines()
+            if "=" in line
+        )
+        def num(k):
+            v = acct.get(k, "")
+            return int(v) if v.isdigit() else 0
+        print(
+            f"[status] {m.name} narshare accounting: "
+            f"cpu={num('CPUUsageNSec') / 1e9:.1f}s "
+            f"io r/w={num('IOReadBytes') / 1e6:.1f}/{num('IOWriteBytes') / 1e6:.1f} MB "
+            f"mem peak={num('MemoryPeak') / 1e6:.1f} MB"
         )
 
     # --- results ---

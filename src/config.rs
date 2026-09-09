@@ -84,16 +84,30 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheCfg {
-    /// The mesh index database lives at <dir>/index.db — the daemon's only on-disk state, and
+    /// The embedded mesh index lives under <dir>/index — the daemon's only on-disk state, and
     /// state it can always afford to lose (self-verifying, re-learnable from the mesh; loss
     /// bumps this node's generation so peers resync it from a snapshot).
     #[serde(default = "d_cache_dir")]
     pub dir: PathBuf,
+    /// Postgres connection string (URL or key=value form) for the mesh index. Unset: the
+    /// embedded rocksdb backend under <dir>/index. The index is disposable either way, so
+    /// switching backends is just a resync.
+    #[serde(default)]
+    pub postgres: Option<String>,
+    /// How long an attestation (a store-path → content fact, with its signatures) outlives
+    /// the last holder of its content. Within this window a GC'd-then-rebuilt path still
+    /// verifies under its original signatures.
+    #[serde(with = "humantime_serde", default = "d_attestation_grace")]
+    pub attestation_grace: Duration,
 }
 
 impl Default for CacheCfg {
     fn default() -> Self {
-        Self { dir: d_cache_dir() }
+        Self {
+            dir: d_cache_dir(),
+            postgres: None,
+            attestation_grace: d_attestation_grace(),
+        }
     }
 }
 
@@ -140,7 +154,10 @@ pub enum IoBackend {
 
 impl Default for IoCfg {
     fn default() -> Self {
-        Self { concurrency: d_io_concurrency(), backend: IoBackend::Auto }
+        Self {
+            concurrency: d_io_concurrency(),
+            backend: IoBackend::Auto,
+        }
     }
 }
 
@@ -198,29 +215,72 @@ pub struct Peer {
     pub encoding: String,
 }
 
-fn d_serve_priority() -> u32 { 30 }
-fn d_proxy_priority() -> u32 { 30 }
-fn d_max_zstd_level() -> i32 { 19 }
-fn d_segment_bytes() -> ByteSize { ByteSize(4 << 20) }
-fn d_store_dir() -> PathBuf { "/nix/store".into() }
-fn d_db_path() -> PathBuf { "/nix/var/nix/db/db.sqlite".into() }
-fn d_io_concurrency() -> usize { 64 }
+fn d_serve_priority() -> u32 {
+    30
+}
+fn d_proxy_priority() -> u32 {
+    30
+}
+fn d_max_zstd_level() -> i32 {
+    19
+}
+fn d_segment_bytes() -> ByteSize {
+    ByteSize(4 << 20)
+}
+fn d_store_dir() -> PathBuf {
+    "/nix/store".into()
+}
+fn d_db_path() -> PathBuf {
+    "/nix/var/nix/db/db.sqlite".into()
+}
+fn d_io_concurrency() -> usize {
+    64
+}
 // 64 MiB: with streaming serve-side encode a chunk's cost is pure wire time, so the cap only
 // bounds requeue waste and striping granularity; the rate*CHUNK_TARGET_SECS sizer stops being
 // cap-bound on fast LAN links (16 MiB capped every link past 8 MB/s).
-fn d_chunk_max() -> ByteSize { ByteSize(64 << 20) }
-fn d_window_bytes() -> ByteSize { ByteSize(256 << 20) }
-fn d_dedup_budget() -> ByteSize { ByteSize(512 << 20) }
-fn d_per_peer_connections() -> usize { 8 }
-fn d_narinfo_timeout() -> Duration { Duration::from_secs(5) }
-fn d_stall_timeout() -> Duration { Duration::from_secs(60) }
-fn d_cache_dir() -> PathBuf { "/var/cache/narshare".into() }
-fn d_zero_bytes() -> ByteSize { ByteSize(0) }
-fn d_min_bandwidth_grace() -> Duration { Duration::from_secs(60) }
-fn d_breaker_failures() -> u32 { 3 }
-fn d_breaker_cooldown() -> Duration { Duration::from_secs(15) }
-fn d_tier() -> u32 { 1 }
-fn d_encoding() -> String { "auto".into() }
+fn d_chunk_max() -> ByteSize {
+    ByteSize(64 << 20)
+}
+fn d_window_bytes() -> ByteSize {
+    ByteSize(256 << 20)
+}
+fn d_dedup_budget() -> ByteSize {
+    ByteSize(512 << 20)
+}
+fn d_per_peer_connections() -> usize {
+    8
+}
+fn d_narinfo_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+fn d_stall_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+fn d_cache_dir() -> PathBuf {
+    "/var/cache/narshare".into()
+}
+fn d_attestation_grace() -> Duration {
+    Duration::from_secs(90 * 24 * 3600)
+}
+fn d_zero_bytes() -> ByteSize {
+    ByteSize(0)
+}
+fn d_min_bandwidth_grace() -> Duration {
+    Duration::from_secs(60)
+}
+fn d_breaker_failures() -> u32 {
+    3
+}
+fn d_breaker_cooldown() -> Duration {
+    Duration::from_secs(15)
+}
+fn d_tier() -> u32 {
+    1
+}
+fn d_encoding() -> String {
+    "auto".into()
+}
 
 pub fn load(path: &Path) -> Result<Config> {
     let text = std::fs::read_to_string(path)
@@ -250,7 +310,10 @@ fn validate(cfg: &Config) -> Result<()> {
     if let Some(s) = &cfg.serve {
         // 0 would make the manifest builder loop forever (min(0) never advances).
         if s.segment_bytes.0 < 4096 {
-            bail!("serve.segment_bytes must be at least 4096 (got {})", s.segment_bytes.0);
+            bail!(
+                "serve.segment_bytes must be at least 4096 (got {})",
+                s.segment_bytes.0
+            );
         }
     }
     if let Some(p) = &cfg.proxy {
@@ -265,7 +328,11 @@ fn validate(cfg: &Config) -> Result<()> {
                 .strip_prefix("zstd:")
                 .is_some_and(|l| l.parse::<i32>().is_ok_and(|l| (1..=22).contains(&l))))
         {
-            bail!("peer {:?}: invalid encoding {:?} (auto | none | zstd:<1..=22>)", p.name, p.encoding);
+            bail!(
+                "peer {:?}: invalid encoding {:?} (auto | none | zstd:<1..=22>)",
+                p.name,
+                p.encoding
+            );
         }
         if !p.url.starts_with("http://") {
             if p.url.starts_with("https://") {
@@ -342,7 +409,10 @@ mod tests {
         // Explicit list, and the explicit-empty "CA paths only" form.
         let cfg: Config =
             toml::from_str(&mk("trusted_public_keys = [\"k-1:AAAA\"]", "", "")).unwrap();
-        assert_eq!(cfg.trusted_public_keys.as_deref(), Some(&["k-1:AAAA".to_owned()][..]));
+        assert_eq!(
+            cfg.trusted_public_keys.as_deref(),
+            Some(&["k-1:AAAA".to_owned()][..])
+        );
         let cfg: Config = toml::from_str(&mk("trusted_public_keys = []", "", "")).unwrap();
         assert_eq!(cfg.trusted_public_keys.as_deref(), Some(&[][..]));
     }
@@ -354,8 +424,8 @@ mod tests {
         let cfg: Config = toml::from_str(&mk("", "breaker_failures = 0", "")).unwrap();
         assert!(validate(&cfg).is_err());
         // https accepted at parse time would only fail at request time: no TLS is built in.
-        let cfg: Config = toml::from_str(&mk("", "", "").replace("http://x:1", "https://x:1"))
-            .unwrap();
+        let cfg: Config =
+            toml::from_str(&mk("", "", "").replace("http://x:1", "https://x:1")).unwrap();
         assert!(validate(&cfg).is_err());
     }
 

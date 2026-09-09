@@ -65,12 +65,18 @@ impl SegmentReader {
                 }
             },
         };
-        Ok(Self { sem: Arc::new(Semaphore::new(cfg.concurrency.max(1))), backend })
+        Ok(Self {
+            sem: Arc::new(Semaphore::new(cfg.concurrency.max(1))),
+            backend,
+        })
     }
 
     #[cfg(test)]
     fn with_backend(backend: Backend, concurrency: usize) -> Self {
-        Self { sem: Arc::new(Semaphore::new(concurrency)), backend }
+        Self {
+            sem: Arc::new(Semaphore::new(concurrency)),
+            backend,
+        }
     }
 
     #[cfg(test)]
@@ -81,13 +87,16 @@ impl SegmentReader {
     /// Read exactly `len` bytes at `off`. Short reads (file changed underneath us, e.g. GC) are
     /// errors — correctness comes from failing loudly, never from serving what happens to be there.
     pub async fn read(&self, path: Arc<PathBuf>, off: u64, len: usize) -> Result<Bytes> {
-        let _permit = self.sem.clone().acquire_owned().await.expect("semaphore closed");
+        let _permit = self
+            .sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore closed");
         match &self.backend {
-            Backend::Blocking => {
-                tokio::task::spawn_blocking(move || read_segment(&path, off, len))
-                    .await
-                    .expect("read task panicked")
-            }
+            Backend::Blocking => tokio::task::spawn_blocking(move || read_segment(&path, off, len))
+                .await
+                .expect("read task panicked"),
             Backend::Uring(pool) => pool.read(path, off, len).await,
         }
     }
@@ -139,7 +148,13 @@ impl Window {
         let alen = (aend - astart) as usize;
         let buf = vec![0u8; alen + ALIGN as usize];
         let shift = (ALIGN as usize - (buf.as_ptr() as usize % ALIGN as usize)) % ALIGN as usize;
-        Self { buf, shift, astart, alen, need: (off - astart) as usize + len }
+        Self {
+            buf,
+            shift,
+            astart,
+            alen,
+            need: (off - astart) as usize + len,
+        }
     }
 
     fn finish(self, off: u64, len: usize) -> Bytes {
@@ -152,15 +167,26 @@ fn read_direct(path: &std::path::Path, off: u64, len: usize) -> std::io::Result<
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path)?;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)?;
     let mut w = Window::new(off, len);
     let mut filled = 0usize;
     while filled < w.need {
-        let n = f.read_at(&mut w.buf[w.shift + filled..w.shift + w.alen], w.astart + filled as u64)?;
+        let n = f.read_at(
+            &mut w.buf[w.shift + filled..w.shift + w.alen],
+            w.astart + filled as u64,
+        )?;
         if n == 0 {
             return Err(Error::new(
                 ErrorKind::UnexpectedEof,
-                format!("EOF at {} while reading {}B @{}", w.astart + filled as u64, len, off),
+                format!(
+                    "EOF at {} while reading {}B @{}",
+                    w.astart + filled as u64,
+                    len,
+                    off
+                ),
             ));
         }
         filled += n;
@@ -220,7 +246,8 @@ impl UringPool {
             .send(Req { path, off, len, tx })
             .map_err(|_| anyhow::anyhow!("uring thread gone"))?;
         self.wake();
-        rx.await.map_err(|_| anyhow::anyhow!("uring thread dropped request"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("uring thread dropped request"))?
     }
 }
 
@@ -308,7 +335,12 @@ fn ring_loop(
         match open {
             Ok(f) => {
                 let window = Window::new(req.off, req.len);
-                let op = Op { req, window, filled: 0, fd: f.into() };
+                let op = Op {
+                    req,
+                    window,
+                    filled: 0,
+                    fd: f.into(),
+                };
                 let idx = free.pop().unwrap_or_else(|| {
                     slab.push(None);
                     slab.len() - 1
@@ -341,7 +373,10 @@ fn ring_loop(
             panic!("io_uring submit_and_wait: {e}");
         }
         // Collect first: processing pushes new SQEs, which needs &mut ring.
-        let cqes: Vec<(u64, i32)> = ring.completion().map(|c| (c.user_data(), c.result())).collect();
+        let cqes: Vec<(u64, i32)> = ring
+            .completion()
+            .map(|c| (c.user_data(), c.result()))
+            .collect();
         for (ud, res) in cqes {
             if ud == EVENTFD_TOKEN {
                 // Drain new requests, then re-arm.
@@ -373,8 +408,12 @@ fn ring_loop(
                         let _ = tx.send(read_buffered(&path, off, len));
                     });
                 } else {
-                    let msg =
-                        format!("read {}B @{} of {}", op.req.len, op.req.off, op.req.path.display());
+                    let msg = format!(
+                        "read {}B @{} of {}",
+                        op.req.len,
+                        op.req.off,
+                        op.req.path.display()
+                    );
                     let _ = op.req.tx.send(Err(anyhow::Error::new(e).context(msg)));
                 }
                 continue;
@@ -415,8 +454,14 @@ mod tests {
         (Arc::new(p), data)
     }
 
-    const CASES: &[(u64, usize)] =
-        &[(0, 10), (1, 4095), (4095, 2), (399_995, 5), (12_345, 65_536), (0, 400_000)];
+    const CASES: &[(u64, usize)] = &[
+        (0, 10),
+        (1, 4095),
+        (4095, 2),
+        (399_995, 5),
+        (12_345, 65_536),
+        (0, 400_000),
+    ];
 
     #[test]
     fn direct_and_buffered_agree() {
@@ -424,7 +469,11 @@ mod tests {
         let (p, data) = test_data(dir.path());
         for &(off, len) in CASES {
             let got = read_segment(&p, off, len).unwrap();
-            assert_eq!(&got[..], &data[off as usize..off as usize + len], "@{off}+{len}");
+            assert_eq!(
+                &got[..],
+                &data[off as usize..off as usize + len],
+                "@{off}+{len}"
+            );
             assert_eq!(got, read_buffered(&p, off, len).unwrap());
         }
         assert!(read_segment(&p, 399_999, 2).is_err());
@@ -443,12 +492,19 @@ mod tests {
         for &(off, len) in CASES {
             let a = uring.read(p.clone(), off, len).await.unwrap();
             let b = blocking.read(p.clone(), off, len).await.unwrap();
-            assert_eq!(&a[..], &data[off as usize..off as usize + len], "@{off}+{len}");
+            assert_eq!(
+                &a[..],
+                &data[off as usize..off as usize + len],
+                "@{off}+{len}"
+            );
             assert_eq!(a, b);
         }
         // Errors propagate, and the pool survives them.
         assert!(uring.read(p.clone(), 399_999, 2).await.is_err());
-        assert!(uring.read(Arc::new(dir.path().join("missing")), 0, 1).await.is_err());
+        assert!(uring
+            .read(Arc::new(dir.path().join("missing")), 0, 1)
+            .await
+            .is_err());
         let again = uring.read(p.clone(), 7, 300).await.unwrap();
         assert_eq!(&again[..], &data[7..307]);
     }
@@ -467,7 +523,10 @@ mod tests {
         const CHUNK: usize = 1 << 20;
         const N: u64 = 512;
         let backends: Vec<(&str, SegmentReader)> = vec![
-            ("blocking", SegmentReader::with_backend(Backend::Blocking, 64)),
+            (
+                "blocking",
+                SegmentReader::with_backend(Backend::Blocking, 64),
+            ),
             (
                 "uring",
                 SegmentReader::with_backend(
@@ -481,9 +540,8 @@ mod tests {
             let mut tasks = tokio::task::JoinSet::new();
             for i in 0..N {
                 // Deterministic pseudo-random offsets across the file.
-                let off = (i * 2654435761 % (size.saturating_sub(CHUNK as u64).max(1)))
-                    / ALIGN
-                    * ALIGN;
+                let off =
+                    (i * 2654435761 % (size.saturating_sub(CHUNK as u64).max(1))) / ALIGN * ALIGN;
                 let r = reader.clone();
                 let p = path.clone();
                 tasks.spawn(async move { r.read(p, off, CHUNK).await.map(|b| b.len()) });
@@ -493,7 +551,10 @@ mod tests {
                 bytes += res.unwrap().unwrap();
             }
             let dt = t0.elapsed().as_secs_f64();
-            println!("{name}: {:.0} MB/s ({bytes} bytes in {dt:.3}s)", bytes as f64 / 1e6 / dt);
+            println!(
+                "{name}: {:.0} MB/s ({bytes} bytes in {dt:.3}s)",
+                bytes as f64 / 1e6 / dt
+            );
         }
     }
 }
