@@ -124,18 +124,32 @@ impl RocksStore {
             let mut opts = Options::default();
             opts.create_if_missing(true);
             opts.create_missing_column_families(true);
+            opts.set_max_open_files(256);
+            // Bound WAL accumulation from rarely-flushed CFs.
+            opts.set_max_total_wal_size(64 << 20);
             let cache = Cache::new_lru_cache(BLOCK_CACHE_BYTES);
             let cfds: Vec<ColumnFamilyDescriptor> = CFS
                 .iter()
                 .map(|n| {
                     let mut o = Options::default();
+                    // Rows here are tiny; the rocksdb default of 64 MiB memtables PER CF
+                    // (x9 CFs) is what made an idle daemon hold ~200 MB. Small buffers cost
+                    // slightly more flushes during a resync storm and nothing at idle.
+                    o.set_write_buffer_size(16 << 20);
+                    o.set_max_write_buffer_number(2);
                     if HASH_PREFIX_CFS.contains(n) {
                         o.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
                         o.set_memtable_prefix_bloom_ratio(0.2);
                         let mut bb = BlockBasedOptions::default();
                         bb.set_bloom_filter(10.0, false);
                         bb.set_block_cache(&cache);
+                        // Index/filter blocks count against the shared cache instead of
+                        // accumulating unbounded in the heap.
+                        bb.set_cache_index_and_filter_blocks(true);
+                        bb.set_pin_l0_filter_and_index_blocks_in_cache(true);
                         o.set_block_based_table_factory(&bb);
+                    } else {
+                        o.set_write_buffer_size(4 << 20);
                     }
                     ColumnFamilyDescriptor::new(*n, o)
                 })

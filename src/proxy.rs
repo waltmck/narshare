@@ -1488,8 +1488,9 @@ mod tests {
             404,
             "a GC'd path must disappear from the mesh index"
         );
-        // The fact lost its last holder; with the test fixtures' zero grace, the compaction
-        // that rides the pull reaped it.
+        // The fact lost its last holder; the (paced in production, explicit here) reaper
+        // removes it under the test fixtures' zero grace.
+        client.index.compact().unwrap();
         assert_eq!(client.index.count_attestations(), 0);
     }
 

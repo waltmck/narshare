@@ -256,7 +256,7 @@ impl Sync {
             // Compaction rides sync REQUESTS elsewhere (handle_sync), but a consume-only node
             // never receives one — without this its relayed journals would grow forever.
             let index = self.index.clone();
-            tokio::task::spawn_blocking(move || index.compact())
+            tokio::task::spawn_blocking(move || index.maybe_compact())
                 .await
                 .map_err(|e| anyhow::anyhow!("compact task died: {e}"))??;
         }
@@ -513,7 +513,7 @@ async fn handle_sync(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> Response
         };
         let z = zstd::stream::encode_all(&resp.encode_to_vec()[..], 3)
             .context("compressing sync response")?;
-        index.compact()?;
+        index.maybe_compact()?;
         Ok(z)
     })
     .await

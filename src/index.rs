@@ -70,6 +70,12 @@ pub struct Index {
     trusted: TrustedKeys,
     /// How long an attestation outlives its last holder.
     grace: Duration,
+    /// Pacing for the maintenance pass: sync traffic calls maybe_compact() on every
+    /// request/pull, but journal floors move at most once a minute and the attestation
+    /// reaper — a full-table scan — at most every ten. Unpaced compact() stays for tests
+    /// and for callers that just did something reap-worthy.
+    last_compact: Mutex<Option<std::time::Instant>>,
+    last_reap: Mutex<Option<std::time::Instant>>,
     /// Deriver drv path -> "may this output be substituted" verdict cache. Reading and
     /// scanning a drv file happens at most once per deriver per process lifetime; without the
     /// cache, paths filtered by allowSubstitutes=false would re-read their drv on every diff
@@ -169,6 +175,8 @@ impl Index {
             peer_names: peer_names.to_vec(),
             trusted,
             grace,
+            last_compact: Mutex::new(None),
+            last_reap: Mutex::new(None),
             nosub: Mutex::new(HashMap::new()),
         })
     }
@@ -544,47 +552,100 @@ impl Index {
             return Ok(0);
         }
 
-        // Phase 3: journal and materialize in one atomic store write.
+        // Phase 3: journal and materialize. Chunked — a first export of a whole store is
+        // hundreds of thousands of events, and encoding them plus the store's write batch all
+        // at once was a half-gigabyte memory spike at switch time. Each chunk is atomic and
+        // advances the clock; the self origin is single-writer, so a chunk boundary is just
+        // a smaller-than-usual export, and a crash between chunks re-diffs the remainder.
+        const EXPORT_CHUNK: usize = 10_000;
+        enum Op<'a> {
+            Att(&'a proto::Attestation),
+            Hold(&'a HoldOp),
+        }
+        let ops: Vec<Op> = attests
+            .iter()
+            .map(Op::Att)
+            .chain(holds.iter().map(Op::Hold))
+            .collect();
+        let emitted = ops.len();
         let cur = self.store.clock(&self.self_name)?;
         let mut seq = cur.seq;
-        let mut journal: Vec<(u64, Vec<u8>)> = Vec::new();
-        let mut emit = |op: proto::event::Op, seq: &mut u64| {
-            *seq += 1;
-            let e = proto::Event {
-                seq: *seq,
-                op: Some(op),
-            };
-            journal.push((e.seq, e.encode_to_vec()));
-        };
-        for a in &attests {
-            emit(proto::event::Op::Attest(a.clone()), &mut seq);
-        }
-        for op in &holds {
-            match op {
-                HoldOp::Add(h) => emit(proto::event::Op::Have(h.to_vec()), &mut seq),
-                HoldOp::Drop(h) => emit(proto::event::Op::Drop(h.to_vec()), &mut seq),
+        for chunk in ops.chunks(EXPORT_CHUNK) {
+            let expect = (cur.generation, seq);
+            let mut journal: Vec<(u64, Vec<u8>)> = Vec::with_capacity(chunk.len());
+            let mut chunk_holds: Vec<HoldOp> = Vec::new();
+            let mut chunk_atts: Vec<proto::Attestation> = Vec::new();
+            for op in chunk {
+                seq += 1;
+                let pop = match op {
+                    Op::Att(a) => {
+                        chunk_atts.push((*a).clone());
+                        proto::event::Op::Attest((*a).clone())
+                    }
+                    Op::Hold(h) => {
+                        chunk_holds.push(**h);
+                        match h {
+                            HoldOp::Add(h) => proto::event::Op::Have(h.to_vec()),
+                            HoldOp::Drop(h) => proto::event::Op::Drop(h.to_vec()),
+                        }
+                    }
+                };
+                let e = proto::Event { seq, op: Some(pop) };
+                journal.push((seq, e.encode_to_vec()));
             }
-        }
-        let emitted = journal.len();
-        if !self.store.apply_events(
-            &self.self_name,
-            (cur.generation, cur.seq),
-            (cur.generation, seq),
-            &journal,
-            &holds,
-            &attests,
-            unix_now(),
-            true, // OUR seqs must never be reissued: self-origin commits are durable
-        )? {
-            bail!("self-origin apply raced: the own-db loop must be the only self writer");
+            if !self.store.apply_events(
+                &self.self_name,
+                expect,
+                (cur.generation, seq),
+                &journal,
+                &chunk_holds,
+                &chunk_atts,
+                unix_now(),
+                true, // OUR seqs must never be reissued: self-origin commits are durable
+            )? {
+                bail!("self-origin apply raced: the own-db loop must be the only self writer");
+            }
         }
         Ok(emitted)
     }
 
+    /// The sync-path maintenance entry: full compaction is idempotent housekeeping, so pace
+    /// it — at most one journal-floor pass per minute and one attestation reap (a full-table
+    /// scan) per ten. This was measured to matter: unpaced, every inbound sync request paid
+    /// the reap scan, which alone was most of an idle node's CPU.
+    pub fn maybe_compact(&self) -> Result<()> {
+        const COMPACT_EVERY: Duration = Duration::from_secs(60);
+        const REAP_EVERY: Duration = Duration::from_secs(600);
+        let now = std::time::Instant::now();
+        {
+            let mut last = self.last_compact.lock().unwrap();
+            if last.is_some_and(|t| now.duration_since(t) < COMPACT_EVERY) {
+                return Ok(());
+            }
+            *last = Some(now);
+        }
+        let reap = {
+            let mut last = self.last_reap.lock().unwrap();
+            if last.is_some_and(|t| now.duration_since(t) < REAP_EVERY) {
+                false
+            } else {
+                *last = Some(now);
+                true
+            }
+        };
+        self.compact_inner(reap)
+    }
+
     /// Compact journals — to the minimum watermark across all configured peers (the ack rule),
     /// with the size backstop so a straggler cannot pin retention forever — and reap
-    /// attestations whose hash has been unheld past the grace window.
+    /// attestations whose hash has been unheld past the grace window. Unpaced; production
+    /// traffic goes through maybe_compact(), this is for tests and explicit maintenance.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn compact(&self) -> Result<()> {
+        self.compact_inner(true)
+    }
+
+    fn compact_inner(&self, reap: bool) -> Result<()> {
         let marks: HashMap<(String, String), u64> = self
             .store
             .watermarks()?
@@ -607,10 +668,12 @@ impl Index {
                 self.store.compact_journal(origin, floor)?;
             }
         }
-        let cutoff = unix_now().saturating_sub(self.grace.as_secs());
-        let reaped = self.store.reap_attestations(cutoff)?;
-        if reaped > 0 {
-            debug!("reaped {reaped} attestation(s) unheld past the grace window");
+        if reap {
+            let cutoff = unix_now().saturating_sub(self.grace.as_secs());
+            let reaped = self.store.reap_attestations(cutoff)?;
+            if reaped > 0 {
+                debug!("reaped {reaped} attestation(s) unheld past the grace window");
+            }
         }
         Ok(())
     }
