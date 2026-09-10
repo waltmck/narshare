@@ -48,19 +48,6 @@ pub struct PathInfo {
     pub references: Vec<String>,
 }
 
-/// One consistent snapshot of the incremental differ's inputs (see diff_signals).
-pub struct DiffSignals {
-    pub cands: Vec<Candidate>,
-    /// Raw row count above the watermark, malformed rows included.
-    pub raw: usize,
-    /// The table's current max id — the next additions watermark.
-    pub max_id: i64,
-    /// Present when consistency signals were requested (paced by the caller).
-    pub count: Option<i64>,
-    /// SUM(LENGTH(sigs) + LENGTH(ca)): moves on in-place signature/ca updates.
-    pub probe: Option<i64>,
-}
-
 pub struct StoreDb {
     conn: Mutex<Connection>,
     pub store_dir: String,
@@ -188,7 +175,7 @@ impl StoreDb {
     /// detection needs only (hash, sigs). Callers fetch references via references_of() for
     /// the handful of rows that actually changed.
     pub fn candidates(&self) -> Result<Vec<Candidate>> {
-        Ok(self.diff_signals(-1, false)?.cands)
+        Ok(self.additions_since(-1)?.0)
     }
 
     /// Rows with id strictly above `since`, plus every consistency signal, in ONE read
@@ -197,36 +184,18 @@ impl StoreDb {
     /// deletions and in-place updates are invisible here BY CONSTRUCTION and are detected by
     /// the count / probe signals instead. Commits after this snapshot bump data_version and
     /// earn their own wake — at-least-once, never lost.
-    pub fn diff_signals(&self, since: i64, with_consistency: bool) -> Result<DiffSignals> {
+    /// Rows with id strictly above `since` plus the table's current max id (the next
+    /// watermark — the TABLE max, not the max of returned rows: it must advance past
+    /// malformed rows too, or they would be re-fetched forever), in one read transaction.
+    /// ValidPaths.id is AUTOINCREMENT (monotone, never reused), so this is the complete
+    /// additions stream; deletions and in-place updates are invisible here BY CONSTRUCTION
+    /// and are the hourly reconciliation's job.
+    pub fn additions_since(&self, since: i64) -> Result<(Vec<Candidate>, i64)> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-        // The next watermark is the TABLE max, not the max of returned rows: it must advance
-        // past malformed rows too, or they would be re-fetched (and re-counted) forever.
-        // Index-only, O(log n): safe to read on every wake.
         let max_id: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) FROM ValidPaths", [], |r| {
             r.get(0)
         })?;
-        // COUNT(*) and the sig probe each walk the whole ValidPaths b-tree — on a compressed
-        // CoW filesystem that is real kernel time (checksum + decompress per pread), measured
-        // as the daemon's dominant cost when run per wake. The caller paces them; the deletion
-        // and in-place detection latency is bounded by that pace, which was already accepted
-        // for the full-diff rate limit.
-        let (count, probe) = if with_consistency {
-            let count: i64 = tx.query_row("SELECT COUNT(*) FROM ValidPaths", [], |r| r.get(0))?;
-            // The silent-commit probe: in-place UPDATEs (nix store sign, ca rewrites) move
-            // neither ids nor the count, but they change sig/ca byte totals. Length-blind to
-            // equal-length swaps (a repair rewriting narHash) — the periodic reconciliation
-            // covers those.
-            let probe: i64 = tx.query_row(
-                "SELECT COALESCE(SUM(LENGTH(COALESCE(sigs,'')) + LENGTH(COALESCE(ca,''))), 0) \
-                 FROM ValidPaths",
-                [],
-                |r| r.get(0),
-            )?;
-            (Some(count), Some(probe))
-        } else {
-            (None, None)
-        };
         let mut stmt = tx.prepare_cached(
             "SELECT id, path, hash, narSize, sigs, ca, deriver FROM ValidPaths WHERE id > ?1",
         )?;
@@ -243,8 +212,7 @@ impl StoreDb {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let raw = rows.len();
-        let mut cands = Vec::with_capacity(raw);
+        let mut cands = Vec::with_capacity(rows.len());
         for (id, path, hash, sz, sigs, ca, deriver) in rows {
             let Some(nar_size) = sz else {
                 warn_once(&anyhow::anyhow!("path {path} has no narSize in nix db"));
@@ -267,13 +235,7 @@ impl StoreDb {
         }
         drop(stmt);
         tx.commit()?;
-        Ok(DiffSignals {
-            cands,
-            raw,
-            max_id,
-            count,
-            probe,
-        })
+        Ok((cands, max_id))
     }
 
     /// Is ValidPaths.id AUTOINCREMENT (monotone, never reused)? The incremental differ's

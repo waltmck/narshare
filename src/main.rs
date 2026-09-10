@@ -152,7 +152,7 @@ async fn run(cfg: config::Config) -> Result<()> {
         nix_db_dir = scfg.db_path.parent().map(|p| p.to_path_buf());
         serve_db = Some(db.clone());
         let reader = io::SegmentReader::new(&cfg.io)?;
-        let state = serve::ServeState::new(db, reader, scfg);
+        let state = serve::ServeState::new(db, reader, scfg, Some(idx.clone()));
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .with_context(|| format!("binding serve listener {listen}"))?;
@@ -162,9 +162,15 @@ async fn run(cfg: config::Config) -> Result<()> {
 
     // The sync subsystem exists whenever there are peers; its endpoints ride the serve
     // listener (a node without [serve] consumes the mesh but cannot export or relay).
-    let sync_ctx = peers
-        .as_ref()
-        .map(|p| sync::Sync::new(idx.clone(), p.clone(), serve_db.clone(), nix_db_dir.clone()));
+    let sync_ctx = peers.as_ref().map(|p| {
+        sync::Sync::new(
+            idx.clone(),
+            p.clone(),
+            serve_db.clone(),
+            nix_db_dir.clone(),
+            cfg.cache.reconcile_every,
+        )
+    });
 
     let mut proxy_parts = None;
     if let Some(pcfg) = cfg.proxy {

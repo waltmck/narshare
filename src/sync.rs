@@ -56,42 +56,12 @@ const BURST_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_CAP: usize = 1 << 20;
 /// Truncated-suffix pull rounds before giving up until the next trigger.
 const MAX_ROUNDS: usize = 64;
-/// Full reconciliations run at most this often when triggered by the deletion/in-place
-/// signals — a GC or `nix store sign --all` is thousands of commits, and one full diff per
-/// rate window converges the same state as one per commit.
-#[cfg(not(test))]
-const FULL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-#[cfg(test)]
-const FULL_MIN_INTERVAL: std::time::Duration = std::time::Duration::ZERO;
-/// Belt-and-braces reconciliation for what no signal sees (an equal-length in-place rewrite,
-/// e.g. `nix store repair` swapping a narHash): one O(store) diff per hour is noise.
-const RECONCILE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
-/// The COUNT(*)/sig-probe consistency queries walk the whole ValidPaths b-tree — dominant
-/// kernel time on compressed CoW filesystems when run per wake (measured: 99% system time).
-/// Paced: raw additions are accumulated between checks so the deletion algebra stays exact,
-/// and detection latency stays within the already-accepted full-diff rate limit.
-#[cfg(not(test))]
-const SIGNALS_EVERY: std::time::Duration = std::time::Duration::from_secs(45);
-#[cfg(test)]
-const SIGNALS_EVERY: std::time::Duration = std::time::Duration::ZERO;
 
-/// The incremental differ's arithmetic between wakes: the additions watermark, the expected
-/// row count, and the expected sig-probe total. Any observation that disagrees means the db
-/// changed in a way additions cannot explain -> full reconciliation.
+/// The incremental differ's state: the additions watermark and the reconciliation clock.
 #[derive(Clone, Copy)]
 struct DiffState {
     max_id: i64,
-    count: i64,
-    probe: i64,
-    /// Raw rows seen (and the sig/ca bytes they contribute) since the last consistency
-    /// check — the accumulators that keep the count/probe algebra exact across paced checks.
-    pending_raw: i64,
-    pending_probe_bytes: i64,
-    /// Set when a wake contained rows we could not parse: their probe contribution is
-    /// unknown, so the probe comparison stays suspended until the next full baseline.
-    probe_unreliable: bool,
     last_full: std::time::Instant,
-    last_signals: std::time::Instant,
 }
 
 pub struct Sync {
@@ -108,6 +78,10 @@ pub struct Sync {
     started: std::time::Instant,
     /// The incremental differ's consistency state; None forces a full reconciliation (startup).
     diff_state: std::sync::Mutex<Option<DiffState>>,
+    /// Deletions and in-place db updates are detected ONLY by the periodic full
+    /// reconciliation (the additions watermark cannot see them; the 410 feedback path
+    /// covers fetch-facing staleness in between). Config: cache.reconcile_every.
+    reconcile_every: std::time::Duration,
     /// The nix db's data_version as of the last completed diff (i64::MIN = never diffed).
     /// The differ's cheap gate: PRAGMA data_version moves only when another connection
     /// COMMITS, so timer rescans and reader-generated inotify chatter on an unchanged store
@@ -137,6 +111,7 @@ impl Sync {
         peers: Arc<Peers>,
         db: Option<Arc<StoreDb>>,
         nix_db_dir: Option<PathBuf>,
+        reconcile_every: std::time::Duration,
     ) -> Arc<Self> {
         let n = peers.list.len();
         let mut kicks = Vec::with_capacity(n);
@@ -158,6 +133,7 @@ impl Sync {
             hint_rx: std::sync::Mutex::new(Some(hint_rx)),
             started: std::time::Instant::now(),
             diff_state: std::sync::Mutex::new(None),
+            reconcile_every,
             last_data_version: std::sync::atomic::AtomicI64::new(i64::MIN),
             stats: SyncStats::default(),
         })
@@ -323,87 +299,48 @@ impl Sync {
                 .await
                 .map_err(|e| anyhow::anyhow!("gate task died: {e}"))??
         };
-        if v == self.last_data_version.load(Relaxed) {
+        let st = *self.diff_state.lock().unwrap();
+        // The periodic reconciliation must run even on a QUIET db: a GC's final commit makes
+        // one gated-in wake (which sees no additions), and nothing bumps data_version
+        // afterwards — the deletion would otherwise wait for an unrelated commit. The 60s
+        // own-db timer keeps calling us; reconcile-due bypasses the gate.
+        let reconcile_due = st
+            .map(|s| s.last_full.elapsed() >= self.reconcile_every)
+            .unwrap_or(true);
+        if !reconcile_due && v == self.last_data_version.load(Relaxed) {
             return Ok(0);
         }
         let index = self.index.clone();
-        let st = *self.diff_state.lock().unwrap();
         let (n, new_state) = tokio::task::spawn_blocking(move || -> Result<(usize, DiffState)> {
             let now = std::time::Instant::now();
-            // A full reconciliation captures its baseline snapshot BEFORE scanning, so
-            // rows committed mid-scan land above the watermark and are re-examined
-            // (idempotently) on the next wake instead of being silently skipped.
+            // A full reconciliation captures its watermark BEFORE scanning, so rows committed
+            // mid-scan land above it and are re-examined (idempotently) on the next wake.
             let full = |reason: &str| -> Result<(usize, DiffState)> {
                 if !reason.is_empty() {
                     tracing::debug!("full reconciliation: {reason}");
                 }
-                let base = db.diff_signals(i64::MAX, true)?;
+                let (_, max_id) = db.additions_since(i64::MAX)?;
                 let n = index.sync_own_db(&db)?;
                 Ok((
                     n,
                     DiffState {
-                        max_id: base.max_id,
-                        count: base.count.expect("consistency signals were requested"),
-                        probe: base.probe.expect("consistency signals were requested"),
-                        pending_raw: 0,
-                        pending_probe_bytes: 0,
-                        probe_unreliable: false,
+                        max_id,
                         last_full: now,
-                        last_signals: now,
                     },
                 ))
             };
-            // The whole incremental design is sound only while ids are monotone
-            // (AUTOINCREMENT): a reused id would make a delete+reinsert replacement
-            // invisible to both the watermark and the count. Guarded per wake.
             let Some(mut s) = st else { return full("") };
-            if now.duration_since(s.last_full) >= RECONCILE_EVERY {
+            if reconcile_due {
                 return full("periodic");
             }
+            // The watermark is sound only while ids are monotone (AUTOINCREMENT): a reused id
+            // would hide an addition below the watermark. Guarded per wake.
             if !db.ids_monotone()? {
                 return full("ValidPaths.id is not AUTOINCREMENT on this system");
             }
-            let check = now.duration_since(s.last_signals) >= SIGNALS_EVERY;
-            let sig = db.diff_signals(s.max_id, check)?;
-            let parsed = sig.cands.len();
-            let (n, added_probe_bytes) = index.sync_own_db_incremental(&db, &sig.cands)?;
-            s.max_id = sig.max_id;
-            s.pending_raw += sig.raw as i64;
-            s.pending_probe_bytes += added_probe_bytes;
-            s.probe_unreliable |= parsed != sig.raw;
-            let (Some(count), Some(probe)) = (sig.count, sig.probe) else {
-                return Ok((n, s));
-            };
-            s.last_signals = now;
-            let may_full = now.duration_since(s.last_full) >= FULL_MIN_INTERVAL;
-            // Deletions (or delete+reinsert replacements): additions alone cannot explain
-            // the count — every raw new row since the last check is counted on both sides,
-            // so a mismatch is exactly "rows at or below the old watermark vanished". Keep
-            // the stale expectation when rate-limited so the next check re-detects it.
-            if count != s.count + s.pending_raw {
-                if may_full {
-                    return full("row count moved beyond additions (GC?)");
-                }
-                return Ok((n, s));
-            }
-            // In-place updates (nix store sign, ca rewrites): ids and count stand still
-            // while sig/ca bytes move. The accumulated additions' own contribution is
-            // accounted for, so add-churn does not mask a concurrent update.
-            if !s.probe_unreliable && probe != s.probe + s.pending_probe_bytes {
-                if may_full {
-                    return full("sig/ca bytes moved in place (nix store sign?)");
-                }
-                // The count is verified: roll its baseline, keep the probe stale.
-                s.count = count;
-                s.pending_raw = 0;
-                return Ok((n, s));
-            }
-            // Both signals verified (or the probe is suspended): roll the baselines.
-            s.count = count;
-            s.probe = probe;
-            s.pending_raw = 0;
-            s.pending_probe_bytes = 0;
-            s.probe_unreliable = false;
+            let (cands, max_id) = db.additions_since(s.max_id)?;
+            let n = index.sync_own_db_incremental(&db, &cands)?;
+            s.max_id = max_id;
             Ok((n, s))
         })
         .await
@@ -415,6 +352,14 @@ impl Sync {
             self.stats.export_events.fetch_add(n as u64, Relaxed);
         }
         Ok(n)
+    }
+
+    /// Test hook: make the next wake take the full-reconciliation path.
+    #[cfg(test)]
+    pub fn force_reconcile(&self) {
+        *self.diff_state.lock().unwrap() = None;
+        self.last_data_version
+            .store(i64::MIN, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Nudge every peer to pull from us (debounced by the hint loop).

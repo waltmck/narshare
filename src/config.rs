@@ -94,6 +94,12 @@ pub struct CacheCfg {
     /// switching backends is just a resync.
     #[serde(default)]
     pub postgres: Option<String>,
+    /// Deletions and in-place updates in the local Nix db are detected only by the periodic
+    /// full reconciliation (the additions watermark cannot see them; a peer fetching content
+    /// we no longer have gets 410 Gone and we retract that hash immediately). Lower values
+    /// trade CPU (an O(store) diff per interval) for staleness; tests use seconds.
+    #[serde(with = "humantime_serde", default = "d_reconcile_every")]
+    pub reconcile_every: Duration,
     /// How long an attestation (a store-path → content fact, with its signatures) outlives
     /// the last holder of its content. Within this window a GC'd-then-rebuilt path still
     /// verifies under its original signatures.
@@ -106,6 +112,7 @@ impl Default for CacheCfg {
         Self {
             dir: d_cache_dir(),
             postgres: None,
+            reconcile_every: d_reconcile_every(),
             attestation_grace: d_attestation_grace(),
         }
     }
@@ -259,6 +266,9 @@ fn d_stall_timeout() -> Duration {
 }
 fn d_cache_dir() -> PathBuf {
     "/var/cache/narshare".into()
+}
+fn d_reconcile_every() -> Duration {
+    Duration::from_secs(3600)
 }
 fn d_attestation_grace() -> Duration {
     Duration::from_secs(90 * 24 * 3600)

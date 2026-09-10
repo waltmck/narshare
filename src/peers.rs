@@ -394,6 +394,13 @@ impl Peers {
                 return Err(e).with_context(|| format!("peer {}", peer.name));
             }
         };
+        if resp.status() == reqwest::StatusCode::GONE {
+            // Stale-index feedback, not a fault: the holder just learned (and retracted) that
+            // it no longer has this content. Deliberately NO strike — a breaker would blank
+            // its other content over our stale expectation. The transfer's MW weights stop
+            // picking it, and the holder's Drop reaches us on the next pull.
+            bail!("peer {}: content gone (holder GC'd it)", peer.name);
+        }
         if resp.status().is_server_error() {
             self.strike(peer_idx);
             bail!("peer {}: HTTP {}", peer.name, resp.status());

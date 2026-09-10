@@ -71,6 +71,10 @@ const NAR_NEGATIVE_TTL: Duration = Duration::from_secs(10);
 const NAR_NEGATIVE_ENTRIES: usize = 4096;
 
 pub struct ServeState {
+    /// Demand-driven deletion feedback: a NAR request for content the db no longer has
+    /// answers 410 Gone and retracts our Have for that hash (see Index::retract_hold).
+    /// None only in fixtures that exercise serving alone.
+    pub index: Option<Arc<crate::index::Index>>,
     db: Arc<StoreDb>,
     reader: SegmentReader,
     cfg: ServeCfg,
@@ -171,8 +175,14 @@ struct EncStats {
 }
 
 impl ServeState {
-    pub fn new(db: Arc<StoreDb>, reader: SegmentReader, cfg: ServeCfg) -> Arc<Self> {
+    pub fn new(
+        db: Arc<StoreDb>,
+        reader: SegmentReader,
+        cfg: ServeCfg,
+        index: Option<Arc<crate::index::Index>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            index,
             db,
             reader,
             cfg,
@@ -323,6 +333,24 @@ fn err500(context: &str, e: anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
 }
 
+/// A request for content we may have CLAIMED but no longer have (GC'd between
+/// reconciliations): 410 Gone — distinct from 404 so the peer skips us without a breaker
+/// strike — and retract our Have for the hash point-wise. The requester's hash IS the
+/// resolution; no scan needed. A bogus hash retracts nothing (is_held gate).
+fn content_gone(st: &Arc<ServeState>, nar_hash: [u8; 32]) -> Response {
+    if let Some(index) = st.index.clone() {
+        tokio::task::spawn_blocking(move || match index.retract_hold(nar_hash) {
+            Ok(true) => tracing::info!(
+                "retracted stale hold for {} after a peer's request (GC'd?)",
+                crate::nixbase32::encode(&nar_hash)
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("could not retract stale hold: {e:#}"),
+        });
+    }
+    StatusCode::GONE.into_response()
+}
+
 async fn cache_info(State(st): State<Arc<ServeState>>) -> Response {
     let body = format!(
         "StoreDir: {}\nWantMassQuery: 1\nPriority: {}\n",
@@ -381,7 +409,7 @@ async fn get_nar(
             st.stats
                 .nar_misses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return StatusCode::NOT_FOUND.into_response();
+            return content_gone(&st, nar_hash);
         }
         Err(e) => return err500("nar lookup", e),
     };

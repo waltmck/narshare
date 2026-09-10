@@ -115,6 +115,9 @@ let
       enable = true;
       config = {
         inherit name;
+        # Deletions propagate via the periodic reconciliation (production: hourly, plus the
+        # 410 feedback path); the suite's GC assertions need it within test timeouts.
+        cache.reconcile_every = "10s";
         serve = {
           listen = "0.0.0.0:5050";
           # Bounds serve-side zstd encoder memory on these small VMs.

@@ -41,7 +41,19 @@ postgres commits die with the SERVER on an OOM-kill — wal_buffers are its shar
 which is exactly why self-origin transactions escalate.) Both backends wipe-and-resync on
 layout changes. sqlite remains only as the read-only window into Nix's own database.
 
-Future (noted, unimplemented): for a recursive fixed-output derivation whose .drv is in the
+The exporter is incremental: additions ride the ValidPaths.id watermark (AUTOINCREMENT ids,
+never reused — guarded at runtime), O(new rows) per debounced wake with point lookups.
+Deletions and in-place updates are DELIBERATELY deferred to a periodic full reconciliation
+(cache.reconcile_every, default hourly; it bypasses the data_version gate so quiet databases
+still reconcile) — per-wake consistency scans were the daemon's dominant CPU on compressed CoW
+filesystems. Fetch-facing staleness in between is closed by demand feedback: a NAR request for
+content the db no longer has answers 410 Gone (the peer skips the holder WITHOUT a breaker
+strike) and retracts the holder's Have for that hash point-wise — the request itself carries
+the hash, which is exactly the resolution a filesystem watcher could not provide.
+
+Future (noted, unimplemented): hook garbage collection directly (e.g. SIGHUP → immediate
+reconciliation, poked by an ExecStopPost on the GC unit) so deletions propagate promptly
+without any polling. And: for a recursive fixed-output derivation whose .drv is in the
 local store, the expected output NAR hash is known before any attestation exists — the proxy
 could parse the drv and go straight to "who holds H" as a fallback lookup for unattested FODs.
 

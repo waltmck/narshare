@@ -395,7 +395,12 @@ mod tests {
             db_path.to_str().unwrap()
         ))
         .unwrap();
-        let serve_state = serve::ServeState::new(db.clone(), SegmentReader::for_tests(), scfg);
+        let serve_state = serve::ServeState::new(
+            db.clone(),
+            SegmentReader::for_tests(),
+            scfg,
+            Some(index.clone()),
+        );
         let peers = Arc::new(
             Peers::new(
                 &[],
@@ -406,7 +411,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let s = sync::Sync::new(index.clone(), peers, Some(db.clone()), None);
+        let s = sync::Sync::new(
+            index.clone(),
+            peers,
+            Some(db.clone()),
+            None,
+            std::time::Duration::from_secs(3600),
+        );
         let status = crate::status::router(Arc::new(crate::status::StatusCtx {
             name: name.to_owned(),
             started: Instant::now(),
@@ -474,7 +485,13 @@ mod tests {
         );
         let peer_names: Vec<String> = cfg.peers.iter().map(|p| p.name.clone()).collect();
         let index = open_test_index(&dir.path().join("cache"), name, &peer_names, keys);
-        let s = sync::Sync::new(index.clone(), peers.clone(), None, None);
+        let s = sync::Sync::new(
+            index.clone(),
+            peers.clone(),
+            None,
+            None,
+            std::time::Duration::from_secs(3600),
+        );
         let state = ProxyState::new(
             peers,
             index.clone(),
@@ -1495,10 +1512,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn incremental_export_covers_adds_gc_and_inplace_signing() {
-        // The differ's wake taxonomy end to end: additions ride the id watermark (O(new)),
-        // deletions trip the row-count check, and in-place signature adds — invisible to both
-        // — trip the sig probe. FULL_MIN_INTERVAL is zero under cfg(test).
+    async fn incremental_export_defers_gc_and_signing_to_reconciliation() {
+        // The differ's contract: additions ride the id watermark per wake (O(new));
+        // deletions and in-place signing are INVISIBLE until a reconciliation (hourly in
+        // production, forced here) — with the 410 feedback path covering the fetch-facing
+        // staleness in between (tested separately).
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("store");
         std::fs::create_dir_all(&store).unwrap();
@@ -1524,40 +1542,110 @@ mod tests {
             )
             .unwrap(),
         );
-        let s = sync::Sync::new(index.clone(), peers, Some(db.clone()), None);
+        let s = sync::Sync::new(
+            index.clone(),
+            peers,
+            Some(db.clone()),
+            None,
+            std::time::Duration::from_secs(3600),
+        );
 
-        // Startup wake: full reconciliation — one fact, one hash.
-        assert_eq!(s.export_own_db().await.unwrap(), 2);
-        // A quiet wake is gated by data_version before any diff work.
-        assert_eq!(s.export_own_db().await.unwrap(), 0);
-
-        // Addition: exactly the new row's events, via the incremental path.
-        let p2 = format!("{}/{}-two", store.display(), "2".repeat(32));
-        crate::db::tests::insert_path(&db_path, &p2, [2u8; 32], 20, Some("fixed:r:sha256:y"));
         assert_eq!(
             s.export_own_db().await.unwrap(),
             2,
-            "attest + have for the new row"
+            "startup full: attest + have"
         );
+        assert_eq!(s.export_own_db().await.unwrap(), 0, "quiet wake is gated");
+
+        // Additions: exactly the new row's events, incrementally.
+        let p2 = format!("{}/{}-two", store.display(), "2".repeat(32));
+        crate::db::tests::insert_path(&db_path, &p2, [2u8; 32], 20, Some("fixed:r:sha256:y"));
+        assert_eq!(s.export_own_db().await.unwrap(), 2);
         assert_eq!(index.holdings_of("a").len(), 2);
 
-        // In-place signing (nix store sign): no new ids, count unchanged — the sig probe
-        // detects it and the full diff re-attests with the new signature merged.
+        // In-place signing: invisible to the watermark — deferred to reconciliation.
         crate::db::tests::set_sigs(&db_path, &p1, "cache.example-1:AAAA");
-        assert_eq!(s.export_own_db().await.unwrap(), 1, "the re-attested fact");
-        let rows = index.lookup_hash_part(&"1".repeat(32)).unwrap();
-        assert!(
-            rows[0]
-                .info
-                .sigs
-                .contains(&"cache.example-1:AAAA".to_string()),
-            "the in-place signature must reach the index: {rows:?}"
+        assert_eq!(s.export_own_db().await.unwrap(), 0, "not yet visible");
+        s.force_reconcile();
+        assert_eq!(
+            s.export_own_db().await.unwrap(),
+            1,
+            "reconciliation attests the sig"
         );
+        let rows = index.lookup_hash_part(&"1".repeat(32)).unwrap();
+        assert!(rows[0]
+            .info
+            .sigs
+            .contains(&"cache.example-1:AAAA".to_string()));
 
-        // GC: the count check detects deletion and the full diff drops possession.
+        // GC: likewise deferred.
         crate::db::tests::delete_path(&db_path, &p2);
-        assert_eq!(s.export_own_db().await.unwrap(), 1, "one Drop");
+        assert_eq!(s.export_own_db().await.unwrap(), 0, "not yet visible");
+        s.force_reconcile();
+        assert_eq!(
+            s.export_own_db().await.unwrap(),
+            1,
+            "reconciliation drops possession"
+        );
         assert_eq!(index.holdings_of("a").len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_hold_answers_410_and_retracts_without_breaker_strike() {
+        // Between reconciliations a GC'd path is still advertised. A peer's fetch must get
+        // 410 Gone (no breaker strike — a strike would blank the holder's other content),
+        // and the holder must retract its Have point-wise from the request's hash alone.
+        let dir = tempfile::tempdir().unwrap();
+        let (store_dir, db_path, _nar_size, nar_hash) = fake_store(dir.path());
+        let node = spawn_node("a", &["a", "c"], &store_dir, &db_path, TrustedKeys::none()).await;
+        let client = spawn_client("c", &[("a", &node.url)], "", TrustedKeys::none()).await;
+        client.sync_all().await;
+        let http = reqwest::Client::new();
+        let nar32 = crate::nixbase32::encode(&nar_hash);
+
+        // GC the path on the holder WITHOUT letting its differ notice (deferred by design).
+        crate::db::tests::delete_path(
+            &db_path,
+            &format!("{store_dir}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-game-1.0"),
+        );
+        let resp = http
+            .get(format!("{}/nar/{nar32}.nar", client.url))
+            .send()
+            .await
+            .unwrap();
+        // The proxy commits its 200 before streaming; the sole holder's 410 aborts the body.
+        assert!(
+            resp.bytes().await.is_err(),
+            "sole holder lost the bytes: the transfer must fail"
+        );
+        // The holder answered 410: no strike, breaker stays closed.
+        assert!(
+            client.state.peers.list[0].available(),
+            "410 must not open the breaker"
+        );
+        // ...and it retracted its own Have from the request alone (no scan, no differ run).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !node.index.holdings_of("a").contains(&nar_hash) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hold was not retracted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // After the client's next pull, the mesh index agrees: clean 404, not 410 noise.
+        client.sync_all().await;
+        let gone = http
+            .get(format!(
+                "{}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo",
+                client.url
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), 404);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1597,7 +1685,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let b_sync = sync::Sync::new(b.index.clone(), b_peers, Some(b.db.clone()), None);
+        let b_sync = sync::Sync::new(
+            b.index.clone(),
+            b_peers,
+            Some(b.db.clone()),
+            None,
+            std::time::Duration::from_secs(3600),
+        );
         assert!(b_sync.pull_from(0).await.unwrap());
 
         // c CONFIGURES a (the origin universe is the configured mesh) but cannot reach it —
@@ -2140,7 +2234,12 @@ mod tests {
             db_path.to_str().unwrap()
         ))
         .unwrap();
-        let serve_state = serve::ServeState::new(db.clone(), SegmentReader::for_tests(), scfg);
+        let serve_state = serve::ServeState::new(
+            db.clone(),
+            SegmentReader::for_tests(),
+            scfg,
+            Some(index.clone()),
+        );
         let peers0 = Arc::new(
             Peers::new(
                 &[],
@@ -2151,7 +2250,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let s = sync::Sync::new(index, peers0, Some(db), None);
+        let s = sync::Sync::new(
+            index,
+            peers0,
+            Some(db),
+            None,
+            std::time::Duration::from_secs(3600),
+        );
         let inner = serve::router(serve_state).merge(s.router());
         let hang = Router::new()
             .route(
@@ -2232,6 +2337,7 @@ mod tests {
             db,
             SegmentReader::for_tests(),
             scfg,
+            None,
         )))
         .await;
         let http = reqwest::Client::new();
@@ -2267,6 +2373,7 @@ mod tests {
             db,
             SegmentReader::for_tests(),
             scfg,
+            None,
         )))
         .await;
         let nar32 = crate::nixbase32::encode(&nar_hash);

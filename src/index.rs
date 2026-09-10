@@ -70,6 +70,9 @@ pub struct Index {
     trusted: TrustedKeys,
     /// How long an attestation outlives its last holder.
     grace: Duration,
+    /// Serializes ALL self-origin exports (differ + serve-side retractions): the store's
+    /// expect-gate would only detect the race and bail; this prevents it.
+    self_write: Mutex<()>,
     /// Pacing for the maintenance pass: sync traffic calls maybe_compact() on every
     /// request/pull, but journal floors move at most once a minute and the attestation
     /// reaper — a full-table scan — at most every ten. Unpaced compact() stays for tests
@@ -175,6 +178,7 @@ impl Index {
             peer_names: peer_names.to_vec(),
             trusted,
             grace,
+            self_write: Mutex::new(()),
             last_compact: Mutex::new(None),
             last_reap: Mutex::new(None),
             nosub: Mutex::new(HashMap::new()),
@@ -569,6 +573,7 @@ impl Index {
     /// is just a smaller-than-usual export, and a crash between chunks re-diffs the remainder.
     fn export_ops(&self, attests: &[proto::Attestation], holds: &[HoldOp]) -> Result<usize> {
         const EXPORT_CHUNK: usize = 10_000;
+        let _self_writer = self.self_write.lock().unwrap();
         enum Op<'a> {
             Att(&'a proto::Attestation),
             Hold(&'a HoldOp),
@@ -624,25 +629,19 @@ impl Index {
     /// the snapshot and its consistency arithmetic): O(new rows), point lookups instead of
     /// table scans. Deletions and in-place updates are invisible to an additions stream BY
     /// CONSTRUCTION; the caller detects those via the snapshot's count and probe signals and
-    /// schedules a full reconciliation. Returns (events emitted, the parsed rows' sig/ca byte
-    /// contribution to the probe — mirroring SQLite's LENGTH() arithmetic: space-joined sigs,
-    /// ASCII so chars == bytes).
+    /// schedules... rather: catches at the hourly reconciliation. Returns events emitted.
     pub fn sync_own_db_incremental(
         &self,
         db: &StoreDb,
         cands: &[crate::db::Candidate],
-    ) -> Result<(usize, i64)> {
+    ) -> Result<usize> {
         if cands.is_empty() {
-            return Ok((0, 0));
+            return Ok(0);
         }
-        let mut added_probe_bytes: i64 = 0;
         let mut attests: Vec<proto::Attestation> = Vec::new();
         let mut holds: Vec<HoldOp> = Vec::new();
         let mut new_hashes: HashSet<[u8; 32]> = HashSet::new();
         for c in cands {
-            let sig_len: i64 = c.sigs.iter().map(|s| s.len() as i64).sum::<i64>()
-                + c.sigs.len().saturating_sub(1) as i64;
-            added_probe_bytes += sig_len + c.ca.as_deref().map_or(0, |ca| ca.len() as i64);
             if new_hashes.insert(c.nar_hash) && !self.store.is_held(&self.self_name, &c.nar_hash)? {
                 holds.push(HoldOp::Add(c.nar_hash));
             }
@@ -672,7 +671,21 @@ impl Index {
                 attests.push(a);
             }
         }
-        Ok((self.export_ops(&attests, &holds)?, added_probe_bytes))
+        self.export_ops(&attests, &holds)
+    }
+
+    /// Demand-driven deletion feedback from the serve side: a peer asked for content our
+    /// index claims we hold, and the store said no. Retract the Have point-wise — a
+    /// journaled Drop like any export, O(1) — instead of waiting for the hourly
+    /// reconciliation. The request itself carried the NAR hash: exactly the path→hash
+    /// resolution a filesystem watcher could not provide. Peers learn on their next pull;
+    /// the requester already got its 410 and moved on.
+    pub fn retract_hold(&self, nar_hash: [u8; 32]) -> Result<bool> {
+        if !self.store.is_held(&self.self_name, &nar_hash)? {
+            return Ok(false);
+        }
+        self.export_ops(&[], &[HoldOp::Drop(nar_hash)])?;
+        Ok(true)
     }
 
     /// The sync-path maintenance entry: full compaction is idempotent housekeeping, so pace
