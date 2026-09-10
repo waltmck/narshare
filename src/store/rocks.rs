@@ -723,6 +723,22 @@ impl SyncStore for RocksStore {
             .collect()
     }
 
+    fn attestation_sigs(&self, hash_part: &str, nar_hash: &[u8]) -> Result<Option<Vec<String>>> {
+        let mut key = Vec::with_capacity(64);
+        key.extend_from_slice(hash_part.as_bytes());
+        key.extend_from_slice(nar_hash);
+        match self.db.get_cf(self.cf("att"), &key)? {
+            Some(v) => Ok(Some(att_decode(&v)?.0.sigs)),
+            None => Ok(None),
+        }
+    }
+
+    fn is_held(&self, origin: &str, nar_hash: &[u8; 32]) -> Result<bool> {
+        let mut key = okey(origin)?;
+        key.extend_from_slice(nar_hash);
+        Ok(self.db.get_cf(self.cf("hold"), &key)?.is_some())
+    }
+
     fn advance_watermark(&self, peer: &str, origin: &str, seq: u64) -> Result<()> {
         let _g = self.write.lock().unwrap();
         let mut key = okey(peer)?;

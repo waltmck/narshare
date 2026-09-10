@@ -676,6 +676,26 @@ impl SyncStore for PgStore {
         })
     }
 
+    fn attestation_sigs(&self, hash_part: &str, nar_hash: &[u8]) -> Result<Option<Vec<String>>> {
+        self.with_conn(|c| {
+            Ok(c.query_opt(
+                "SELECT sigs FROM attestations WHERE hash_part = $1 AND nar_hash = $2",
+                &[&hash_part, &nar_hash],
+            )?
+            .map(|r| r.get(0)))
+        })
+    }
+
+    fn is_held(&self, origin: &str, nar_hash: &[u8; 32]) -> Result<bool> {
+        self.with_conn(|c| {
+            Ok(c.query_opt(
+                "SELECT 1 FROM holdings WHERE origin = $1 AND nar_hash = $2",
+                &[&origin, &&nar_hash[..]],
+            )?
+            .is_some())
+        })
+    }
+
     fn advance_watermark(&self, peer: &str, origin: &str, seq: u64) -> Result<()> {
         self.with_conn(|c| {
             c.execute(

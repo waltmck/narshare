@@ -1495,6 +1495,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn incremental_export_covers_adds_gc_and_inplace_signing() {
+        // The differ's wake taxonomy end to end: additions ride the id watermark (O(new)),
+        // deletions trip the row-count check, and in-place signature adds — invisible to both
+        // — trip the sig probe. FULL_MIN_INTERVAL is zero under cfg(test).
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let p1 = format!("{}/{}-one", store.display(), "1".repeat(32));
+        let db_path = crate::db::tests::fake_db(
+            dir.path(),
+            &[(&p1, [1u8; 32], 10, Some("fixed:r:sha256:x"))],
+        );
+        let db = Arc::new(StoreDb::open(&db_path, store.to_str().unwrap()).unwrap());
+        let index = open_test_index(
+            &dir.path().join("cache"),
+            "a",
+            &["b".to_string()],
+            TrustedKeys::none(),
+        );
+        let peers = Arc::new(
+            Peers::new(
+                &[],
+                std::time::Duration::from_secs(5),
+                3,
+                std::time::Duration::from_secs(15),
+                8,
+            )
+            .unwrap(),
+        );
+        let s = sync::Sync::new(index.clone(), peers, Some(db.clone()), None);
+
+        // Startup wake: full reconciliation — one fact, one hash.
+        assert_eq!(s.export_own_db().await.unwrap(), 2);
+        // A quiet wake is gated by data_version before any diff work.
+        assert_eq!(s.export_own_db().await.unwrap(), 0);
+
+        // Addition: exactly the new row's events, via the incremental path.
+        let p2 = format!("{}/{}-two", store.display(), "2".repeat(32));
+        crate::db::tests::insert_path(&db_path, &p2, [2u8; 32], 20, Some("fixed:r:sha256:y"));
+        assert_eq!(
+            s.export_own_db().await.unwrap(),
+            2,
+            "attest + have for the new row"
+        );
+        assert_eq!(index.holdings_of("a").len(), 2);
+
+        // In-place signing (nix store sign): no new ids, count unchanged — the sig probe
+        // detects it and the full diff re-attests with the new signature merged.
+        crate::db::tests::set_sigs(&db_path, &p1, "cache.example-1:AAAA");
+        assert_eq!(s.export_own_db().await.unwrap(), 1, "the re-attested fact");
+        let rows = index.lookup_hash_part(&"1".repeat(32)).unwrap();
+        assert!(
+            rows[0]
+                .info
+                .sigs
+                .contains(&"cache.example-1:AAAA".to_string()),
+            "the in-place signature must reach the index: {rows:?}"
+        );
+
+        // GC: the count check detects deletion and the full diff drops possession.
+        crate::db::tests::delete_path(&db_path, &p2);
+        assert_eq!(s.export_own_db().await.unwrap(), 1, "one Drop");
+        assert_eq!(index.holdings_of("a").len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn transitive_propagation_through_a_relay() {
         // a → b → c: c never talks to a, but learns a's holdings through b's cache.
         let dir = tempfile::tempdir().unwrap();

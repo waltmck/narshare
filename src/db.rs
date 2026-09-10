@@ -48,6 +48,18 @@ pub struct PathInfo {
     pub references: Vec<String>,
 }
 
+/// One consistent snapshot of the incremental differ's inputs (see diff_signals).
+pub struct DiffSignals {
+    pub cands: Vec<Candidate>,
+    /// Raw row count above the watermark, malformed rows included.
+    pub raw: usize,
+    /// The table's current max id — the next additions watermark.
+    pub max_id: i64,
+    pub count: i64,
+    /// SUM(LENGTH(sigs) + LENGTH(ca)): moves on in-place signature/ca updates.
+    pub probe: i64,
+}
+
 pub struct StoreDb {
     conn: Mutex<Connection>,
     pub store_dir: String,
@@ -175,11 +187,39 @@ impl StoreDb {
     /// detection needs only (hash, sigs). Callers fetch references via references_of() for
     /// the handful of rows that actually changed.
     pub fn candidates(&self) -> Result<Vec<Candidate>> {
+        Ok(self.diff_signals(-1)?.cands)
+    }
+
+    /// Rows with id strictly above `since`, plus every consistency signal, in ONE read
+    /// transaction (a single WAL snapshot — the arithmetic must describe one moment).
+    /// ValidPaths.id is AUTOINCREMENT, so additions are monotone and ids are never reused;
+    /// deletions and in-place updates are invisible here BY CONSTRUCTION and are detected by
+    /// the count / probe signals instead. Commits after this snapshot bump data_version and
+    /// earn their own wake — at-least-once, never lost.
+    pub fn diff_signals(&self, since: i64) -> Result<DiffSignals> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached("SELECT id, path, hash, narSize, sigs, ca, deriver FROM ValidPaths")?;
+        let tx = conn.unchecked_transaction()?;
+        // The next watermark is the TABLE max, not the max of returned rows: it must advance
+        // past malformed rows too, or they would be re-fetched (and re-counted) forever.
+        let max_id: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) FROM ValidPaths", [], |r| {
+            r.get(0)
+        })?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM ValidPaths", [], |r| r.get(0))?;
+        // The silent-commit probe: in-place UPDATEs (nix store sign, ca rewrites) move
+        // neither ids nor the count, but they change sig/ca byte totals. Length-blind to
+        // equal-length swaps (a repair rewriting narHash) — the periodic reconciliation
+        // covers those.
+        let probe: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(LENGTH(COALESCE(sigs,'')) + LENGTH(COALESCE(ca,''))), 0) \
+             FROM ValidPaths",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut stmt = tx.prepare_cached(
+            "SELECT id, path, hash, narSize, sigs, ca, deriver FROM ValidPaths WHERE id > ?1",
+        )?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map([since], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
@@ -191,14 +231,15 @@ impl StoreDb {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut out = Vec::with_capacity(rows.len());
+        let raw = rows.len();
+        let mut cands = Vec::with_capacity(raw);
         for (id, path, hash, sz, sigs, ca, deriver) in rows {
             let Some(nar_size) = sz else {
                 warn_once(&anyhow::anyhow!("path {path} has no narSize in nix db"));
                 continue;
             };
             match parse_hash_column(&hash) {
-                Ok(nar_hash) => out.push(Candidate {
+                Ok(nar_hash) => cands.push(Candidate {
                     id,
                     path,
                     nar_hash,
@@ -212,7 +253,31 @@ impl StoreDb {
                 Err(e) => warn_once(&e),
             }
         }
-        Ok(out)
+        drop(stmt);
+        tx.commit()?;
+        Ok(DiffSignals {
+            cands,
+            raw,
+            max_id,
+            count,
+            probe,
+        })
+    }
+
+    /// Is ValidPaths.id AUTOINCREMENT (monotone, never reused)? The incremental differ's
+    /// count arithmetic is only sound under that guarantee: with a plain rowid PK, SQLite may
+    /// reuse a deleted max id, making a delete+reinsert replacement invisible to both the
+    /// watermark and the count check. Nix's schema declares it (verified live: sqlite_sequence
+    /// is ~12x the row count on a real store); if a future Nix drops it, the differ falls back
+    /// to full scans.
+    pub fn ids_monotone(&self) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let sql: String = conn.query_row(
+            "SELECT COALESCE(sql, '') FROM sqlite_master WHERE name = 'ValidPaths'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(sql.to_ascii_lowercase().contains("autoincrement"))
     }
 
     /// Full store paths of one row's references, sorted (the fingerprint needs them) — fetched

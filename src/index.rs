@@ -552,11 +552,23 @@ impl Index {
             return Ok(0);
         }
 
-        // Phase 3: journal and materialize. Chunked — a first export of a whole store is
-        // hundreds of thousands of events, and encoding them plus the store's write batch all
-        // at once was a half-gigabyte memory spike at switch time. Each chunk is atomic and
-        // advances the clock; the self origin is single-writer, so a chunk boundary is just
-        // a smaller-than-usual export, and a crash between chunks re-diffs the remainder.
+        // Phase 3: journal and materialize.
+        let emitted = self.export_ops(&attests, &holds)?;
+        // The diff's transient maps (candidates, claims) peak at ~100MB on a real store, and
+        // glibc retains freed arenas indefinitely — hand them back so a build's worth of diff
+        // cycles doesn't read as daemon bloat.
+        if emitted > 0 {
+            unsafe { libc::malloc_trim(0) };
+        }
+        Ok(emitted)
+    }
+
+    /// Journal and materialize a batch of self-origin ops. Chunked — a first export of a
+    /// whole store is hundreds of thousands of events, and encoding them plus the store's
+    /// write batch all at once was a half-gigabyte memory spike at switch time. Each chunk is
+    /// atomic and advances the clock; the self origin is single-writer, so a chunk boundary
+    /// is just a smaller-than-usual export, and a crash between chunks re-diffs the remainder.
+    fn export_ops(&self, attests: &[proto::Attestation], holds: &[HoldOp]) -> Result<usize> {
         const EXPORT_CHUNK: usize = 10_000;
         enum Op<'a> {
             Att(&'a proto::Attestation),
@@ -606,13 +618,62 @@ impl Index {
                 bail!("self-origin apply raced: the own-db loop must be the only self writer");
             }
         }
-        // The diff's transient maps (candidates, claims) peak at ~100MB on a real store, and
-        // glibc retains freed arenas indefinitely — hand them back so a build's worth of diff
-        // cycles doesn't read as daemon bloat.
-        if emitted > 0 {
-            unsafe { libc::malloc_trim(0) };
-        }
         Ok(emitted)
+    }
+
+    /// The incremental additions pass over a pre-fetched snapshot's candidates (sync.rs owns
+    /// the snapshot and its consistency arithmetic): O(new rows), point lookups instead of
+    /// table scans. Deletions and in-place updates are invisible to an additions stream BY
+    /// CONSTRUCTION; the caller detects those via the snapshot's count and probe signals and
+    /// schedules a full reconciliation. Returns (events emitted, the parsed rows' sig/ca byte
+    /// contribution to the probe — mirroring SQLite's LENGTH() arithmetic: space-joined sigs,
+    /// ASCII so chars == bytes).
+    pub fn sync_own_db_incremental(
+        &self,
+        db: &StoreDb,
+        cands: &[crate::db::Candidate],
+    ) -> Result<(usize, i64)> {
+        if cands.is_empty() {
+            return Ok((0, 0));
+        }
+        let mut added_probe_bytes: i64 = 0;
+        let mut attests: Vec<proto::Attestation> = Vec::new();
+        let mut holds: Vec<HoldOp> = Vec::new();
+        let mut new_hashes: HashSet<[u8; 32]> = HashSet::new();
+        for c in cands {
+            let sig_len: i64 = c.sigs.iter().map(|s| s.len() as i64).sum::<i64>()
+                + c.sigs.len().saturating_sub(1) as i64;
+            added_probe_bytes += sig_len + c.ca.as_deref().map_or(0, |ca| ca.len() as i64);
+            if new_hashes.insert(c.nar_hash) && !self.store.is_held(&self.self_name, &c.nar_hash)? {
+                holds.push(HoldOp::Add(c.nar_hash));
+            }
+            if c.ca.is_none() && c.sigs.is_empty() {
+                continue;
+            }
+            let known = self
+                .store
+                .attestation_sigs(hash_part_of(&c.path), &c.nar_hash)?
+                .is_some_and(|sigs| c.sigs.iter().all(|s| sigs.contains(s)));
+            if known || !self.substitutable(c) {
+                continue;
+            }
+            let refs = db.references_of(c.id)?;
+            let a = proto::Attestation {
+                store_path: c.path.clone(),
+                nar_hash: c.nar_hash.to_vec(),
+                nar_size: c.nar_size,
+                references: refs
+                    .iter()
+                    .map(|r| crate::narinfo::basename(r, &db.store_dir).to_owned())
+                    .collect(),
+                ca: c.ca.clone().unwrap_or_default(),
+                sigs: c.sigs.clone(),
+            };
+            if self.feasible(&a) {
+                attests.push(a);
+            }
+        }
+        Ok((self.export_ops(&attests, &holds)?, added_probe_bytes))
     }
 
     /// The sync-path maintenance entry: full compaction is idempotent housekeeping, so pace

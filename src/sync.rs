@@ -56,6 +56,27 @@ const BURST_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_CAP: usize = 1 << 20;
 /// Truncated-suffix pull rounds before giving up until the next trigger.
 const MAX_ROUNDS: usize = 64;
+/// Full reconciliations run at most this often when triggered by the deletion/in-place
+/// signals — a GC or `nix store sign --all` is thousands of commits, and one full diff per
+/// rate window converges the same state as one per commit.
+#[cfg(not(test))]
+const FULL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const FULL_MIN_INTERVAL: std::time::Duration = std::time::Duration::ZERO;
+/// Belt-and-braces reconciliation for what no signal sees (an equal-length in-place rewrite,
+/// e.g. `nix store repair` swapping a narHash): one O(store) diff per hour is noise.
+const RECONCILE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The incremental differ's arithmetic between wakes: the additions watermark, the expected
+/// row count, and the expected sig-probe total. Any observation that disagrees means the db
+/// changed in a way additions cannot explain -> full reconciliation.
+#[derive(Clone, Copy)]
+struct DiffState {
+    max_id: i64,
+    count: i64,
+    probe: i64,
+    last_full: std::time::Instant,
+}
 
 pub struct Sync {
     pub index: Arc<Index>,
@@ -69,6 +90,8 @@ pub struct Sync {
     hint_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
     /// Process start, for the catch-up cadence window.
     started: std::time::Instant,
+    /// The incremental differ's consistency state; None forces a full reconciliation (startup).
+    diff_state: std::sync::Mutex<Option<DiffState>>,
     /// The nix db's data_version as of the last completed diff (i64::MIN = never diffed).
     /// The differ's cheap gate: PRAGMA data_version moves only when another connection
     /// COMMITS, so timer rescans and reader-generated inotify chatter on an unchanged store
@@ -118,6 +141,7 @@ impl Sync {
             hint_tx,
             hint_rx: std::sync::Mutex::new(Some(hint_rx)),
             started: std::time::Instant::now(),
+            diff_state: std::sync::Mutex::new(None),
             last_data_version: std::sync::atomic::AtomicI64::new(i64::MIN),
             stats: SyncStats::default(),
         })
@@ -287,9 +311,88 @@ impl Sync {
             return Ok(0);
         }
         let index = self.index.clone();
-        let n = tokio::task::spawn_blocking(move || index.sync_own_db(&db))
-            .await
-            .map_err(|e| anyhow::anyhow!("differ task died: {e}"))??;
+        let st = *self.diff_state.lock().unwrap();
+        let (n, new_state) = tokio::task::spawn_blocking(move || -> Result<(usize, DiffState)> {
+            let now = std::time::Instant::now();
+            // A full reconciliation captures its baseline snapshot BEFORE scanning, so
+            // rows committed mid-scan land above the watermark and are re-examined
+            // (idempotently) on the next wake instead of being silently skipped.
+            let full = |reason: &str| -> Result<(usize, DiffState)> {
+                if !reason.is_empty() {
+                    tracing::debug!("full reconciliation: {reason}");
+                }
+                let base = db.diff_signals(i64::MAX)?;
+                let n = index.sync_own_db(&db)?;
+                Ok((
+                    n,
+                    DiffState {
+                        max_id: base.max_id,
+                        count: base.count,
+                        probe: base.probe,
+                        last_full: now,
+                    },
+                ))
+            };
+            // The whole incremental design is sound only while ids are monotone
+            // (AUTOINCREMENT): a reused id would make a delete+reinsert replacement
+            // invisible to both the watermark and the count. Guarded per wake.
+            let Some(s) = st else { return full("") };
+            if now.duration_since(s.last_full) >= RECONCILE_EVERY {
+                return full("periodic");
+            }
+            if !db.ids_monotone()? {
+                return full("ValidPaths.id is not AUTOINCREMENT on this system");
+            }
+            let sig = db.diff_signals(s.max_id)?;
+            let parsed = sig.cands.len();
+            let (n, added_probe_bytes) = index.sync_own_db_incremental(&db, &sig.cands)?;
+            let may_full = now.duration_since(s.last_full) >= FULL_MIN_INTERVAL;
+            // Deletions (or delete+reinsert replacements): additions alone cannot explain
+            // the count — raw new rows appear on both sides of the equation, so a mismatch
+            // is exactly "rows with id <= watermark vanished". Keep the stale expectation
+            // when rate-limited so the next wake re-detects it.
+            if sig.count != s.count + sig.raw as i64 {
+                if may_full {
+                    return full("row count moved beyond additions (GC?)");
+                }
+                return Ok((
+                    n,
+                    DiffState {
+                        max_id: sig.max_id,
+                        ..s
+                    },
+                ));
+            }
+            // In-place updates (nix store sign, ca rewrites): ids and count stand still
+            // while sig/ca bytes move. The parsed rows' own contribution is accounted
+            // for, so add-churn does not mask a concurrent update; unparseable rows make
+            // the arithmetic unreliable for one wake — accept the fresh probe unchecked.
+            if parsed == sig.raw && sig.probe != s.probe + added_probe_bytes {
+                if may_full {
+                    return full("sig/ca bytes moved in place (nix store sign?)");
+                }
+                return Ok((
+                    n,
+                    DiffState {
+                        max_id: sig.max_id,
+                        count: sig.count,
+                        ..s
+                    },
+                ));
+            }
+            Ok((
+                n,
+                DiffState {
+                    max_id: sig.max_id,
+                    count: sig.count,
+                    probe: sig.probe,
+                    last_full: s.last_full,
+                },
+            ))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("differ task died: {e}"))??;
+        *self.diff_state.lock().unwrap() = Some(new_state);
         self.last_data_version.store(v, Relaxed);
         if n > 0 {
             self.stats.exports.fetch_add(1, Relaxed);

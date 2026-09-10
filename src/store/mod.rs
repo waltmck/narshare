@@ -161,6 +161,11 @@ pub trait SyncStore: Send + Sync {
     /// Slim full scan for the export differ: (store_path, nar_hash, sigs) of every retained
     /// attestation.
     fn attested_claims(&self) -> Result<Vec<ClaimRow>>;
+    /// One fact's signature set, or None if the fact is not retained — the incremental
+    /// differ's point-wise change test (a handful of new rows must not cost a table scan).
+    fn attestation_sigs(&self, hash_part: &str, nar_hash: &[u8]) -> Result<Option<Vec<String>>>;
+    /// Does `origin` hold this hash? Point-wise possession test for the incremental differ.
+    fn is_held(&self, origin: &str, nar_hash: &[u8; 32]) -> Result<bool>;
 
     // ---- watermarks ----
     /// Record that `peer` has seen `origin` up to `seq`; keeps the max of old and new.
@@ -596,6 +601,18 @@ pub mod conformance {
         // Same rows by nar hash.
         assert_eq!(s.lookup_nar_hash(&h(1)).unwrap().len(), 1);
         assert!(s.lookup_nar_hash(&h(9)).unwrap().is_empty());
+        // Point lookups agree with the scans.
+        assert_eq!(
+            s.attestation_sigs(&hp, &a1.nar_hash).unwrap().map(|mut v| {
+                v.sort();
+                v
+            }),
+            Some(vec!["k1:AAA".to_string(), "k2:BBB".to_string()])
+        );
+        assert!(s.attestation_sigs(&hp, &h(9)).unwrap().is_none());
+        assert!(s.is_held("x", &h(1)).unwrap());
+        assert!(!s.is_held("x", &h(9)).unwrap());
+        assert!(!s.is_held("nobody", &h(1)).unwrap());
         // Distinct (path, hash) facts coexist; claims scan sees both.
         let b = att("p", 2, &[]);
         s.merge_attestations(&[b], 0).unwrap();
