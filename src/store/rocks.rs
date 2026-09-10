@@ -700,11 +700,25 @@ impl SyncStore for RocksStore {
     }
 
     fn attested_claims(&self) -> Result<Vec<(String, Vec<u8>, Vec<String>)>> {
+        /// The differ's slim view of a fact: prost skips unlisted fields without allocating,
+        /// so this avoids decoding 200k reference lists once per diff cycle.
+        #[derive(prost::Message)]
+        struct Slim {
+            #[prost(string, tag = "1")]
+            store_path: String,
+            #[prost(bytes = "vec", tag = "2")]
+            nar_hash: Vec<u8>,
+            #[prost(string, repeated, tag = "6")]
+            sigs: Vec<String>,
+        }
         self.scan("att", b"")
             .into_iter()
             .map(|(_, v)| {
-                let (att, _) = att_decode(&v)?;
-                Ok((att.store_path, att.nar_hash, att.sigs))
+                if v.len() < 9 {
+                    bail!("corrupt attestation row ({} bytes)", v.len());
+                }
+                let s = Slim::decode(&v[9..]).context("corrupt attestation body")?;
+                Ok((s.store_path, s.nar_hash, s.sigs))
             })
             .collect()
     }

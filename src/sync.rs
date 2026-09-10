@@ -44,11 +44,14 @@ const CATCHUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(180);
 /// Own-db diff cadence when inotify is unavailable (and the safety-net re-scan besides).
 const OWN_DB_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Burst coalescing for db events, LEADING-edge: the first event triggers a diff after at most
-/// this much quiet — the single-add case pays ~100 ms, not a fixed debounce.
-const BURST_QUIET: std::time::Duration = std::time::Duration::from_millis(100);
+/// this much quiet — the single-add case pays ~250 ms, not a fixed debounce.
+const BURST_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
 /// …and a long registration burst (a big closure is thousands of rows over many seconds) still
-/// gets a diff at least this often, so the first paths of the burst don't wait for its end.
-const BURST_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+/// gets a diff at least this often, so early paths of the burst don't wait for its end. A diff
+/// is a full candidates + claims scan, so its cadence IS the daemon's CPU cost during a local
+/// build — 5s keeps that under a few percent of a core while the mesh still learns fresh
+/// paths mid-build.
+const BURST_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 /// Sync request body cap (a clock vector is tiny).
 const REQUEST_CAP: usize = 1 << 20;
 /// Truncated-suffix pull rounds before giving up until the next trigger.

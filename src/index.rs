@@ -606,6 +606,12 @@ impl Index {
                 bail!("self-origin apply raced: the own-db loop must be the only self writer");
             }
         }
+        // The diff's transient maps (candidates, claims) peak at ~100MB on a real store, and
+        // glibc retains freed arenas indefinitely — hand them back so a build's worth of diff
+        // cycles doesn't read as daemon bloat.
+        if emitted > 0 {
+            unsafe { libc::malloc_trim(0) };
+        }
         Ok(emitted)
     }
 
