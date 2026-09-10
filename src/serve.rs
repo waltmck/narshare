@@ -64,12 +64,6 @@ fn encode_permits() -> usize {
 /// Concurrent manifest builds. Each is a whole-tree hashing read (minutes for a game tree); two
 /// permits let a small burst overlap without a fleet of peers saturating the disk.
 const MANIFEST_BUILD_CONCURRENCY: usize = 2;
-/// A narhash that resolved to nothing is not re-probed for this long. The hash column is
-/// unindexed, so every miss is a full ValidPaths scan — and restart-recovery probes for a NAR we
-/// never held fan in from every peer.
-const NAR_NEGATIVE_TTL: Duration = Duration::from_secs(10);
-const NAR_NEGATIVE_ENTRIES: usize = 4096;
-
 pub struct ServeState {
     /// Demand-driven deletion feedback: a NAR request for content the db no longer has
     /// answers 410 Gone and retracts our Have for that hash (see Index::retract_hold).
@@ -87,8 +81,6 @@ pub struct ServeState {
     building: Mutex<HashMap<[u8; 32], watch::Receiver<()>>>,
     /// Bounds concurrent manifest builds.
     manifest_sem: Arc<tokio::sync::Semaphore>,
-    /// narhash → when a lookup found nothing (valid for NAR_NEGATIVE_TTL).
-    nar_negative: Mutex<LruCache<[u8; 32], Instant>>,
     /// Bounds concurrent chunk-encode jobs (m4). Arc'd so streaming responses can carry an
     /// owned permit for their whole lifetime.
     encode_sem: Arc<tokio::sync::Semaphore>,
@@ -193,9 +185,6 @@ impl ServeState {
             manifests: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
             building: Mutex::new(HashMap::new()),
             manifest_sem: Arc::new(tokio::sync::Semaphore::new(MANIFEST_BUILD_CONCURRENCY)),
-            nar_negative: Mutex::new(LruCache::new(
-                NonZeroUsize::new(NAR_NEGATIVE_ENTRIES).unwrap(),
-            )),
             encode_sem: Arc::new(tokio::sync::Semaphore::new(encode_permits())),
             encode_sem_small: Arc::new(tokio::sync::Semaphore::new(encode_permits())),
             stats: ServeStats::default(),
@@ -576,29 +565,21 @@ async fn get_nar(
         .unwrap()
 }
 
-/// Resolve narhash → PathInfo, LRU-cached both ways (the hash column is unindexed in the Nix db,
-/// so a miss is a full ValidPaths scan: recent misses are cached for NAR_NEGATIVE_TTL).
+/// Resolve narhash → PathInfo. Positive entries are LRU-cached (content-addressed: immutable
+/// by definition); misses need no cache at all — the db's data_version-keyed narhash map
+/// answers them authoritatively (see StoreDb::by_nar_hash), so the db is the cache and its
+/// own write signal is the invalidation.
 async fn nar_entry(st: &Arc<ServeState>, nar_hash: [u8; 32]) -> Result<Option<Arc<NarEntry>>> {
     if let Some(e) = st.nars.lock().unwrap().lru.get(&nar_hash) {
         return Ok(Some(e.clone()));
-    }
-    if let Some(at) = st.nar_negative.lock().unwrap().get(&nar_hash) {
-        if at.elapsed() < NAR_NEGATIVE_TTL {
-            return Ok(None);
-        }
     }
     let db = st.db.clone();
     let info = tokio::task::spawn_blocking(move || db.by_nar_hash(&nar_hash))
         .await
         .unwrap()?;
     let Some(info) = info else {
-        st.nar_negative
-            .lock()
-            .unwrap()
-            .put(nar_hash, Instant::now());
         return Ok(None);
     };
-    st.nar_negative.lock().unwrap().pop(&nar_hash);
     let mut cache = st.nars.lock().unwrap();
     // Re-check under the lock: a concurrent request may have inserted while we scanned. Sharing
     // the resident entry means sharing its OnceCell — one table build, one accounting.

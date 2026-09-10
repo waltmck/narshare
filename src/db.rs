@@ -59,14 +59,20 @@ pub struct StoreDb {
 }
 
 struct NarIndex {
+    /// The nix db's data_version when this map was built. While it stands (the db is the
+    /// authoritative cache and data_version moves exactly when another connection commits),
+    /// hits are exact AND misses are authoritative — no negative caching, no TTL semantics.
+    data_version: i64,
+    /// Rebuilds are rate-limited under write churn; a stale-map miss falls back to a single
+    /// exact scan instead, so answers are never wrong, only occasionally slower.
     built: std::time::Instant,
     map: std::collections::HashMap<[u8; 32], String>,
 }
 
-/// How long a built narhash map is trusted before a MISS forces a rebuild. Staleness only
-/// delays lookups of paths registered since the build, and misses fall back to a direct scan
-/// anyway, so this is purely a rebuild-rate bound.
-const NAR_INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Minimum interval between narhash-map rebuilds: bounds rebuild cost under sustained db
+/// write churn combined with miss traffic. Not a correctness knob — a rate-limited stale
+/// miss is answered by one exact scan.
+const NAR_INDEX_REBUILD_MIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Parse the ValidPaths.hash column: "sha256:" + (base16 | nix32).
 fn parse_hash_column(h: &str) -> Result<[u8; 32]> {
@@ -285,31 +291,62 @@ impl StoreDb {
     /// 404 behind a stale map), and a map hit is re-verified against the row's actual hash
     /// (the path may have been re-registered with different content since the build).
     pub fn by_nar_hash(&self, nar_hash: &[u8; 32]) -> Result<Option<PathInfo>> {
-        if let Some(path) = self.nar_index_lookup(nar_hash)? {
+        // A map hit is usable even from a stale map: by_path re-reads the row and the hash
+        // check rejects a since-rewritten path.
+        let (hit, fresh) = {
+            let guard = self.nar_index.lock().unwrap();
+            match guard.as_ref() {
+                Some(ix) => (
+                    ix.map.get(nar_hash).cloned(),
+                    ix.data_version == self.data_version()?,
+                ),
+                None => (None, false),
+            }
+        };
+        if let Some(path) = hit {
             if let Some(info) = self.by_path(&path)? {
                 if &info.nar_hash == nar_hash {
                     return Ok(Some(info));
                 }
             }
         }
+        if fresh {
+            // The map covered every row at this exact data_version: the miss is
+            // AUTHORITATIVE. No scan, no negative cache — the db is the cache, and
+            // data_version is its invalidation signal.
+            return Ok(None);
+        }
+        if self.rebuild_nar_index()? {
+            let path = {
+                let guard = self.nar_index.lock().unwrap();
+                guard.as_ref().and_then(|ix| ix.map.get(nar_hash).cloned())
+            };
+            return match path {
+                Some(p) => self.by_path(&p),
+                None => Ok(None), // authoritative under the just-built version
+            };
+        }
+        // Rebuild rate-limited under churn: answer this one exactly with a single scan.
         self.by_nar_hash_scan(nar_hash)
     }
 
-    /// Consult the narhash map: hits never rebuild; a miss on a stale map rebuilds once (so a
-    /// burst of first-time lookups after a fresh closure lands pays one scan, not hundreds).
-    fn nar_index_lookup(&self, nar_hash: &[u8; 32]) -> Result<Option<String>> {
-        let mut guard = self.nar_index.lock().unwrap();
-        if let Some(ix) = guard.as_ref() {
-            if let Some(p) = ix.map.get(nar_hash) {
-                return Ok(Some(p.clone()));
-            }
-            if ix.built.elapsed() <= NAR_INDEX_TTL {
-                return Ok(None); // fresh miss; the caller's scan fallback settles it
+    /// Rebuild the narhash map, tagged with the data_version read INSIDE the same
+    /// transaction as the scan (so the tag and the contents describe one snapshot).
+    /// Returns false when rate-limited.
+    fn rebuild_nar_index(&self) -> Result<bool> {
+        {
+            let guard = self.nar_index.lock().unwrap();
+            if let Some(ix) = guard.as_ref() {
+                if ix.built.elapsed() < NAR_INDEX_REBUILD_MIN {
+                    return Ok(false);
+                }
             }
         }
-        let map = {
+        let (map, version) = {
             let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare_cached("SELECT path, hash FROM ValidPaths")?;
+            let tx = conn.unchecked_transaction()?;
+            let version: i64 = tx.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            let mut stmt = tx.prepare_cached("SELECT path, hash FROM ValidPaths")?;
             let mut map = std::collections::HashMap::new();
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
@@ -319,14 +356,17 @@ impl StoreDb {
                     map.insert(h, path);
                 }
             }
-            map
+            drop(rows);
+            drop(stmt);
+            tx.commit()?;
+            (map, version)
         };
-        let found = map.get(nar_hash).cloned();
-        *guard = Some(NarIndex {
+        *self.nar_index.lock().unwrap() = Some(NarIndex {
+            data_version: version,
             built: std::time::Instant::now(),
             map,
         });
-        Ok(found)
+        Ok(true)
     }
 
     /// Look up by exact store path (indexed: ValidPaths.path is UNIQUE).

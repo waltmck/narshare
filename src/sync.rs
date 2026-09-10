@@ -9,8 +9,9 @@
 //!
 //! The own-db loop is the exporting half: an inotify watch on the Nix database directory (every
 //! registration and GC touches the WAL) triggers a debounced diff of the Nix db against our
-//! indexed self-holdings, emitting add/remove events to our own journal — with a timer fallback
-//! where inotify is unavailable.
+//! indexed self-holdings, emitting events to our own journal. inotify is REQUIRED: without a
+//! change signal the index goes silently stale, so its absence (or death) is a hard error and
+//! systemd's restart is the recovery. The only timer is the reconciliation deadline.
 
 use crate::db::StoreDb;
 use crate::index::{proto, Apply, Index};
@@ -41,8 +42,7 @@ const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const CATCHUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long after startup the catch-up cadence may apply.
 const CATCHUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(180);
-/// Own-db diff cadence when inotify is unavailable (and the safety-net re-scan besides).
-const OWN_DB_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Burst coalescing for db events, LEADING-edge: the first event triggers a diff after at most
 /// this much quiet — the single-add case pays ~250 ms, not a fixed debounce.
 const BURST_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
@@ -477,26 +477,29 @@ impl Sync {
             return;
         }
         // inotify on the Nix db directory: registrations and GC both touch the WAL. Watch the
-        // DIRECTORY — the -wal file itself is checkpointed away and recreated.
-        let mut events = self.nix_db_dir.as_ref().and_then(|dir| {
-            let inotify = inotify::Inotify::init().ok()?;
-            inotify
-                .watches()
-                .add(
-                    dir,
-                    inotify::WatchMask::MODIFY
-                        | inotify::WatchMask::CREATE
-                        | inotify::WatchMask::DELETE
-                        | inotify::WatchMask::MOVED_TO,
-                )
-                .ok()?;
-            let stream = inotify.into_event_stream(vec![0u8; 4096]).ok()?;
-            info!("mesh index: watching {} for store changes", dir.display());
-            Some(stream)
-        });
-        if events.is_none() {
-            info!("mesh index: inotify unavailable; polling every {OWN_DB_INTERVAL:?}");
-        }
+        // DIRECTORY — the -wal file itself is checkpointed away and recreated. MANDATORY:
+        // narshare without a change signal serves a silently stale index, which is worse than
+        // not running; systemd restarts us into an environment where it hopefully works.
+        let mut events = match self.nix_db_dir.as_ref().map(|dir| {
+            let inotify = inotify::Inotify::init()?;
+            inotify.watches().add(
+                dir,
+                inotify::WatchMask::MODIFY
+                    | inotify::WatchMask::CREATE
+                    | inotify::WatchMask::DELETE
+                    | inotify::WatchMask::MOVED_TO,
+            )?;
+            let stream = inotify.into_event_stream(vec![0u8; 4096])?;
+            tracing::info!("mesh index: watching {} for store changes", dir.display());
+            Ok::<_, std::io::Error>(stream)
+        }) {
+            Some(Ok(s)) => Some(s),
+            Some(Err(e)) => {
+                tracing::error!("inotify on the nix db is REQUIRED and unavailable ({e}): exiting");
+                std::process::exit(1);
+            }
+            None => None,
+        };
         let mut err_streak = 0u32;
         loop {
             match self.export_own_db().await {
@@ -507,12 +510,23 @@ impl Sync {
                 Ok(_) => {}
                 Err(e) => warn!("mesh index: own-db diff failed: {e:#}"),
             }
-            // Wait for the next trigger. On an event, coalesce the burst LEADING-edge: diff
-            // after at most BURST_QUIET of silence, but never later than BURST_MAX — a single
-            // add pays ~100 ms while a long registration burst still diffs about once a second.
+            // Wait for the next trigger: an inotify event (burst-coalesced, leading edge) or
+            // the reconciliation deadline — the ONLY timer, needed because a quiet db emits
+            // no events yet deletions/in-place updates still owe their periodic detection.
+            let next_reconcile = {
+                let due = self
+                    .diff_state
+                    .lock()
+                    .unwrap()
+                    .map(|s| s.last_full + self.reconcile_every)
+                    .unwrap_or_else(std::time::Instant::now);
+                tokio::time::Instant::from_std(
+                    due.max(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+                )
+            };
             tokio::select! {
                 _ = shutdown.changed() => return,
-                _ = tokio::time::sleep(OWN_DB_INTERVAL) => {}
+                _ = tokio::time::sleep_until(next_reconcile) => {}
                 item = async {
                     match events.as_mut() {
                         Some(s) => {
@@ -526,16 +540,20 @@ impl Sync {
                     // fall back to the timer, which the loop already supports.
                     match &item {
                         None => {
-                            warn!("mesh index: inotify stream ended; polling every {OWN_DB_INTERVAL:?}");
-                            events = None;
-                            continue;
+                            tracing::error!(
+                                "mesh index: inotify stream ended — a dead watch means a \
+                                 silently stale index; exiting for a clean restart"
+                            );
+                            std::process::exit(1);
                         }
-                        Some(Err(_)) => {
+                        Some(Err(e)) => {
                             err_streak += 1;
                             if err_streak >= 3 {
-                                warn!("mesh index: inotify erroring persistently; polling every {OWN_DB_INTERVAL:?}");
-                                events = None;
-                                continue;
+                                tracing::error!(
+                                    "mesh index: inotify erroring persistently ({e}); exiting \
+                                     for a clean restart"
+                                );
+                                std::process::exit(1);
                             }
                         }
                         Some(Ok(_)) => err_streak = 0,
