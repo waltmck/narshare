@@ -74,6 +74,11 @@ in
         # always afford to lose (self-verifying, re-learnable; loss bumps the node's sync
         # generation so peers snapshot it back up).
         CacheDirectory = "narshare";
+        # A ~40MB disposable-state daemon has no business in swap: parked cold pages get
+        # churned back through zswap on every allocation cycle (measured: 99% of the daemon's
+        # CPU as kernel time). Keep it resident; under real pressure the kernel/oomd may kill
+        # it instead, which costs one journal-tail resync.
+        MemorySwapMax = 0;
         DynamicUser = true;
         ProtectSystem = "strict";
         ProtectHome = true;

@@ -66,6 +66,14 @@ const FULL_MIN_INTERVAL: std::time::Duration = std::time::Duration::ZERO;
 /// Belt-and-braces reconciliation for what no signal sees (an equal-length in-place rewrite,
 /// e.g. `nix store repair` swapping a narHash): one O(store) diff per hour is noise.
 const RECONCILE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+/// The COUNT(*)/sig-probe consistency queries walk the whole ValidPaths b-tree — dominant
+/// kernel time on compressed CoW filesystems when run per wake (measured: 99% system time).
+/// Paced: raw additions are accumulated between checks so the deletion algebra stays exact,
+/// and detection latency stays within the already-accepted full-diff rate limit.
+#[cfg(not(test))]
+const SIGNALS_EVERY: std::time::Duration = std::time::Duration::from_secs(45);
+#[cfg(test)]
+const SIGNALS_EVERY: std::time::Duration = std::time::Duration::ZERO;
 
 /// The incremental differ's arithmetic between wakes: the additions watermark, the expected
 /// row count, and the expected sig-probe total. Any observation that disagrees means the db
@@ -75,7 +83,15 @@ struct DiffState {
     max_id: i64,
     count: i64,
     probe: i64,
+    /// Raw rows seen (and the sig/ca bytes they contribute) since the last consistency
+    /// check — the accumulators that keep the count/probe algebra exact across paced checks.
+    pending_raw: i64,
+    pending_probe_bytes: i64,
+    /// Set when a wake contained rows we could not parse: their probe contribution is
+    /// unknown, so the probe comparison stays suspended until the next full baseline.
+    probe_unreliable: bool,
     last_full: std::time::Instant,
+    last_signals: std::time::Instant,
 }
 
 pub struct Sync {
@@ -321,74 +337,74 @@ impl Sync {
                 if !reason.is_empty() {
                     tracing::debug!("full reconciliation: {reason}");
                 }
-                let base = db.diff_signals(i64::MAX)?;
+                let base = db.diff_signals(i64::MAX, true)?;
                 let n = index.sync_own_db(&db)?;
                 Ok((
                     n,
                     DiffState {
                         max_id: base.max_id,
-                        count: base.count,
-                        probe: base.probe,
+                        count: base.count.expect("consistency signals were requested"),
+                        probe: base.probe.expect("consistency signals were requested"),
+                        pending_raw: 0,
+                        pending_probe_bytes: 0,
+                        probe_unreliable: false,
                         last_full: now,
+                        last_signals: now,
                     },
                 ))
             };
             // The whole incremental design is sound only while ids are monotone
             // (AUTOINCREMENT): a reused id would make a delete+reinsert replacement
             // invisible to both the watermark and the count. Guarded per wake.
-            let Some(s) = st else { return full("") };
+            let Some(mut s) = st else { return full("") };
             if now.duration_since(s.last_full) >= RECONCILE_EVERY {
                 return full("periodic");
             }
             if !db.ids_monotone()? {
                 return full("ValidPaths.id is not AUTOINCREMENT on this system");
             }
-            let sig = db.diff_signals(s.max_id)?;
+            let check = now.duration_since(s.last_signals) >= SIGNALS_EVERY;
+            let sig = db.diff_signals(s.max_id, check)?;
             let parsed = sig.cands.len();
             let (n, added_probe_bytes) = index.sync_own_db_incremental(&db, &sig.cands)?;
+            s.max_id = sig.max_id;
+            s.pending_raw += sig.raw as i64;
+            s.pending_probe_bytes += added_probe_bytes;
+            s.probe_unreliable |= parsed != sig.raw;
+            let (Some(count), Some(probe)) = (sig.count, sig.probe) else {
+                return Ok((n, s));
+            };
+            s.last_signals = now;
             let may_full = now.duration_since(s.last_full) >= FULL_MIN_INTERVAL;
             // Deletions (or delete+reinsert replacements): additions alone cannot explain
-            // the count — raw new rows appear on both sides of the equation, so a mismatch
-            // is exactly "rows with id <= watermark vanished". Keep the stale expectation
-            // when rate-limited so the next wake re-detects it.
-            if sig.count != s.count + sig.raw as i64 {
+            // the count — every raw new row since the last check is counted on both sides,
+            // so a mismatch is exactly "rows at or below the old watermark vanished". Keep
+            // the stale expectation when rate-limited so the next check re-detects it.
+            if count != s.count + s.pending_raw {
                 if may_full {
                     return full("row count moved beyond additions (GC?)");
                 }
-                return Ok((
-                    n,
-                    DiffState {
-                        max_id: sig.max_id,
-                        ..s
-                    },
-                ));
+                return Ok((n, s));
             }
             // In-place updates (nix store sign, ca rewrites): ids and count stand still
-            // while sig/ca bytes move. The parsed rows' own contribution is accounted
-            // for, so add-churn does not mask a concurrent update; unparseable rows make
-            // the arithmetic unreliable for one wake — accept the fresh probe unchecked.
-            if parsed == sig.raw && sig.probe != s.probe + added_probe_bytes {
+            // while sig/ca bytes move. The accumulated additions' own contribution is
+            // accounted for, so add-churn does not mask a concurrent update.
+            if !s.probe_unreliable && probe != s.probe + s.pending_probe_bytes {
                 if may_full {
                     return full("sig/ca bytes moved in place (nix store sign?)");
                 }
-                return Ok((
-                    n,
-                    DiffState {
-                        max_id: sig.max_id,
-                        count: sig.count,
-                        ..s
-                    },
-                ));
+                // The count is verified: roll its baseline, keep the probe stale.
+                s.count = count;
+                s.pending_raw = 0;
+                return Ok((n, s));
             }
-            Ok((
-                n,
-                DiffState {
-                    max_id: sig.max_id,
-                    count: sig.count,
-                    probe: sig.probe,
-                    last_full: s.last_full,
-                },
-            ))
+            // Both signals verified (or the probe is suspended): roll the baselines.
+            s.count = count;
+            s.probe = probe;
+            s.pending_raw = 0;
+            s.pending_probe_bytes = 0;
+            s.probe_unreliable = false;
+            Ok((n, s))
         })
         .await
         .map_err(|e| anyhow::anyhow!("differ task died: {e}"))??;

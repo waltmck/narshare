@@ -55,9 +55,10 @@ pub struct DiffSignals {
     pub raw: usize,
     /// The table's current max id — the next additions watermark.
     pub max_id: i64,
-    pub count: i64,
+    /// Present when consistency signals were requested (paced by the caller).
+    pub count: Option<i64>,
     /// SUM(LENGTH(sigs) + LENGTH(ca)): moves on in-place signature/ca updates.
-    pub probe: i64,
+    pub probe: Option<i64>,
 }
 
 pub struct StoreDb {
@@ -187,7 +188,7 @@ impl StoreDb {
     /// detection needs only (hash, sigs). Callers fetch references via references_of() for
     /// the handful of rows that actually changed.
     pub fn candidates(&self) -> Result<Vec<Candidate>> {
-        Ok(self.diff_signals(-1)?.cands)
+        Ok(self.diff_signals(-1, false)?.cands)
     }
 
     /// Rows with id strictly above `since`, plus every consistency signal, in ONE read
@@ -196,25 +197,36 @@ impl StoreDb {
     /// deletions and in-place updates are invisible here BY CONSTRUCTION and are detected by
     /// the count / probe signals instead. Commits after this snapshot bump data_version and
     /// earn their own wake — at-least-once, never lost.
-    pub fn diff_signals(&self, since: i64) -> Result<DiffSignals> {
+    pub fn diff_signals(&self, since: i64, with_consistency: bool) -> Result<DiffSignals> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         // The next watermark is the TABLE max, not the max of returned rows: it must advance
         // past malformed rows too, or they would be re-fetched (and re-counted) forever.
+        // Index-only, O(log n): safe to read on every wake.
         let max_id: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) FROM ValidPaths", [], |r| {
             r.get(0)
         })?;
-        let count: i64 = tx.query_row("SELECT COUNT(*) FROM ValidPaths", [], |r| r.get(0))?;
-        // The silent-commit probe: in-place UPDATEs (nix store sign, ca rewrites) move
-        // neither ids nor the count, but they change sig/ca byte totals. Length-blind to
-        // equal-length swaps (a repair rewriting narHash) — the periodic reconciliation
-        // covers those.
-        let probe: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(LENGTH(COALESCE(sigs,'')) + LENGTH(COALESCE(ca,''))), 0) \
-             FROM ValidPaths",
-            [],
-            |r| r.get(0),
-        )?;
+        // COUNT(*) and the sig probe each walk the whole ValidPaths b-tree — on a compressed
+        // CoW filesystem that is real kernel time (checksum + decompress per pread), measured
+        // as the daemon's dominant cost when run per wake. The caller paces them; the deletion
+        // and in-place detection latency is bounded by that pace, which was already accepted
+        // for the full-diff rate limit.
+        let (count, probe) = if with_consistency {
+            let count: i64 = tx.query_row("SELECT COUNT(*) FROM ValidPaths", [], |r| r.get(0))?;
+            // The silent-commit probe: in-place UPDATEs (nix store sign, ca rewrites) move
+            // neither ids nor the count, but they change sig/ca byte totals. Length-blind to
+            // equal-length swaps (a repair rewriting narHash) — the periodic reconciliation
+            // covers those.
+            let probe: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(LENGTH(COALESCE(sigs,'')) + LENGTH(COALESCE(ca,''))), 0) \
+                 FROM ValidPaths",
+                [],
+                |r| r.get(0),
+            )?;
+            (Some(count), Some(probe))
+        } else {
+            (None, None)
+        };
         let mut stmt = tx.prepare_cached(
             "SELECT id, path, hash, narSize, sigs, ca, deriver FROM ValidPaths WHERE id > ?1",
         )?;

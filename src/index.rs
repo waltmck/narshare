@@ -555,11 +555,10 @@ impl Index {
         // Phase 3: journal and materialize.
         let emitted = self.export_ops(&attests, &holds)?;
         // The diff's transient maps (candidates, claims) peak at ~100MB on a real store, and
-        // glibc retains freed arenas indefinitely — hand them back so a build's worth of diff
-        // cycles doesn't read as daemon bloat.
-        if emitted > 0 {
-            unsafe { libc::malloc_trim(0) };
-        }
+        // glibc retains freed arenas indefinitely — hand them back UNCONDITIONALLY: a quiet
+        // reconciliation allocates just as much as a busy one, and retained cold arenas end
+        // up parked in swap (then churned back through zswap, which is pure kernel CPU).
+        unsafe { libc::malloc_trim(0) };
         Ok(emitted)
     }
 
