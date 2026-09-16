@@ -1,11 +1,15 @@
 //! The embedded index backend: RocksDB, one column family per logical table.
 //!
-//! Atomicity comes from a store-wide writer lock around read-modify-write sections plus a
-//! single WriteBatch per composite op — readers never take the lock and see either all of a
-//! batch or none of it. That serializes writers, which is exactly the trade accepted when the
+//! Atomicity comes from a store-wide writer lock around read-modify-write sections plus one
+//! WriteBatch per composite op — readers never take the lock and see either all of a batch or
+//! none of it. That serializes writers, which is exactly the trade accepted when the
 //! shared-table layout was chosen: applies are rare and group-committed, and correctness of
 //! the holder-count/stamp maintenance requires a consistent read of "who else holds this hash"
-//! anyway.
+//! anyway. The exception is the BULK ops — snapshot applies, the reaper, origin retirement —
+//! which commit in BATCH_OPS-bounded chunks so their memory is O(chunk) on any table size;
+//! per-hash effects are independent across chunks, and each op's clock (where it has one)
+//! moves only in the final batch, so interruption means clean re-application, never
+//! divergence.
 //!
 //! Durability: only SELF-origin applies (and the meta writes that name the self generation)
 //! are fsynced — a seq a peer has observed must never be reissued with different events, and
@@ -34,19 +38,32 @@ use std::sync::Mutex;
 
 /// One scanned row: rocksdb hands back boxed key/value slices.
 type Kv = (Box<[u8]>, Box<[u8]>);
+/// Streaming-scan visitor: (key, value) → keep going? See each_opt.
+type RowVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<bool> + 'a;
 
-const LAYOUT: &str = "narshare-rocks-1";
+const LAYOUT: &str = "narshare-rocks-2";
 /// CFs whose keys start with a fixed 32-byte hash — the hot lookup path. They get a prefix
 /// extractor, prefix bloom filters (memtable and SST), and a shared block cache: the proxy is
 /// consulted for every substitution the machine attempts, so both hits (common: the mesh holds
 /// most of what cache.nixos.org served everyone) and misses (fresh nixpkgs bumps) must resolve
 /// in memory, not per-seek SST index reads.
-const HASH_PREFIX_CFS: &[&str] = &["att", "attby", "holdby"];
+const HASH_PREFIX_CFS: &[&str] = &["att", "attby", "holdby", "stamp"];
 /// Shared block cache for the hot CFs. 64 MiB comfortably holds the working set of a
 /// mesh-wide fact table (~500k rows) plus holder edges.
 const BLOCK_CACHE_BYTES: usize = 64 << 20;
+/// Flush threshold for the bulk maintenance batches (snapshot applies, the reaper, origin
+/// retirement). One giant WriteBatch over a peer's whole possession set was a ~600 MiB spike
+/// at production scale; per-hash effects are independent, so bounded batches change only how
+/// much of the pass a reader can observe mid-way — a crash before the final clock write leaves
+/// the clock unmoved and the operation re-applies wholesale.
+const BATCH_OPS: usize = 32_768;
+/// Retention stamps live in their OWN column family (att key → 8-byte unheld_since; row
+/// present = stamped), not in the att value: stamps flip on every holder churn — a snapshot
+/// apply touches every fact of every hash it moves — and rewriting ~850-byte fact bodies to
+/// flip 9 bytes was 180 MB of memtable/compaction churn per 200k-holding snapshot (measured:
+/// most of that phase's CPU and its 44x write amplification).
 const CFS: &[&str] = &[
-    "meta", "clocks", "journal", "hold", "holdby", "att", "attby", "wm", "mw",
+    "meta", "clocks", "journal", "hold", "holdby", "att", "attby", "stamp", "wm", "mw",
 ];
 
 pub struct RocksStore {
@@ -91,22 +108,14 @@ fn clock_from(b: &[u8]) -> Result<Clock> {
     })
 }
 
-/// Attestation row value: 1 flag byte + 8-byte unheld_since + the encoded Attestation.
-fn att_value(att: &proto::Attestation, unheld_since: Option<u64>) -> Vec<u8> {
-    let mut v = Vec::with_capacity(9 + att.encoded_len());
-    v.push(unheld_since.is_some() as u8);
-    v.extend_from_slice(&unheld_since.unwrap_or(0).to_be_bytes());
-    att.encode(&mut v).expect("vec write is infallible");
-    v
+/// Attestation row value: the encoded Attestation, nothing else — the unheld_since stamp
+/// lives in the `stamp` CF (see CFS) so holder churn never rewrites fact bodies.
+fn att_value(att: &proto::Attestation) -> Vec<u8> {
+    att.encode_to_vec()
 }
 
-fn att_decode(v: &[u8]) -> Result<(proto::Attestation, Option<u64>)> {
-    if v.len() < 9 {
-        bail!("corrupt attestation row ({} bytes)", v.len());
-    }
-    let stamp = (v[0] == 1).then(|| u64::from_be_bytes(<[u8; 8]>::try_from(&v[1..9]).unwrap()));
-    let att = proto::Attestation::decode(&v[9..]).context("corrupt attestation body")?;
-    Ok((att, stamp))
+fn att_decode(v: &[u8]) -> Result<proto::Attestation> {
+    proto::Attestation::decode(v).context("corrupt attestation body")
 }
 
 fn att_key(att: &proto::Attestation) -> Vec<u8> {
@@ -137,20 +146,24 @@ impl RocksStore {
                     // slightly more flushes during a resync storm and nothing at idle.
                     o.set_write_buffer_size(16 << 20);
                     o.set_max_write_buffer_number(2);
+                    // EVERY CF shares the one block cache: a table factory with no cache set
+                    // silently creates its own private default LRU (32 MiB apiece in current
+                    // rocksdb), so the six "cold" CFs — journal and hold among them, both
+                    // scanned routinely — were quietly entitled to ~200 MiB nobody budgeted.
+                    let mut bb = BlockBasedOptions::default();
+                    bb.set_block_cache(&cache);
+                    // Index/filter blocks count against the shared cache instead of
+                    // accumulating unbounded in the heap.
+                    bb.set_cache_index_and_filter_blocks(true);
+                    bb.set_pin_l0_filter_and_index_blocks_in_cache(true);
                     if HASH_PREFIX_CFS.contains(n) {
                         o.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
                         o.set_memtable_prefix_bloom_ratio(0.2);
-                        let mut bb = BlockBasedOptions::default();
                         bb.set_bloom_filter(10.0, false);
-                        bb.set_block_cache(&cache);
-                        // Index/filter blocks count against the shared cache instead of
-                        // accumulating unbounded in the heap.
-                        bb.set_cache_index_and_filter_blocks(true);
-                        bb.set_pin_l0_filter_and_index_blocks_in_cache(true);
-                        o.set_block_based_table_factory(&bb);
                     } else {
                         o.set_write_buffer_size(4 << 20);
                     }
+                    o.set_block_based_table_factory(&bb);
                     ColumnFamilyDescriptor::new(*n, o)
                 })
                 .collect();
@@ -224,19 +237,52 @@ impl RocksStore {
 
     fn scan_opt(&self, cf: &str, prefix: &[u8], ro: ReadOptions) -> Vec<Kv> {
         let mut out = Vec::new();
+        // Iterator errors end the scan early, as they always have here.
+        let _ = self.each_opt(cf, prefix, prefix, ro, &mut |k, v| {
+            out.push((Box::from(k), Box::from(v)));
+            Ok(true)
+        });
+        out
+    }
+
+    /// The streaming core every scan is built on: seek to `from`, then visit rows while their
+    /// keys still start with `prefix`, one at a time, WITHOUT materializing the range.
+    /// Full-table walks (claims, dump pages, the reaper) must use this — collecting the att
+    /// table was measured at ~400 MiB of transient heap at production scale. The visitor
+    /// returns false to stop early.
+    fn each_opt(
+        &self,
+        cf: &str,
+        from: &[u8],
+        prefix: &[u8],
+        ro: ReadOptions,
+        f: &mut RowVisitor,
+    ) -> Result<()> {
         let it = self.db.iterator_cf_opt(
             self.cf(cf),
             ro,
-            IteratorMode::From(prefix, Direction::Forward),
+            IteratorMode::From(from, Direction::Forward),
         );
         for kv in it {
-            let Ok((k, v)) = kv else { break };
-            if !k.starts_with(prefix) {
+            let (k, v) = kv?;
+            if !k.starts_with(prefix) || !f(&k, &v)? {
                 break;
             }
-            out.push((k, v));
         }
-        out
+        Ok(())
+    }
+
+    /// Total-order streaming walk (see `scan` for why total-order matters on prefix CFs).
+    fn each(
+        &self,
+        cf: &str,
+        from: &[u8],
+        prefix: &[u8],
+        f: &mut RowVisitor,
+    ) -> Result<()> {
+        let mut ro = ReadOptions::default();
+        ro.set_total_order_seek(true);
+        self.each_opt(cf, from, prefix, ro, f)
     }
 
     /// Origins currently holding `hash`, minus `exclude`.
@@ -248,22 +294,21 @@ impl RocksStore {
             .collect()
     }
 
-    /// Stamp (or clear) unheld_since on every attestation of `hash`, into `batch`.
+    /// Stamp (or clear) unheld_since on every attestation of `hash`, into `batch`. Touches
+    /// only the tiny stamp rows — fact bodies are immutable under holder churn.
     fn restamp(&self, batch: &mut WriteBatch, hash: &[u8; 32], stamp: Option<u64>) -> Result<()> {
         for (k, _) in self.scan_prefix32("attby", hash) {
             let hp = &k[32..];
-            let mut akey = hp.to_vec();
-            akey.extend_from_slice(hash);
-            let Some(v) = self.db.get_cf(self.cf("att"), &akey)? else {
-                continue;
-            };
-            let (att, old) = att_decode(&v)?;
-            let new = match (old, stamp) {
-                (Some(old), Some(_)) => Some(old), // keep the EARLIEST unheld stamp
-                (_, s) => s,
-            };
-            if new != old {
-                batch.put_cf(self.cf("att"), akey, att_value(&att, new));
+            let mut skey = hp.to_vec();
+            skey.extend_from_slice(hash);
+            match stamp {
+                // Keep the EARLIEST unheld stamp: write only where none exists.
+                Some(s) => {
+                    if self.db.get_cf(self.cf("stamp"), &skey)?.is_none() {
+                        batch.put_cf(self.cf("stamp"), skey, s.to_be_bytes());
+                    }
+                }
+                None => batch.delete_cf(self.cf("stamp"), skey),
             }
         }
         Ok(())
@@ -333,15 +378,17 @@ impl RocksStore {
             let held = newly_held.contains(&hash) || !self.holders_of(&hash, exclude).is_empty();
             match self.db.get_cf(self.cf("att"), &key)? {
                 None => {
-                    let stamp = (!held).then_some(now);
-                    batch.put_cf(self.cf("att"), &key, att_value(att, stamp));
+                    batch.put_cf(self.cf("att"), &key, att_value(att));
+                    if !held {
+                        batch.put_cf(self.cf("stamp"), &key, now.to_be_bytes());
+                    }
                     let mut by = hash.to_vec();
                     by.extend_from_slice(hash_part_of(&att.store_path).as_bytes());
                     batch.put_cf(self.cf("attby"), by, b"");
                     changed += 1;
                 }
                 Some(v) => {
-                    let (mut cur, stamp) = att_decode(&v)?;
+                    let mut cur = att_decode(&v)?;
                     let before_sigs = cur.sigs.len();
                     for s in &att.sigs {
                         if !cur.sigs.contains(s) {
@@ -359,8 +406,10 @@ impl RocksStore {
                         cur.ca = att.ca.clone();
                     }
                     if body_changed || cur.sigs.len() != before_sigs {
-                        let stamp = if held { None } else { stamp };
-                        batch.put_cf(self.cf("att"), &key, att_value(&cur, stamp));
+                        batch.put_cf(self.cf("att"), &key, att_value(&cur));
+                        if held {
+                            batch.delete_cf(self.cf("stamp"), &key);
+                        }
                         changed += 1;
                     }
                 }
@@ -371,10 +420,10 @@ impl RocksStore {
 
     fn lookup_atts(
         &self,
-        rows: Vec<(proto::Attestation, Option<u64>)>,
+        rows: Vec<proto::Attestation>,
     ) -> Result<Vec<(proto::Attestation, Vec<String>)>> {
         let mut out = Vec::new();
-        for (att, _) in rows {
+        for att in rows {
             let Ok(hash) = <[u8; 32]>::try_from(att.nar_hash.as_slice()) else {
                 continue;
             };
@@ -498,27 +547,42 @@ impl SyncStore for RocksStore {
         if generation < cur.generation || (generation == cur.generation && seq < cur.seq) {
             return Ok(false);
         }
-        let mut batch = WriteBatch::default();
-        let old: HashSet<[u8; 32]> = self
-            .scan("hold", &okey(origin)?)
-            .into_iter()
-            .filter_map(|(k, _)| <[u8; 32]>::try_from(&k[k.len() - 32..]).ok())
-            .collect();
+        let prefix = okey(origin)?;
+        let mut old: HashSet<[u8; 32]> = HashSet::new();
+        self.each("hold", &prefix, &prefix, &mut |k, _| {
+            if let Ok(h) = <[u8; 32]>::try_from(&k[k.len() - 32..]) {
+                old.insert(h);
+            }
+            Ok(true)
+        })?;
         let new: HashSet<[u8; 32]> = held.iter().copied().collect();
         let mut ops: Vec<HoldOp> = Vec::new();
         ops.extend(old.difference(&new).map(|h| HoldOp::Drop(*h)));
         ops.extend(new.difference(&old).map(|h| HoldOp::Add(*h)));
-        self.apply_holds(&mut batch, origin, &ops, now)?;
-        for (k, _) in self.scan("journal", &okey(origin)?) {
-            batch.delete_cf(self.cf("journal"), k);
+        // Bounded batches (see BATCH_OPS): each hash appears in exactly one chunk, so the
+        // per-hash retention arithmetic is chunk-independent; the writer lock spans the whole
+        // replace, and the clock advances only at the very end, after every chunk landed —
+        // an interrupted apply is simply re-offered by the next pull.
+        for chunk in ops.chunks(BATCH_OPS) {
+            let mut batch = WriteBatch::default();
+            self.apply_holds(&mut batch, origin, chunk, now)?;
+            // Snapshot applies are always replicas of OTHER origins: async (see module docs).
+            self.db.write(batch)?;
         }
+        let mut batch = WriteBatch::default();
+        self.each("journal", &prefix, &prefix, &mut |k, _| {
+            batch.delete_cf(self.cf("journal"), k);
+            if batch.len() >= BATCH_OPS {
+                self.db.write(std::mem::take(&mut batch))?;
+            }
+            Ok(true)
+        })?;
         let c = Clock {
             generation,
             seq,
             tail_seq: seq,
         };
-        batch.put_cf(self.cf("clocks"), okey(origin)?, clock_bytes(c));
-        // Snapshot applies are always replicas of OTHER origins: async (see module docs).
+        batch.put_cf(self.cf("clocks"), &prefix, clock_bytes(c));
         self.db.write(batch)?;
         Ok(true)
     }
@@ -577,11 +641,31 @@ impl SyncStore for RocksStore {
             .collect())
     }
 
-    fn all_attestations(&self) -> Result<Vec<proto::Attestation>> {
-        self.scan("att", b"")
-            .into_iter()
-            .map(|(_, v)| Ok(att_decode(&v)?.0))
-            .collect()
+    fn attestation_page(
+        &self,
+        cursor: &[u8],
+        max_bytes: usize,
+    ) -> Result<(Vec<proto::Attestation>, Option<Vec<u8>>)> {
+        let mut page: Vec<proto::Attestation> = Vec::new();
+        let mut used = 0usize;
+        let mut last_key: Vec<u8> = Vec::new();
+        let mut more = false;
+        self.each("att", cursor, b"", &mut |k, v| {
+            if k == cursor {
+                return Ok(true); // the seek is inclusive; resume strictly after
+            }
+            let att = att_decode(v)?;
+            let len = att.encoded_len();
+            if used + len > max_bytes && !page.is_empty() {
+                more = true;
+                return Ok(false);
+            }
+            used += len;
+            last_key = k.to_vec();
+            page.push(att);
+            Ok(true)
+        })?;
+        Ok((page, more.then_some(last_key)))
     }
 
     fn compact_journal(&self, origin: &str, floor: u64) -> Result<()> {
@@ -618,19 +702,30 @@ impl SyncStore for RocksStore {
         let _g = self.write.lock().unwrap();
         let mut batch = WriteBatch::default();
         let mut reaped = 0usize;
-        for (k, v) in self.scan("att", b"") {
-            let (att, stamp) = att_decode(&v)?;
-            if let Some(s) = stamp {
-                if s <= cutoff {
-                    batch.delete_cf(self.cf("att"), &k);
-                    let mut by = att.nar_hash.clone();
-                    by.extend_from_slice(hash_part_of(&att.store_path).as_bytes());
-                    batch.delete_cf(self.cf("attby"), by);
-                    reaped += 1;
+        // Only the stamp CF is read: one tiny row per UNHELD fact, so the pass costs nothing
+        // on a healthy mesh however large the fact table is. (Streaming walk — the iterator
+        // reads a consistent snapshot, so deleting behind it is safe — with bounded batches.)
+        self.each("stamp", b"", b"", &mut |k, v| {
+            if v.len() != 8 || k.len() != 64 {
+                bail!("corrupt stamp row ({}B key, {}B value)", k.len(), v.len());
+            }
+            let s = u64::from_be_bytes(<[u8; 8]>::try_from(v).unwrap());
+            if s <= cutoff {
+                // att key = hash_part ++ nar_hash; the attby key is the swap.
+                let (hp, nh) = k.split_at(32);
+                let mut by = nh.to_vec();
+                by.extend_from_slice(hp);
+                batch.delete_cf(self.cf("att"), k);
+                batch.delete_cf(self.cf("attby"), by);
+                batch.delete_cf(self.cf("stamp"), k);
+                reaped += 1;
+                if batch.len() >= BATCH_OPS {
+                    self.db.write(std::mem::take(&mut batch))?;
                 }
             }
-        }
-        if reaped > 0 {
+            Ok(true)
+        })?;
+        if !batch.is_empty() {
             self.db.write(batch)?;
         }
         Ok(reaped)
@@ -648,7 +743,8 @@ impl SyncStore for RocksStore {
         let mut batch = WriteBatch::default();
         for origin in &departed {
             tracing::info!("dropping departed origin {origin:?} from the index");
-            for (k, _) in self.scan("hold", &okey(origin)?) {
+            let prefix = okey(origin)?;
+            self.each("hold", &prefix, &prefix, &mut |k, _| {
                 let h = <[u8; 32]>::try_from(&k[k.len() - 32..]).unwrap();
                 let mut by = h.to_vec();
                 by.extend_from_slice(origin.as_bytes());
@@ -657,11 +753,19 @@ impl SyncStore for RocksStore {
                 if self.holders_of(&h, Some(origin)).is_empty() {
                     self.restamp(&mut batch, &h, Some(now))?;
                 }
-            }
-            for (k, _) in self.scan("journal", &okey(origin)?) {
+                if batch.len() >= BATCH_OPS {
+                    self.db.write(std::mem::take(&mut batch))?;
+                }
+                Ok(true)
+            })?;
+            self.each("journal", &prefix, &prefix, &mut |k, _| {
                 batch.delete_cf(self.cf("journal"), k);
-            }
-            batch.delete_cf(self.cf("clocks"), okey(origin)?);
+                if batch.len() >= BATCH_OPS {
+                    self.db.write(std::mem::take(&mut batch))?;
+                }
+                Ok(true)
+            })?;
+            batch.delete_cf(self.cf("clocks"), &prefix);
         }
         for (k, _) in self.scan("wm", b"") {
             let plen = k[0] as usize;
@@ -699,7 +803,10 @@ impl SyncStore for RocksStore {
         self.lookup_atts(rows)
     }
 
-    fn attested_claims(&self) -> Result<Vec<(String, Vec<u8>, Vec<String>)>> {
+    fn for_each_claim(
+        &self,
+        f: &mut dyn FnMut(super::ClaimRow) -> Result<()>,
+    ) -> Result<()> {
         /// The differ's slim view of a fact: prost skips unlisted fields without allocating,
         /// so this avoids decoding 200k reference lists once per diff cycle.
         #[derive(prost::Message)]
@@ -711,16 +818,11 @@ impl SyncStore for RocksStore {
             #[prost(string, repeated, tag = "6")]
             sigs: Vec<String>,
         }
-        self.scan("att", b"")
-            .into_iter()
-            .map(|(_, v)| {
-                if v.len() < 9 {
-                    bail!("corrupt attestation row ({} bytes)", v.len());
-                }
-                let s = Slim::decode(&v[9..]).context("corrupt attestation body")?;
-                Ok((s.store_path, s.nar_hash, s.sigs))
-            })
-            .collect()
+        self.each("att", b"", b"", &mut |_, v| {
+            let s = Slim::decode(v).context("corrupt attestation body")?;
+            f((s.store_path, s.nar_hash, s.sigs))?;
+            Ok(true)
+        })
     }
 
     fn attestation_sigs(&self, hash_part: &str, nar_hash: &[u8]) -> Result<Option<Vec<String>>> {
@@ -728,7 +830,7 @@ impl SyncStore for RocksStore {
         key.extend_from_slice(hash_part.as_bytes());
         key.extend_from_slice(nar_hash);
         match self.db.get_cf(self.cf("att"), &key)? {
-            Some(v) => Ok(Some(att_decode(&v)?.0.sigs)),
+            Some(v) => Ok(Some(att_decode(&v)?.sigs)),
             None => Ok(None),
         }
     }
@@ -846,7 +948,12 @@ impl SyncStore for RocksStore {
     }
 
     fn count_attestations(&self) -> Result<u64> {
-        Ok(self.scan("att", b"").len() as u64)
+        let mut n = 0u64;
+        self.each("att", b"", b"", &mut |_, _| {
+            n += 1;
+            Ok(true)
+        })?;
+        Ok(n)
     }
 }
 

@@ -57,6 +57,59 @@ message OriginClock {
 message SyncRequest {
   string requester = 1;           // self-declared node name (validated against config)
   repeated OriginClock have = 2;  // full watermark vector
+  // Fact-dump resume cursor: opaque bytes echoed from SyncResponse.atts_next. Non-empty means
+  // the requester is mid-dump and wants the next page regardless of snapshot state; empty
+  // means "facts only if this response ships a snapshot". Keeps both sides' memory
+  // proportional to a page, never to the responder's whole fact table.
+  //
+  // Consistency: pages read the responder's LIVE table in key order, so a dump is a frontier
+  // scan — rows reaped mid-dump simply stop appearing (the cursor is positional, never a row
+  // reference), and rows inserted BEHIND the frontier are missed by that dump. Missed rows
+  // are harmless as long as the requester still receives their introducing journal events as
+  // ordinary suffixes; the requester loses that guarantee exactly when it APPLIES a
+  // possession snapshot (forfeiting events wholesale), so at that moment it cancels every
+  // in-progress dump and restarts by sending a cursor that precedes every real key.
+  // Responders never restart a dump on their own: lag alone must not cost dump progress
+  // (compaction floors at the slowest peer's watermark — snapshots ship only on generation
+  // changes and backstop overruns, not because a flaky device's peers stayed busy).
+  // Requesters persist the cursor across restarts, so a dump survives a process death.
+  bytes atts_cursor = 3;
+  // Origins whose bodies ANOTHER peer is already streaming to this requester (single-flight
+  // catch-up: the requester leases each behind-origin to one weighted-chosen peer per round,
+  // so the same journal bytes never travel N times over an N-peer mesh). For a listed origin
+  // the responder sends its clock line only — generation and seq, body omitted — and never a
+  // suffix, snapshot, or the fact-dump trigger a snapshot carries. The `have` vector stays
+  // honest regardless: acks (and therefore compaction floors) are unaffected by skipping.
+  repeated string skip_origins = 4;
+  // Non-empty makes this a RANGE-ONLY request: the responder answers the asks and nothing
+  // else — no origin updates, no snapshots, no fact dump. Journal content at a (generation,
+  // seq) is immutable mesh-wide, so a backlog can be fetched as parallel windowed chunks from
+  // whichever peers hold it (the requester's catch-up engine assigns chunks by MW weight,
+  // exactly like the data plane assigns NAR chunks). Shipped as a FLAG DAY with the paged
+  // fact dump: every mesh node speaks ranges, and a response without range replies is a
+  // protocol violation, not a version to accommodate (v1/v2 precedent: mixed versions simply
+  // do not sync until upgraded — the index is disposable, so there is no migration).
+  repeated RangeAsk ranges = 5;
+}
+
+// One journal-range ask: origin's events with seq in (after, until], under the responder's
+// per-reply byte cap (a short reply is not an error — the requester re-queues the remainder).
+message RangeAsk {
+  string origin = 1;
+  uint64 generation = 2;  // the generation being fetched; a mismatch is unreachable
+  uint64 after = 3;       // exclusive
+  uint64 until = 4;       // inclusive
+}
+
+message RangeReply {
+  string origin = 1;
+  uint64 generation = 2;  // the responder's current generation for this origin
+  uint64 after = 3;       // echo of the ask
+  // Contiguous events from after+1 up to at most `until`, possibly short of it (byte cap).
+  repeated Event events = 4;
+  // False: this responder cannot serve the ask — its journal tail has compacted past
+  // `after`, or its generation differs. Try another peer, or fall back to a snapshot.
+  bool reachable = 5;
 }
 
 // Per-origin answer: nothing new, a journal suffix, or a full snapshot (the recovery path —
@@ -87,10 +140,16 @@ message Snapshot {
 message SyncResponse {
   string responder = 1;           // self-declared node name (validated against config)
   repeated OriginUpdate origins = 2;
-  // Populated whenever any origin update above is a snapshot: every attestation the responder
-  // retains, so the recovery path that loses journal history still learns the facts. Grow-only
-  // dedup on apply makes over-delivery harmless.
+  // Populated whenever any origin update above is a snapshot (or the request carried a
+  // resume cursor): a PAGE of the responder's retained attestations, in stable storage
+  // order, so the recovery path that loses journal history still learns the facts.
+  // Grow-only dedup on apply makes over-delivery harmless.
   repeated Attestation attests = 3;
+  // More attestation pages remain: pull again with atts_cursor = atts_next.
+  bool atts_truncated = 4;
+  bytes atts_next = 5;
+  // Answers to SyncRequest.ranges, one per ask, in ask order (range-only responses).
+  repeated RangeReply range_replies = 6;
 }
 
 // "I have news — pull from me." Carries no data: pull is the only data path.

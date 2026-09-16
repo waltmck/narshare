@@ -221,12 +221,13 @@ impl Peers {
     }
 
     /// One sync round-trip: POST our clock vector, get per-origin suffixes/snapshots back
-    /// (zstd-compressed protobuf). Hard failures strike the breaker; success resets it.
+    /// (zstd-compressed protobuf) plus the response's wire size — the caller feeds substantive
+    /// rounds to the MW pool. Hard failures strike the breaker; success resets it.
     pub async fn sync_pull(
         &self,
         idx: usize,
         req: &proto::SyncRequest,
-    ) -> Result<proto::SyncResponse> {
+    ) -> Result<(proto::SyncResponse, u64)> {
         let peer = &self.list[idx];
         let url = peer.base.join("narshare/v2/sync").context("bad sync url")?;
         let exchange = async {
@@ -241,6 +242,7 @@ impl Peers {
                 bail!("peer {}: sync HTTP {}", peer.name, resp.status());
             }
             let body = read_capped(resp, SYNC_CAP).await?;
+            let wire = body.len() as u64;
             let raw = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
                 use std::io::Read;
                 let mut dec = zstd::stream::read::Decoder::new(&body[..])?;
@@ -255,7 +257,9 @@ impl Peers {
             })
             .await
             .map_err(|e| anyhow::anyhow!("sync decode task died: {e}"))??;
-            proto::SyncResponse::decode(&raw[..]).context("bad sync response proto")
+            let decoded =
+                proto::SyncResponse::decode(&raw[..]).context("bad sync response proto")?;
+            Ok((decoded, wire))
         };
         match tokio::time::timeout(SYNC_TIMEOUT, exchange).await {
             Ok(Ok(resp)) => {

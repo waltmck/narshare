@@ -309,7 +309,9 @@ pub struct PeerTally {
 
 /// Everything the striped fetches share across transfers.
 pub struct FetchCtx {
-    pub pool: crate::pool::HostPool,
+    /// The process-wide MW pool, shared with the sync plane (see main.rs): both planes' routing
+    /// draws from — and both planes' transfers train — the same weights.
+    pub pool: std::sync::Arc<crate::pool::HostPool>,
     limits: Vec<PeerLimit>,
     net: Vec<Mutex<PeerNet>>,
     tally: Vec<PeerTally>,
@@ -331,10 +333,14 @@ pub struct FetchCtx {
 }
 
 impl FetchCtx {
-    pub fn new(peer_cfgs: &[PeerCfg], cfg: &ProxyCfg) -> Self {
+    pub fn new(
+        peer_cfgs: &[PeerCfg],
+        cfg: &ProxyCfg,
+        pool: std::sync::Arc<crate::pool::HostPool>,
+    ) -> Self {
         let n = peer_cfgs.len().max(1);
         Self {
-            pool: crate::pool::HostPool::new(n),
+            pool,
             limits: (0..n)
                 .map(|_| PeerLimit::new(cfg.per_peer_connections.max(1)))
                 .collect(),
@@ -1558,7 +1564,11 @@ mod tests {
             tier: 1,
             encoding: encoding.into(),
         }];
-        FetchCtx::new(&peers, &pcfg)
+        FetchCtx::new(
+            &peers,
+            &pcfg,
+            std::sync::Arc::new(crate::pool::HostPool::new(1)),
+        )
     }
 
     #[test]

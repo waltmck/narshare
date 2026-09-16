@@ -1,11 +1,17 @@
 //! The mesh-index sync subsystem: two endpoints on the serve listener, one pull client, and
-//! three background loops.
+//! four background loops (per-peer pulls, hint fan-out, the own-db exporter, and the journal
+//! catch-up engine).
 //!
 //! Pull is the ONLY data path. A node that has news sends a tiny hint ("pull from me"); pulls
 //! carry the puller's full watermark vector, which doubles as the ack stream that lets journals
 //! compact (index.rs). Pulls that insert nothing trigger no further hints, so hint cascades
 //! terminate exactly when the mesh has converged; pulls that do insert re-hint, which is what
 //! makes propagation transitive.
+//!
+//! Bodies are SINGLE-FLIGHT: each origin's suffix/snapshot stream has one server at a time
+//! (a claim for the round, or the engine while a backlog is enrolled), and every other pull
+//! skips it — so however many peers are configured, catch-up bytes travel once, from peers
+//! chosen through the same MW pool the data plane trains.
 //!
 //! The own-db loop is the exporting half: an inotify watch on the Nix database directory (every
 //! registration and GC touches the WAL) triggers a debounced diff of the Nix db against our
@@ -16,7 +22,10 @@
 use crate::db::StoreDb;
 use crate::index::{proto, Apply, Index};
 use crate::peers::Peers;
+use crate::pool::HostPool;
 use anyhow::{bail, Context, Result};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::Instant;
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -56,6 +65,208 @@ const BURST_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_CAP: usize = 1 << 20;
 /// Truncated-suffix pull rounds before giving up until the next trigger.
 const MAX_ROUNDS: usize = 64;
+/// The dump-restart sentinel cursor: one byte that sorts before every real (64-byte) att key,
+/// so both backends naturally serve the FIRST page when they resume "strictly after" it. The
+/// puller parks this to cancel an in-progress fact dump and start it over — the responder
+/// never restarts a dump on its own (a lagging puller must not lose progress to its own lag).
+const DUMP_RESTART: &[u8] = &[0];
+/// A lease older than this is void — its holder crashed mid-round or wedged. Above
+/// SYNC_TIMEOUT (peers.rs) so a live-but-slow round is never poached from.
+const LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(150);
+/// Sync rounds at least this large on the wire train the shared MW pool; smaller exchanges
+/// are latency-dominated clock chatter that would poison the throughput yardstick.
+const MW_MIN_BYTES: u64 = 64 << 10;
+/// Catch-up engine chunk size, in journal events. Chunks are additionally byte-capped by the
+/// responder (RANGE_BYTES_CAP), so an attest-heavy interval simply comes back short and the
+/// remainder is re-queued.
+const CHUNK_EVENTS: u64 = 4096;
+/// Range fetches in flight across ALL enrolled origins — the shared window. Bounds both the
+/// parallelism and the reorder-buffer memory (window × RANGE_BYTES_CAP, decoded).
+const ENGINE_WINDOW: usize = 6;
+/// Consecutive failed/unreachable fetches for one origin before the engine hands it back to
+/// the classic path (whose next round takes the snapshot the range asks could not).
+const ENGINE_STRIKES: u32 = 3;
+
+/// An origin's bodies flow from ONE place at a time: a classic pull round (whoever claimed it
+/// for that round) or the catch-up engine. Everyone else's requests skip the origin (clock
+/// lines only), so no journal or snapshot byte ever travels twice.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Holder {
+    Peer(usize),
+    Engine,
+}
+
+struct Lease {
+    holder: Holder,
+    at: Instant,
+}
+
+/// A classic round's hand-off to the engine: origin O at `generation` has a real backlog
+/// reaching (at least) `target`.
+struct Enroll {
+    origin: String,
+    generation: u64,
+    target: u64,
+}
+
+/// The catch-up planner: pure bookkeeping for the windowed multi-peer journal fetch — the
+/// data plane's chunk engine applied to origin journals. Per origin: a cursor (everything at
+/// or below it is applied), a reorder buffer of completed chunks, and a retry queue; globally
+/// one shared in-flight window. IO-free, so the scheduling is unit-testable.
+#[derive(Default)]
+struct Catchup {
+    origins: HashMap<String, OriginPlan>,
+    inflight: usize,
+}
+
+struct OriginPlan {
+    generation: u64,
+    /// Applied through here (mirrors the origin's clock as the engine advances it).
+    cursor: u64,
+    /// First seq not yet covered by any queued, in-flight, or buffered chunk.
+    next: u64,
+    /// Catch up through here — the highest head any peer has advertised.
+    target: u64,
+    /// Completed out-of-order chunks, keyed by their `after`.
+    buffered: BTreeMap<u64, Vec<proto::Event>>,
+    /// Intervals to (re)fetch: failures, unreachables, and byte-capped shortfalls.
+    retry: VecDeque<(u64, u64)>,
+    strikes: u32,
+}
+
+impl Catchup {
+    /// Register an origin (or raise its target). `cursor` is its applied clock right now.
+    /// False means the catch-up was CANCELLED and the caller must hand the origin back to the
+    /// classic path: the origin regenerated, or — the retention-window guard — some peer
+    /// advertised a head more than JOURNAL_BACKSTOP past the applied cursor, which dooms the
+    /// ranges still needed (every peer's tail overtakes them within a compaction cycle; only
+    /// the last JOURNAL_BACKSTOP events are guaranteed retained). Cancelling early, on the
+    /// advertised clock rather than on fetch failures, keeps the cut clean: this origin
+    /// restarts (as the snapshot it now requires) and no other origin's plan is touched.
+    fn enroll(&mut self, origin: &str, generation: u64, cursor: u64, target: u64) -> bool {
+        let p = self
+            .origins
+            .entry(origin.to_owned())
+            .or_insert_with(|| OriginPlan {
+                generation,
+                cursor,
+                next: cursor,
+                target: cursor,
+                buffered: BTreeMap::new(),
+                retry: VecDeque::new(),
+                strikes: 0,
+            });
+        if p.generation != generation {
+            self.origins.remove(origin);
+            return false;
+        }
+        p.target = p.target.max(target);
+        if p.target > p.cursor.saturating_add(crate::index::JOURNAL_BACKSTOP) {
+            self.origins.remove(origin);
+            return false;
+        }
+        true
+    }
+
+    /// Next chunk to fetch, when the window has room. Retries take priority.
+    fn next_ask(&mut self) -> Option<proto::RangeAsk> {
+        if self.inflight >= ENGINE_WINDOW {
+            return None;
+        }
+        for (name, p) in self.origins.iter_mut() {
+            let (after, until) = if let Some(iv) = p.retry.pop_front() {
+                iv
+            } else if p.next < p.target {
+                let after = p.next;
+                let until = (after + CHUNK_EVENTS).min(p.target);
+                p.next = until;
+                (after, until)
+            } else {
+                continue;
+            };
+            self.inflight += 1;
+            return Some(proto::RangeAsk {
+                origin: name.clone(),
+                generation: p.generation,
+                after,
+                until,
+            });
+        }
+        None
+    }
+
+    /// Undo a dispatch that found no available peer.
+    fn unpick(&mut self, ask: proto::RangeAsk) {
+        self.inflight = self.inflight.saturating_sub(1);
+        if let Some(p) = self.origins.get_mut(&ask.origin) {
+            p.retry.push_front((ask.after, ask.until));
+        }
+    }
+
+    /// A good reply landed: buffer it, re-queue any byte-capped shortfall.
+    fn complete(&mut self, origin: &str, after: u64, until: u64, events: Vec<proto::Event>) {
+        self.inflight = self.inflight.saturating_sub(1);
+        let Some(p) = self.origins.get_mut(origin) else {
+            return;
+        };
+        p.strikes = 0;
+        let covered = events.last().map(|e| e.seq).unwrap_or(after);
+        if covered < until {
+            p.retry.push_back((covered, until));
+        }
+        if !events.is_empty() {
+            p.buffered.insert(after, events);
+        }
+    }
+
+    /// A fetch failed (transport, unreachable, empty, or wrong generation): re-queue and
+    /// count a strike. False = give the origin back to the classic path.
+    fn strike(&mut self, origin: &str, after: u64, until: u64) -> bool {
+        self.inflight = self.inflight.saturating_sub(1);
+        let Some(p) = self.origins.get_mut(origin) else {
+            return true;
+        };
+        p.retry.push_back((after, until));
+        p.strikes += 1;
+        p.strikes < ENGINE_STRIKES
+    }
+
+    /// The contiguous head chunk, ready to apply (chunks overlapping the cursor are fine:
+    /// replayed events skip inside apply_suffix).
+    fn take_ready(&mut self, origin: &str) -> Option<(u64, Vec<proto::Event>)> {
+        let p = self.origins.get_mut(origin)?;
+        let (&after, _) = p.buffered.first_key_value()?;
+        if after > p.cursor {
+            return None;
+        }
+        let (_, events) = p.buffered.pop_first().expect("checked non-empty");
+        Some((p.generation, events))
+    }
+
+    fn applied(&mut self, origin: &str, through: u64) {
+        if let Some(p) = self.origins.get_mut(origin) {
+            p.cursor = p.cursor.max(through);
+            p.next = p.next.max(p.cursor);
+        }
+    }
+
+    /// Nothing left to fetch, buffer, or apply for this origin.
+    fn finished(&self, origin: &str) -> bool {
+        self.origins.get(origin).is_none_or(|p| {
+            p.cursor >= p.target && p.buffered.is_empty() && p.retry.is_empty()
+        })
+    }
+
+    fn drop_origin(&mut self, origin: &str) {
+        self.origins.remove(origin);
+    }
+
+    fn has_work(&self) -> bool {
+        self.origins
+            .values()
+            .any(|p| !p.retry.is_empty() || p.next < p.target)
+    }
+}
 
 /// The incremental differ's state: the additions watermark and the reconciliation clock.
 #[derive(Clone, Copy)]
@@ -67,6 +278,14 @@ struct DiffState {
 pub struct Sync {
     pub index: Arc<Index>,
     pub peers: Arc<Peers>,
+    /// The process-wide MW pool (shared with the data plane): sync routes catch-up streams by
+    /// it and trains it with its transfers.
+    pool: Arc<HostPool>,
+    /// origin → its current body server (see Holder).
+    leases: std::sync::Mutex<HashMap<String, Lease>>,
+    /// Classic rounds hand real backlogs to the catch-up engine here.
+    engine_tx: mpsc::UnboundedSender<Enroll>,
+    engine_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Enroll>>>,
     /// The exporting half; None on a node with no [serve] (consume-only).
     db: Option<Arc<StoreDb>>,
     nix_db_dir: Option<PathBuf>,
@@ -109,6 +328,7 @@ impl Sync {
     pub fn new(
         index: Arc<Index>,
         peers: Arc<Peers>,
+        pool: Arc<HostPool>,
         db: Option<Arc<StoreDb>>,
         nix_db_dir: Option<PathBuf>,
         reconcile_every: std::time::Duration,
@@ -122,9 +342,14 @@ impl Sync {
             kick_rxs.push(Some(rx));
         }
         let (hint_tx, hint_rx) = mpsc::channel(1);
+        let (engine_tx, engine_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             index,
             peers,
+            pool,
+            leases: std::sync::Mutex::new(HashMap::new()),
+            engine_tx,
+            engine_rx: std::sync::Mutex::new(Some(engine_rx)),
             db,
             nix_db_dir,
             kicks,
@@ -146,14 +371,97 @@ impl Sync {
             .with_state(self.clone())
     }
 
+    /// Claim unleased (or stale-leased) origins for this round and return the ones to SKIP —
+    /// origins another peer's loop is actively serving. Claims live one round: settle_leases
+    /// releases whatever this responder had nothing more for, so a lease never outlives its
+    /// use by more than a round (or LEASE_TTL, when its holder died mid-round).
+    fn claim_origins(&self, idx: usize, have: &[proto::OriginClock]) -> Vec<String> {
+        let now = Instant::now();
+        let mut leases = self.leases.lock().unwrap();
+        let mut skip = Vec::new();
+        for c in have {
+            match leases.get_mut(&c.origin) {
+                // Engine leases are exempt from the TTL: the engine removes them itself on
+                // completion or abort, and poaching one would double-serve its ranges.
+                Some(l) if l.holder == Holder::Engine => skip.push(c.origin.clone()),
+                Some(l) if l.holder == Holder::Peer(idx) => l.at = now,
+                Some(l) if now.duration_since(l.at) < LEASE_TTL => skip.push(c.origin.clone()),
+                _ => {
+                    leases.insert(
+                        c.origin.clone(),
+                        Lease {
+                            holder: Holder::Peer(idx),
+                            at: now,
+                        },
+                    );
+                }
+            }
+        }
+        skip
+    }
+
+    /// Round settlement: release everything this loop claimed, then hand origins with a real
+    /// remaining backlog — a truncated suffix that carried events — to the catch-up engine
+    /// (windowed, multi-peer, weighted per chunk; see engine_loop). Clock lines for origins
+    /// the engine already owns raise its targets, so news keeps flowing while enrolled.
+    /// Budget-deferred bodies (truncated but EMPTY) stay with the classic round loop: they
+    /// are snapshots waiting for budget, not fetchable ranges.
+    fn settle_leases(&self, idx: usize, adv: &[(String, u64, u64, bool)]) {
+        let mut enrolls: Vec<Enroll> = Vec::new();
+        {
+            let now = Instant::now();
+            let mut leases = self.leases.lock().unwrap();
+            leases.retain(|_, l| l.holder != Holder::Peer(idx));
+            for (origin, gen, seq, fresh_backlog) in adv {
+                let engine_held =
+                    leases.get(origin).map(|l| l.holder) == Some(Holder::Engine);
+                if *fresh_backlog {
+                    leases.insert(
+                        origin.clone(),
+                        Lease {
+                            holder: Holder::Engine,
+                            at: now,
+                        },
+                    );
+                }
+                if *fresh_backlog || engine_held {
+                    enrolls.push(Enroll {
+                        origin: origin.clone(),
+                        generation: *gen,
+                        target: *seq,
+                    });
+                }
+            }
+        }
+        for e in enrolls {
+            let _ = self.engine_tx.send(e);
+        }
+    }
+
+    /// Give an origin back to the classic path: drop its engine lease and kick every loop so
+    /// whoever is available re-serves it (usually as the snapshot the ranges could not be).
+    fn unenroll(&self, origin: &str) {
+        self.leases.lock().unwrap().remove(origin);
+        for k in &self.kicks {
+            let _ = k.try_send(());
+        }
+    }
+
     /// One full sync with a peer: pull journal suffixes / snapshots for every origin until
     /// nothing is truncated. Returns whether anything changed locally.
     pub async fn pull_from(&self, idx: usize) -> Result<bool> {
         use std::sync::atomic::Ordering::Relaxed;
         let r = self.pull_from_inner(idx).await;
         match &r {
-            Ok(_) => self.stats.pulls_ok.fetch_add(1, Relaxed),
-            Err(_) => self.stats.pulls_err.fetch_add(1, Relaxed),
+            Ok(_) => {
+                self.stats.pulls_ok.fetch_add(1, Relaxed);
+            }
+            Err(_) => {
+                self.stats.pulls_err.fetch_add(1, Relaxed);
+                // Whatever this loop was serving must not stay parked behind a broken pull:
+                // release it all; the next loop to fire re-claims and re-routes.
+                self.leases.lock().unwrap().retain(|_, l| l.holder != Holder::Peer(idx));
+            }
         };
         r
     }
@@ -162,11 +470,37 @@ impl Sync {
         use std::sync::atomic::Ordering::Relaxed;
         let mut changed_any = false;
         for _ in 0..MAX_ROUNDS {
+            let have = self.index.clock_vector()?;
+            let skip_origins = self.claim_origins(idx, &have);
             let req = proto::SyncRequest {
                 requester: self.index.self_name.clone(),
-                have: self.index.clock_vector()?,
+                have,
+                // Resume a fact dump a previous pull (or round, or PROCESS) left unfinished —
+                // the cursor is persisted per response below, so a pull that dies mid-dump
+                // resumes later instead of dropping the tail of the responder's facts.
+                atts_cursor: self.index.dump_cursor(&self.peers.list[idx].name)?,
+                skip_origins,
+                ranges: vec![],
             };
-            let mut resp = self.peers.sync_pull(idx, &req).await?;
+            let t0 = Instant::now();
+            let mut resp = match self.peers.sync_pull(idx, &req).await {
+                Ok((resp, wire)) => {
+                    if wire >= MW_MIN_BYTES {
+                        // A catch-up round is a real transfer: train the shared MW pool, so
+                        // sync traffic teaches the same "which peers are fast" weights the
+                        // data plane routes by. Up-to-date exchanges are latency-dominated
+                        // clock chatter — recording those would poison the rate yardstick.
+                        self.pool.record_success(idx, wire, t0.elapsed());
+                    }
+                    resp
+                }
+                Err(e) => {
+                    // Transport failure: train the pool alongside the breaker strike that
+                    // sync_pull already recorded, so routing drains off this peer quickly.
+                    self.pool.record_failure(idx);
+                    return Err(e);
+                }
+            };
             let expect = &self.peers.list[idx].name;
             if &resp.responder != expect {
                 bail!(
@@ -177,8 +511,8 @@ impl Sync {
                     expect
                 );
             }
-            // Facts first: a snapshot-bearing response carries the responder's retained
-            // attestations, and the snapshots' holdings should land on known facts.
+            // Facts first: a snapshot-bearing response carries a page of the responder's
+            // retained attestations, and the snapshots' holdings should land on known facts.
             if !resp.attests.is_empty() {
                 let index = self.index.clone();
                 let atts = std::mem::take(&mut resp.attests);
@@ -187,7 +521,71 @@ impl Sync {
                     .map_err(|e| anyhow::anyhow!("attest merge task died: {e}"))??;
                 changed_any |= n > 0;
             }
-            let mut truncated = false;
+            // A possession snapshot in this response is about to FORFEIT journal events (the
+            // apply jumps our clock for that origin wholesale), and the facts those events
+            // introduced may already sit behind an in-progress dump's frontier — at this
+            // responder or any other. Snapshots only ship when an origin regenerated or when
+            // compaction genuinely overran our watermark (the min-watermark floor waits for
+            // us; only the journal backstop overrides it), so this is the rare recovery path,
+            // never ordinary lag: cancel every dump in flight and start over. The exception
+            // is a dump STARTING in this very response (no real cursor yet): its pages are
+            // read after the snapshot state inside the same respond(), so nothing it needs
+            // can be behind its frontier.
+            let has_snapshot = resp
+                .origins
+                .iter()
+                .any(|u| matches!(u.body, Some(proto::origin_update::Body::Snapshot(_))));
+            let mid_dump = !req.atts_cursor.is_empty() && req.atts_cursor != DUMP_RESTART;
+
+            // Persist the dump cursor AFTER the page merged and BEFORE applying origin
+            // updates: the write is synchronous and its fsync also lands the page merge above
+            // (see Index::dump_cursor), so no crash can leave the cursor ahead of its facts —
+            // and a crash between an invalidation and its snapshot apply merely re-offers the
+            // snapshot, which re-invalidates. Skipped when unchanged, so the steady state (no
+            // dump in flight) writes nothing.
+            let next = if has_snapshot && mid_dump {
+                DUMP_RESTART.to_vec()
+            } else if resp.atts_truncated {
+                std::mem::take(&mut resp.atts_next)
+            } else {
+                Vec::new()
+            };
+            let restarted = next == DUMP_RESTART;
+            if next != req.atts_cursor || has_snapshot {
+                let index = self.index.clone();
+                let peer = self.peers.list[idx].name.clone();
+                let others: Vec<String> = if has_snapshot {
+                    self.peers
+                        .list
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != idx)
+                        .map(|(_, p)| p.name.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    if next != index.dump_cursor(&peer)? {
+                        index.set_dump_cursor(&peer, &next)?;
+                    }
+                    // The forfeit is global to our event streams, not to this responder:
+                    // restart the other peers' in-flight dumps too.
+                    for other in &others {
+                        if !index.dump_cursor(other)?.is_empty() {
+                            index.set_dump_cursor(other, DUMP_RESTART)?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("cursor park task died: {e}"))??;
+            }
+            let mut truncated = resp.atts_truncated || restarted;
+            // Every known origin's advertised clock, plus whether THIS responder left it with
+            // a real backlog (a truncated suffix that carried events) — the engine hand-off
+            // computed at settlement below.
+            let mut adv: Vec<(String, u64, u64, bool)> = Vec::new();
             for up in resp.origins {
                 if up.origin == self.index.self_name {
                     // Only we author our own set — but a peer reporting a FUTURE for it means
@@ -218,25 +616,31 @@ impl Sync {
                 }
                 let index = self.index.clone();
                 let origin = up.origin.clone();
-                // (changed, truncated, suffix events applied, snapshot applied)
+                let oname = up.origin.clone();
+                let (ogen, oseq) = (up.generation, up.seq);
+                // (changed, truncated, suffix events applied, snapshot applied, had events)
                 let out =
-                    tokio::task::spawn_blocking(move || -> Result<(bool, bool, u64, bool)> {
+                    tokio::task::spawn_blocking(move || -> Result<(bool, bool, u64, bool, bool)> {
                         match up.body {
                             None | Some(proto::origin_update::Body::UpToDate(_)) => {
-                                Ok((false, false, 0, false))
+                                Ok((false, false, 0, false, false))
                             }
                             Some(proto::origin_update::Body::Suffix(sfx)) => {
+                                let had = !sfx.events.is_empty();
                                 match index.apply_suffix(&origin, up.generation, &sfx.events)? {
-                                    Apply::Applied(n) => Ok((n > 0, up.truncated, n as u64, false)),
+                                    Apply::Applied(n) => {
+                                        Ok((n > 0, up.truncated, n as u64, false, had))
+                                    }
                                     Apply::NeedSnapshot => {
                                         // Shouldn't happen against a consistent responder (it
                                         // decides suffix-vs-snapshot from OUR clock); keep the
                                         // truncated flag — a budget-deferred origin arrives as an
                                         // empty truncated suffix and must trigger the next round.
+                                        // Not engine-worthy: ranges cannot connect either.
                                         warn!(
                                             "origin {origin}: suffix did not connect to our state"
                                         );
-                                        Ok((false, up.truncated, 0, false))
+                                        Ok((false, up.truncated, 0, false, false))
                                     }
                                 }
                             }
@@ -254,19 +658,25 @@ impl Sync {
                                     "origin {origin}: snapshot applied ({n} rows, gen {}, seq {})",
                                     up.generation, up.seq
                                 );
-                                Ok((true, false, 0, true))
+                                Ok((true, false, 0, true, false))
                             }
                         }
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("apply task died: {e}"))??;
                 changed_any |= out.0;
-                truncated |= out.1;
+                // Real backlogs go to the catch-up engine at settlement; only budget-deferred
+                // bodies (truncated but empty — snapshots waiting their turn) keep THIS round
+                // loop spinning.
+                let fresh_backlog = out.1 && out.4;
+                truncated |= out.1 && !out.4;
+                adv.push((oname, ogen, oseq, fresh_backlog));
                 self.stats.suffix_events_applied.fetch_add(out.2, Relaxed);
                 if out.3 {
                     self.stats.snapshots_applied.fetch_add(1, Relaxed);
                 }
             }
+            self.settle_leases(idx, &adv);
             if !truncated {
                 break;
             }
@@ -378,8 +788,176 @@ impl Sync {
         if let Some(rx) = self.hint_rx.lock().unwrap().take() {
             tokio::spawn(self.clone().hint_loop(rx, shutdown.clone()));
         }
+        // The journal catch-up engine.
+        if let Some(rx) = self.engine_rx.lock().unwrap().take() {
+            tokio::spawn(self.clone().engine_loop(rx, shutdown.clone()));
+        }
         // The own-db exporter.
         tokio::spawn(self.clone().own_db_loop(shutdown));
+    }
+
+    /// The journal catch-up engine: the data plane's windowed chunk scheduling applied to
+    /// origin journals. Classic rounds enroll an origin when its suffix comes back truncated
+    /// with events (a real backlog); the engine then fetches (cursor, target] as parallel
+    /// seq-range chunks — each assigned per fetch through the shared MW pool, exactly like
+    /// NAR chunks — reorders them in a bounded buffer, and applies the contiguous prefix in
+    /// order. Failures and byte-capped shortfalls re-queue at chunk granularity; an origin
+    /// whose ranges keep coming back unreachable (compacted, regenerated) goes back to the
+    /// classic path, whose next round takes the snapshot. While enrolled, an origin is
+    /// lease-held by the engine, so classic rounds everywhere send clock lines only and every
+    /// journal byte travels exactly once, from the fastest peers the weights know about.
+    async fn engine_loop(
+        self: Arc<Self>,
+        mut enroll_rx: mpsc::UnboundedReceiver<Enroll>,
+        mut shutdown: watch::Receiver<()>,
+    ) {
+        let mut plan = Catchup::default();
+        let (done_tx, mut done_rx) =
+            mpsc::unbounded_channel::<(proto::RangeAsk, Option<proto::RangeReply>)>();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                Some(e) = enroll_rx.recv() => {
+                    match self.index.origin_clock(&e.origin) {
+                        Ok((g, s)) if g == e.generation && s < e.target => {
+                            // enroll() may CANCEL instead: regeneration, or the head has
+                            // outrun the retention window past our cursor (any peer's clock
+                            // line delivers that signal here, at any point in the catch-up).
+                            if !plan.enroll(&e.origin, e.generation, s, e.target) {
+                                self.unenroll(&e.origin);
+                            }
+                        }
+                        // Wrong generation (the classic path will snapshot it) or already
+                        // caught up: make sure no engine lease lingers for it.
+                        _ => {
+                            if !plan.origins.contains_key(&e.origin) {
+                                self.unenroll(&e.origin);
+                            }
+                        }
+                    }
+                }
+                Some((ask, reply)) = done_rx.recv() => {
+                    let origin = ask.origin.clone();
+                    match reply {
+                        Some(r)
+                            if r.reachable
+                                && r.generation == ask.generation
+                                && !r.events.is_empty() =>
+                        {
+                            plan.complete(&origin, ask.after, ask.until, r.events);
+                            self.drain_applies(&mut plan, &origin).await;
+                        }
+                        _ => {
+                            if !plan.strike(&origin, ask.after, ask.until) {
+                                debug!(
+                                    "catch-up ranges for origin {origin} keep failing: \
+                                     back to the classic path"
+                                );
+                                plan.drop_origin(&origin);
+                                self.unenroll(&origin);
+                            }
+                        }
+                    }
+                }
+                // Work is queued but nothing is in flight (every peer was unavailable at the
+                // last dispatch): retry on a timer rather than spinning.
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)),
+                    if plan.inflight == 0 && plan.has_work() => {}
+            }
+            // Fill the window: one weighted draw per chunk, exactly like the data plane.
+            while let Some(ask) = plan.next_ask() {
+                let available: Vec<usize> = (0..self.peers.list.len())
+                    .filter(|&i| self.peers.list[i].available())
+                    .collect();
+                let Some(peer) = self.pool.pick_among(&available) else {
+                    plan.unpick(ask);
+                    break;
+                };
+                let peers = self.peers.clone();
+                let pool = self.pool.clone();
+                let requester = self.index.self_name.clone();
+                let tx = done_tx.clone();
+                tokio::spawn(async move {
+                    let req = proto::SyncRequest {
+                        requester,
+                        have: vec![],
+                        atts_cursor: Vec::new(),
+                        skip_origins: vec![],
+                        ranges: vec![ask.clone()],
+                    };
+                    let t0 = Instant::now();
+                    let reply = match peers.sync_pull(peer, &req).await {
+                        Ok((resp, wire)) => {
+                            match resp
+                                .range_replies
+                                .into_iter()
+                                .find(|r| r.origin == ask.origin && r.after == ask.after)
+                            {
+                                Some(r) => {
+                                    if wire >= MW_MIN_BYTES {
+                                        pool.record_success(peer, wire, t0.elapsed());
+                                    }
+                                    Some(r)
+                                }
+                                None => {
+                                    // Ranges shipped as a flag day: every mesh node answers
+                                    // them. A response without ours is a broken (or ancient)
+                                    // peer, not a condition to quietly work around.
+                                    warn!(
+                                        "peer {} ignored a journal-range ask — mixed \
+                                         narshare versions do not sync",
+                                        peers.list[peer].name
+                                    );
+                                    pool.record_failure(peer);
+                                    None
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            pool.record_failure(peer);
+                            None
+                        }
+                    };
+                    let _ = tx.send((ask, reply));
+                });
+            }
+        }
+    }
+
+    /// Apply every contiguous chunk at the head of an origin's reorder buffer, in order.
+    /// Chunks overlapping the cursor are fine — replayed events skip inside apply_suffix.
+    async fn drain_applies(&self, plan: &mut Catchup, origin: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut applied_any = false;
+        while let Some((generation, events)) = plan.take_ready(origin) {
+            let last = events.last().map(|e| e.seq).unwrap_or(0);
+            let index = self.index.clone();
+            let o = origin.to_owned();
+            let out =
+                tokio::task::spawn_blocking(move || index.apply_suffix(&o, generation, &events))
+                    .await;
+            match out {
+                Ok(Ok(Apply::Applied(n))) => {
+                    self.stats.suffix_events_applied.fetch_add(n as u64, Relaxed);
+                    applied_any |= n > 0;
+                    plan.applied(origin, last);
+                }
+                // A gap (regeneration, concurrent surgery) or a store error: the classic
+                // path re-learns this origin wholesale.
+                _ => {
+                    plan.drop_origin(origin);
+                    self.unenroll(origin);
+                    break;
+                }
+            }
+        }
+        if plan.finished(origin) {
+            plan.drop_origin(origin);
+            self.unenroll(origin);
+        }
+        if applied_any {
+            self.hint_peers(); // news travels transitively, however it arrived
+        }
     }
 
     async fn peer_loop(
@@ -595,6 +1173,9 @@ async fn handle_sync(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> Response
             responder: index.self_name.clone(),
             origins: bundle.origins,
             attests: bundle.attests,
+            atts_truncated: bundle.atts_next.is_some(),
+            atts_next: bundle.atts_next.unwrap_or_default(),
+            range_replies: bundle.ranges,
         };
         let z = zstd::stream::encode_all(&resp.encode_to_vec()[..], 3)
             .context("compressing sync response")?;
@@ -631,4 +1212,104 @@ async fn handle_hint(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> StatusCo
         let _ = s.kicks[idx].try_send(());
     }
     StatusCode::OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(seq: u64) -> proto::Event {
+        proto::Event { seq, op: None }
+    }
+
+    fn evs(range: std::ops::RangeInclusive<u64>) -> Vec<proto::Event> {
+        range.map(ev).collect()
+    }
+
+    #[test]
+    fn catchup_chunks_window_and_orders_applies() {
+        let mut c = Catchup::default();
+        c.enroll("a", 1, 0, 10_000);
+        // Chunks come out CHUNK_EVENTS at a time, window-capped.
+        let a1 = c.next_ask().unwrap();
+        assert_eq!((a1.after, a1.until), (0, CHUNK_EVENTS));
+        let a2 = c.next_ask().unwrap();
+        assert_eq!((a2.after, a2.until), (CHUNK_EVENTS, 2 * CHUNK_EVENTS));
+        let a3 = c.next_ask().unwrap();
+        assert_eq!((a3.after, a3.until), (2 * CHUNK_EVENTS, 10_000));
+        assert!(c.next_ask().is_none(), "no work past the target");
+
+        // Out-of-order completion: nothing is ready until the head chunk lands.
+        c.complete("a", a2.after, a2.until, evs(a2.after + 1..=a2.until));
+        assert!(c.take_ready("a").is_none());
+        c.complete("a", a1.after, a1.until, evs(1..=a1.until));
+        let (generation, events) = c.take_ready("a").unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(events.last().unwrap().seq, a1.until);
+        c.applied("a", a1.until);
+        // Now the buffered second chunk is contiguous.
+        let (_, events) = c.take_ready("a").unwrap();
+        assert_eq!(events.last().unwrap().seq, a2.until);
+        c.applied("a", a2.until);
+        assert!(!c.finished("a"), "third chunk still in flight");
+        c.complete("a", a3.after, a3.until, evs(a3.after + 1..=a3.until));
+        let (_, events) = c.take_ready("a").unwrap();
+        c.applied("a", events.last().unwrap().seq);
+        assert!(c.finished("a"));
+        assert_eq!(c.inflight, 0);
+    }
+
+    #[test]
+    fn catchup_requeues_shortfalls_and_failures() {
+        let mut c = Catchup::default();
+        c.enroll("a", 1, 0, 2 * CHUNK_EVENTS);
+        let a1 = c.next_ask().unwrap();
+        // Byte-capped short reply: the remainder is re-queued and served before new ground.
+        c.complete("a", a1.after, a1.until, evs(1..=100));
+        let retry = c.next_ask().unwrap();
+        assert_eq!((retry.after, retry.until), (100, CHUNK_EVENTS));
+        // Failure re-queues too; three consecutive strikes abort.
+        assert!(c.strike("a", retry.after, retry.until));
+        assert!(c.strike("a", retry.after, retry.until));
+        assert!(!c.strike("a", retry.after, retry.until), "third strike aborts");
+        // A window slot that found no peer goes back to the FRONT.
+        let again = c.next_ask().unwrap();
+        c.unpick(again.clone());
+        let front = c.next_ask().unwrap();
+        assert_eq!((front.after, front.until), (again.after, again.until));
+        assert_eq!(c.inflight, 1);
+    }
+
+    #[test]
+    fn catchup_window_cap_and_regen() {
+        let mut c = Catchup::default();
+        assert!(c.enroll("a", 1, 0, 50_000));
+        for _ in 0..ENGINE_WINDOW {
+            assert!(c.next_ask().is_some());
+        }
+        assert!(c.next_ask().is_none(), "the shared window caps in-flight");
+        // Enrolling a NEW generation voids the plan.
+        assert!(!c.enroll("a", 2, 0, 10));
+        assert!(c.finished("a"), "a regenerated origin leaves the engine");
+    }
+
+    #[test]
+    fn catchup_cancels_past_the_retention_window() {
+        let backstop = crate::index::JOURNAL_BACKSTOP;
+        let mut c = Catchup::default();
+        // A fresh enrollment already beyond the window never starts: the ranges it needs
+        // will be compacted away everywhere before they can land.
+        assert!(!c.enroll("a", 1, 0, backstop + 1));
+        assert!(c.finished("a"));
+        // A running catch-up cancels the moment ANY peer's clock line advertises a head
+        // beyond cursor + retention — and only that origin.
+        assert!(c.enroll("a", 1, 0, 10_000));
+        assert!(c.enroll("b", 1, 0, 10_000));
+        assert!(c.next_ask().is_some());
+        assert!(!c.enroll("a", 1, 0, backstop + 1));
+        assert!(c.finished("a"));
+        assert!(!c.finished("b"), "other origins' plans are untouched");
+        // Progress slides the window: an advanced cursor tolerates the same head.
+        assert!(c.enroll("c", 1, 60_000, 60_000 + backstop));
+    }
 }

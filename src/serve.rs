@@ -45,8 +45,40 @@ const MAX_ENCODED_SPAN: u64 = 256 << 20;
 /// wire while the rest of the span is still being read and compressed.
 const ENCODE_FLUSH_BYTES: usize = 128 * 1024;
 /// Byte budget for cached seek tables (a table is ~lits + 56B/segment; big trees reach tens of
-/// MB). Entry counts are the wrong unit — budget the bytes.
-const TABLE_BUDGET: u64 = 256 * 1024 * 1024;
+/// MB). Entry counts are the wrong unit — budget the bytes: a tenth of the memory actually
+/// available to this process (the smaller of the machine's RAM and any cgroup limit), capped —
+/// the working set that made sense on a big host must not be an eighth of a 2 GiB one.
+const TABLE_BUDGET_CAP: u64 = 256 * 1024 * 1024;
+
+fn table_budget() -> u64 {
+    let meminfo_kib = || {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()?
+            .lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))?
+            .trim()
+            .trim_end_matches(" kB")
+            .parse::<u64>()
+            .ok()
+    };
+    // The unified-hierarchy limit of our own cgroup, when one is set ("max" = unlimited).
+    let cgroup_limit = || {
+        let path = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()?
+            .lines()
+            .find_map(|l| l.strip_prefix("0::").map(str::to_owned))?;
+        std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.max"))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    let mem = meminfo_kib()
+        .map(|k| k * 1024)
+        .unwrap_or(u64::MAX)
+        .min(cgroup_limit().unwrap_or(u64::MAX));
+    (mem / 10).min(TABLE_BUDGET_CAP)
+}
 /// Entry cap is a backstop only; the byte budget is the real limit.
 const TABLE_ENTRIES: usize = 4096;
 /// Concurrent chunk-encode jobs — the serve side's CPU budget for wire compression, sized to
@@ -111,6 +143,8 @@ const SMALL_ENCODE_SPAN: u64 = 1 << 20;
 struct NarCache {
     lru: LruCache<[u8; 32], Arc<NarEntry>>,
     table_bytes: u64,
+    /// table_budget(), sampled once at startup.
+    budget: u64,
 }
 
 impl NarCache {
@@ -140,7 +174,7 @@ impl NarCache {
             _ => return,
         }
         self.table_bytes += built;
-        while self.table_bytes > TABLE_BUDGET && self.lru.len() > 1 {
+        while self.table_bytes > self.budget && self.lru.len() > 1 {
             let Some((_, evicted)) = self.lru.pop_lru() else {
                 break;
             };
@@ -181,6 +215,7 @@ impl ServeState {
             nars: Mutex::new(NarCache {
                 lru: LruCache::new(NonZeroUsize::new(TABLE_ENTRIES).unwrap()),
                 table_bytes: 0,
+                budget: table_budget(),
             }),
             manifests: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
             building: Mutex::new(HashMap::new()),

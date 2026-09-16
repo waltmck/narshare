@@ -39,11 +39,12 @@ impl ProxyState {
     pub fn new(
         peers: Arc<Peers>,
         index: Arc<Index>,
+        pool: Arc<crate::pool::HostPool>,
         peer_cfgs: &[config::Peer],
         cfg: ProxyCfg,
     ) -> Arc<Self> {
         let st = Arc::new(Self {
-            fetch: FetchCtx::new(peer_cfgs, &cfg),
+            fetch: FetchCtx::new(peer_cfgs, &cfg, pool),
             peers,
             index,
             cfg,
@@ -414,6 +415,7 @@ mod tests {
         let s = sync::Sync::new(
             index.clone(),
             peers,
+            Arc::new(crate::pool::HostPool::new(1)),
             Some(db.clone()),
             None,
             std::time::Duration::from_secs(3600),
@@ -485,9 +487,11 @@ mod tests {
         );
         let peer_names: Vec<String> = cfg.peers.iter().map(|p| p.name.clone()).collect();
         let index = open_test_index(&dir.path().join("cache"), name, &peer_names, keys);
+        let pool = Arc::new(crate::pool::HostPool::new(cfg.peers.len().max(1)));
         let s = sync::Sync::new(
             index.clone(),
             peers.clone(),
+            pool.clone(),
             None,
             None,
             std::time::Duration::from_secs(3600),
@@ -495,6 +499,7 @@ mod tests {
         let state = ProxyState::new(
             peers,
             index.clone(),
+            pool,
             &cfg.peers,
             toml::from_str(&format!("listen = \"127.0.0.1:0\"\n{extra}")).unwrap(),
         );
@@ -1545,6 +1550,7 @@ mod tests {
         let s = sync::Sync::new(
             index.clone(),
             peers,
+            Arc::new(crate::pool::HostPool::new(1)),
             Some(db.clone()),
             None,
             std::time::Duration::from_secs(3600),
@@ -1688,6 +1694,7 @@ mod tests {
         let b_sync = sync::Sync::new(
             b.index.clone(),
             b_peers,
+            Arc::new(crate::pool::HostPool::new(1)),
             Some(b.db.clone()),
             None,
             std::time::Duration::from_secs(3600),
@@ -2253,6 +2260,7 @@ mod tests {
         let s = sync::Sync::new(
             index,
             peers0,
+            Arc::new(crate::pool::HostPool::new(1)),
             Some(db),
             None,
             std::time::Duration::from_secs(3600),

@@ -13,9 +13,11 @@ different lifetimes. v2 keeps them apart.
   other node holds a signature or CA fact for.
 * **Attestations** ("store path P has content H (size, refs), and here is why you can believe
   it"): self-verifying facts — grow-only, deduped by (path, hash), signature sets unioned,
-  never retracted. They ride origin journals when introduced, and every snapshot-bearing sync
-  response carries the responder's full retained fact set (the recovery path re-teaches facts
-  whose journal history was compacted). Retention is held-plus-grace (`cache.attestation_grace`,
+  never retracted. They ride origin journals when introduced, and a snapshot-bearing sync
+  response starts a PAGED dump of the responder's retained fact set (the recovery path
+  re-teaches facts whose journal history was compacted); the puller loops with a resume
+  cursor until the dump completes, so neither side ever holds the whole fact table in
+  memory. Retention is held-plus-grace (`cache.attestation_grace`,
   default 90 d): a fact whose hash nobody has held for the window is reaped. Trust is enforced
   at USE only — well-formed facts are stored and relayed regardless of the current anchor, so
   removing a trusted key makes rows inert (not deleted) and re-adding it wakes them with no
@@ -216,6 +218,15 @@ origin's history is totally ordered, "peer P saw deletion N" collapses to "P's w
   puller's truncated loop collects them over successive rounds, so no response can outgrow the
   puller's hard caps. One origin's snapshot is never split; a single origin must stay under the
   raw cap (~600k paths — far past any real node).
+* **Catch-up is single-flight and striped.** Bodies for each origin flow from one server at a
+  time (per-round claims; every other pull skips the origin and gets clock lines only), so
+  catch-up bytes travel once however many peers are configured. Real backlogs go to the
+  catch-up engine: journal content at a (generation, seq) is immutable mesh-wide, so the
+  backlog is fetched as parallel windowed seq-range chunks, each assigned per fetch through
+  the same MW pool the data plane trains and routes by, reordered in a bounded buffer, and
+  applied in order. The engine cancels an origin (and the classic path re-snapshots it)
+  whenever any peer's advertised head outruns the journal backstop past the applied cursor —
+  the ranges it still needs are about to be compacted away everywhere.
 * **The differ compares signatures by subset, not equality**: peers holding the same
   (path, narhash) merge their sig sets into the shared row, so the stored set can be a strict
   superset of the local Nix db's forever — an equality check would re-export such paths on every

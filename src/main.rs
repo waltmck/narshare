@@ -160,12 +160,18 @@ async fn run(cfg: config::Config) -> Result<()> {
         serve_parts = Some((listener, state));
     }
 
+    // ONE multiplicative-weights pool arbitrates peers for the whole process: the data plane
+    // trains it with chunk transfers, the sync plane with catch-up rounds, and both route by
+    // it. (Persistence rides the proxy's weight saver; a proxy-less node starts uniform.)
+    let pool = Arc::new(pool::HostPool::new(cfg.peers.len().max(1)));
+
     // The sync subsystem exists whenever there are peers; its endpoints ride the serve
     // listener (a node without [serve] consumes the mesh but cannot export or relay).
     let sync_ctx = peers.as_ref().map(|p| {
         sync::Sync::new(
             idx.clone(),
             p.clone(),
+            pool.clone(),
             serve_db.clone(),
             nix_db_dir.clone(),
             cfg.cache.reconcile_every,
@@ -177,7 +183,7 @@ async fn run(cfg: config::Config) -> Result<()> {
         let listen = pcfg.listen;
         let peers = peers.clone().context("[proxy] requires [[peers]]")?;
         let n = peers.list.len();
-        let state = proxy::ProxyState::new(peers, idx.clone(), &cfg.peers, pcfg);
+        let state = proxy::ProxyState::new(peers, idx.clone(), pool.clone(), &cfg.peers, pcfg);
         state.spawn_weight_saver(shutdown_rx.clone());
         let listener = tokio::net::TcpListener::bind(listen)
             .await

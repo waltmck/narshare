@@ -48,10 +48,24 @@ pub mod proto {
 
 /// Journal rows retained per origin beyond the min-watermark rule — the backstop that keeps one
 /// dead or long-offline peer from pinning the journal forever. Stragglers land on the snapshot
-/// path, which must exist anyway.
-const JOURNAL_BACKSTOP: u64 = 50_000;
+/// path, which must exist anyway. pub(crate): the catch-up engine (sync.rs) cancels an
+/// origin's range plan the moment its head outruns this window past the applied cursor.
+pub(crate) const JOURNAL_BACKSTOP: u64 = 50_000;
 /// Suffix bytes per origin per sync response; more sets `truncated` and the puller loops.
 const SUFFIX_BYTES_CAP: usize = 8 << 20;
+/// Attestation-dump page cap (encoded bytes) per sync response; more sets `atts_truncated`
+/// and the puller loops with the resume cursor. Sized so one page decodes to a few tens of
+/// MiB at both ends — the constant that "O(1) memory in the fact-table size" means.
+const ATTS_PAGE_CAP: usize = 8 << 20;
+/// Even a response already at its overall budget ships at least this much fact-dump progress,
+/// so a snapshot-stuffed exchange cannot starve the dump into a livelock.
+const ATTS_PAGE_FLOOR: usize = 256 << 10;
+/// Byte cap per journal-range reply: bounds one catch-up chunk on the wire, and with it the
+/// requester's reorder-buffer memory (window × this).
+const RANGE_BYTES_CAP: usize = 2 << 20;
+/// Range asks answered per request — the engine's window never comes close, and a broken
+/// peer must not be able to ask for unbounded work in one exchange.
+const RANGE_ASKS_MAX: usize = 16;
 /// Soft byte budget for one WHOLE sync response (suffix events + snapshot hashes + the
 /// attestation dump, encoded). Origins that would overflow it are deferred with an empty
 /// truncated suffix and picked up by the puller's truncated loop next round.
@@ -100,12 +114,18 @@ pub enum Apply {
     NeedSnapshot,
 }
 
-/// What a sync request gets back: per-origin updates, plus (iff any of them is a snapshot)
-/// the full retained attestation dump — the recovery path that re-teaches facts whose journal
-/// events were compacted away.
+/// What a sync request gets back: per-origin updates, plus (iff any of them is a snapshot, or
+/// the requester is mid-dump) one PAGE of the retained attestation dump — the recovery path
+/// that re-teaches facts whose journal events were compacted away. `atts_next` is the resume
+/// cursor for the following page; None when the dump is complete. Paged so that neither side
+/// ever holds the whole fact table in memory: the dump is O(mesh) and materializing it was
+/// most of a measured ~1.15 GiB production peak.
 pub struct RespondBundle {
     pub origins: Vec<proto::OriginUpdate>,
     pub attests: Vec<proto::Attestation>,
+    pub atts_next: Option<Vec<u8>>,
+    /// Answers to a range-only request (the catch-up engine); empty otherwise.
+    pub ranges: Vec<proto::RangeReply>,
 }
 
 fn unix_now() -> u64 {
@@ -241,11 +261,20 @@ impl Index {
     }
 
     fn respond_budgeted(&self, req: &proto::SyncRequest, budget: usize) -> Result<RespondBundle> {
+        // Range-only requests (the catch-up engine's parallel chunk fetches) answer the asks
+        // and nothing else: no origin updates, no snapshots, no fact dump.
+        if !req.ranges.is_empty() {
+            return Ok(RespondBundle {
+                origins: Vec::new(),
+                attests: Vec::new(),
+                atts_next: None,
+                ranges: self.respond_ranges(&req.ranges)?,
+            });
+        }
         let have: HashMap<&str, &proto::OriginClock> =
             req.have.iter().map(|c| (c.origin.as_str(), c)).collect();
         let mut origins = Vec::new();
-        let mut attests: Vec<proto::Attestation> = Vec::new();
-        let mut sent_attests = false;
+        let mut sent_snapshot = false;
         let mut used = 0usize;
         // Sorted iteration: deterministic budget allocation across rounds.
         let mut names: Vec<&String> = self.origin_set.iter().collect();
@@ -268,6 +297,19 @@ impl Index {
                     seq,
                     truncated: false,
                     body: Some(proto::origin_update::Body::UpToDate(true)),
+                });
+                continue;
+            }
+            // Another peer is already streaming this origin to the requester (single-flight
+            // catch-up): clock line only — visibly behind, deliberately body-less, and no
+            // fact-dump trigger. The requester's lease machinery decides who serves bodies.
+            if req.skip_origins.contains(name) {
+                origins.push(proto::OriginUpdate {
+                    origin: name.clone(),
+                    generation: gen,
+                    seq,
+                    truncated: false,
+                    body: None,
                 });
                 continue;
             }
@@ -304,9 +346,9 @@ impl Index {
                 });
                 continue;
             } else {
-                // Their watermark predates our tail, or their generation is stale: snapshot,
-                // and with the FIRST snapshot of the response, the retained facts (journal
-                // history that would have carried them is gone by definition of this path).
+                // Their watermark predates our tail, or their generation is stale: snapshot.
+                // The retained facts ride along too (journal history that would have carried
+                // them is gone by definition of this path) — as PAGES, below.
                 let held: Vec<Vec<u8>> = self
                     .store
                     .holdings(name)?
@@ -314,14 +356,7 @@ impl Index {
                     .map(|h| h.to_vec())
                     .collect();
                 used += held.len() * 34;
-                if !sent_attests {
-                    sent_attests = true;
-                    attests = self.store.all_attestations()?;
-                    used += attests
-                        .iter()
-                        .map(prost::Message::encoded_len)
-                        .sum::<usize>();
-                }
+                sent_snapshot = true;
                 proto::origin_update::Body::Snapshot(proto::Snapshot { held })
             };
             origins.push(proto::OriginUpdate {
@@ -332,7 +367,67 @@ impl Index {
                 body: Some(body),
             });
         }
-        Ok(RespondBundle { origins, attests })
+        // The fact dump: one page per response, resumed by the cursor the requester echoes
+        // back; a mid-dump requester gets its next page even when everything else is up to
+        // date. The cursor is honored UNCONDITIONALLY — snapshots included: a puller that is
+        // merely behind (flaky link, slow device) must not lose dump progress, and only the
+        // PULLER knows when its dump is actually invalidated (it forfeits journal events by
+        // applying a possession snapshot — possibly one learned from a different peer — and
+        // restarts by sending a cursor below every real key; see sync.rs). Pages read the
+        // live table, so rows inserted behind a resumed frontier are missed by that dump,
+        // but every such row's introducing journal event still reaches the puller as an
+        // ordinary suffix unless a snapshot forfeits it — which is exactly the restart case.
+        let (attests, atts_next) = if !req.atts_cursor.is_empty() || sent_snapshot {
+            let page_budget = ATTS_PAGE_CAP
+                .min(budget.saturating_sub(used))
+                .max(ATTS_PAGE_FLOOR);
+            self.store.attestation_page(&req.atts_cursor, page_budget)?
+        } else {
+            (Vec::new(), None)
+        };
+        Ok(RespondBundle {
+            origins,
+            attests,
+            atts_next,
+            ranges: Vec::new(),
+        })
+    }
+
+    /// Serve journal-range asks: each reply carries the origin's events in (after, until],
+    /// independently bounded by RANGE_BYTES_CAP (a short reply is normal — the engine
+    /// re-queues the remainder). Unreachable — compacted past `after`, or another generation —
+    /// is an ANSWER, not an error: the engine re-routes or falls back to the snapshot path.
+    fn respond_ranges(&self, asks: &[proto::RangeAsk]) -> Result<Vec<proto::RangeReply>> {
+        let mut out = Vec::new();
+        for ask in asks.iter().take(RANGE_ASKS_MAX) {
+            if !self.origin_set.contains(&ask.origin) {
+                continue;
+            }
+            let c = self.store.clock(&ask.origin)?;
+            let mut reply = proto::RangeReply {
+                origin: ask.origin.clone(),
+                generation: c.generation,
+                after: ask.after,
+                events: Vec::new(),
+                reachable: false,
+            };
+            if c.generation == ask.generation && ask.after >= c.tail_seq && ask.after < ask.until
+            {
+                reply.reachable = true;
+                let (raw, _) = self
+                    .store
+                    .journal_suffix(&ask.origin, ask.after, RANGE_BYTES_CAP)?;
+                for blob in raw {
+                    let e = proto::Event::decode(&blob[..]).context("corrupt journal event")?;
+                    if e.seq > ask.until {
+                        break;
+                    }
+                    reply.events.push(e);
+                }
+            }
+            out.push(reply);
+        }
+        Ok(out)
     }
 
     /// Apply one origin's journal suffix. Idempotent; events are journaled verbatim (faithful
@@ -496,34 +591,42 @@ impl Index {
     pub fn sync_own_db(&self, db: &StoreDb) -> Result<usize> {
         let candidates = db.candidates()?;
 
-        // Phase 1: what we already export.
+        // Phase 1: what we already export. The "already attested" test streams the claim
+        // table PAST an index of the local candidates instead of materializing it — the claim
+        // set is O(mesh) (measured ~400 MiB of transient heap per cycle at production scale,
+        // which glibc then largely kept); the candidate index is O(this store).
         let held: HashSet<[u8; 32]> = self.store.holdings(&self.self_name)?.into_iter().collect();
-        let claims: HashMap<(String, Vec<u8>), Vec<String>> = self
-            .store
-            .attested_claims()?
-            .into_iter()
-            .map(|(path, hash, sigs)| ((path, hash), sigs))
+        let cand_ix: HashMap<(&str, &[u8]), usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ((c.path.as_str(), &c.nar_hash[..]), i))
             .collect();
+        let mut known = vec![false; candidates.len()];
+        self.store.for_each_claim(&mut |(path, hash, sigs)| {
+            if let Some(&i) = cand_ix.get(&(path.as_str(), hash.as_slice())) {
+                // A merged sig SUPERSET of ours is not a change — comparing by equality here
+                // would re-attest forever: a mesh-wide hint/pull livelock.
+                if candidates[i].sigs.iter().all(|s| sigs.contains(s)) {
+                    known[i] = true;
+                }
+            }
+            Ok(())
+        })?;
+        drop(cand_ix);
 
         // Phase 2: diff. Possession is the distinct hash set of every candidate; attestations
         // are per-path facts, filtered by the deriver's allowSubstitutes and by feasibility
         // (with its ed25519 verify) — both consulted only for rows that actually changed.
         let local: HashSet<[u8; 32]> = candidates.iter().map(|c| c.nar_hash).collect();
         let mut attests: Vec<proto::Attestation> = Vec::new();
-        for c in &candidates {
+        for (i, c) in candidates.iter().enumerate() {
             // Possession covers every path; a FACT needs a reason anyone could believe it.
             // Unbelievable rows are skipped before any per-row work — they never enter the
             // fact table, so they would otherwise look "changed" and re-derive forever.
             if c.ca.is_none() && c.sigs.is_empty() {
                 continue;
             }
-            let key = (c.path.clone(), c.nar_hash.to_vec());
-            let known = claims
-                .get(&key)
-                .is_some_and(|sigs| c.sigs.iter().all(|s| sigs.contains(s)));
-            if known {
-                // A merged sig SUPERSET of ours is not a change — comparing by equality here
-                // would re-attest forever: a mesh-wide hint/pull livelock.
+            if known[i] {
                 continue;
             }
             if !self.substitutable(c) {
@@ -558,10 +661,11 @@ impl Index {
 
         // Phase 3: journal and materialize.
         let emitted = self.export_ops(&attests, &holds)?;
-        // The diff's transient maps (candidates, claims) peak at ~100MB on a real store, and
-        // glibc retains freed arenas indefinitely — hand them back UNCONDITIONALLY: a quiet
-        // reconciliation allocates just as much as a busy one, and retained cold arenas end
-        // up parked in swap (then churned back through zswap, which is pure kernel CPU).
+        // The diff's transient state (candidates, the candidate index, hash sets) peaks at a
+        // few tens of MB on a real store, and glibc retains freed arenas indefinitely — hand
+        // them back UNCONDITIONALLY: a quiet reconciliation allocates just as much as a busy
+        // one, and retained cold arenas end up parked in swap (then churned back through
+        // zswap, which is pure kernel CPU).
         unsafe { libc::malloc_trim(0) };
         Ok(emitted)
     }
@@ -894,6 +998,30 @@ impl Index {
         Ok((c.generation, c.seq))
     }
 
+    /// The persisted fact-dump resume cursor for pulls from `peer` — meta-backed so a dump
+    /// interrupted by a process death resumes after restart instead of silently dropping the
+    /// tail of the responder's fact table. (A store wipe loses it, but a wipe also bumps our
+    /// generation, which forces the snapshots that restart dumps from zero anyway.)
+    ///
+    /// Durability: meta writes commit SYNCHRONOUSLY in both backends (fsync'd WAL / LOCAL
+    /// synchronous_commit), and the caller writes the cursor strictly AFTER the page's fact
+    /// merge. Both engines' logs are sequential, so the cursor's fsync also lands the merge
+    /// committed before it: a database or OS crash can roll the cursor BACK (the next pull
+    /// re-fetches pages it already merged — dedup absorbs that) but never leave it AHEAD of
+    /// its facts, which would silently skip a lost page forever.
+    pub fn dump_cursor(&self, peer: &str) -> Result<Vec<u8>> {
+        Ok(self
+            .store
+            .meta_get(&format!("atts_resume:{peer}"))?
+            .and_then(|h| hex::decode(h).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn set_dump_cursor(&self, peer: &str, cursor: &[u8]) -> Result<()> {
+        self.store
+            .meta_put(&format!("atts_resume:{peer}"), &hex::encode(cursor))
+    }
+
     /// Test seeding: register a fact and make `origin` a holder of its bytes at (gen 1,
     /// seq 1) — the v2 shape of what proxy tests used to do with a one-row v1 snapshot.
     #[cfg(test)]
@@ -1138,6 +1266,142 @@ mod tests {
     }
 
     #[test]
+    fn skipped_origins_get_clock_lines_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = idx(dir.path(), "a", &["b", "c"]);
+        a.merge_attests(&[att("p", 1)]).unwrap();
+        a.apply_snapshot("c", 1, 3, &[vec![1u8; 32]]).unwrap();
+
+        // Unskipped, a zero clock earns the snapshot and the fact dump.
+        let mut req = proto::SyncRequest {
+            requester: "b".into(),
+            have: vec![],
+            atts_cursor: Vec::new(),
+            skip_origins: vec![],
+            ranges: vec![],
+        };
+        let bundle = a.respond(&req).unwrap();
+        let up = bundle.origins.iter().find(|u| u.origin == "c").unwrap();
+        assert!(matches!(
+            up.body,
+            Some(proto::origin_update::Body::Snapshot(_))
+        ));
+        assert!(!bundle.attests.is_empty());
+
+        // Skipped (another peer holds the leases — including the responder's own origin,
+        // which would otherwise first-contact-snapshot too): clock lines stay — visibly
+        // behind — but no bodies ship and no fact dump is triggered.
+        req.skip_origins = vec!["a".into(), "c".into()];
+        let bundle = a.respond(&req).unwrap();
+        let up = bundle.origins.iter().find(|u| u.origin == "c").unwrap();
+        assert_eq!((up.generation, up.seq), (1, 3));
+        assert!(up.body.is_none());
+        assert!(!up.truncated);
+        let up = bundle.origins.iter().find(|u| u.origin == "a").unwrap();
+        assert!(up.body.is_none());
+        assert!(bundle.attests.is_empty(), "skipped snapshots must not dump");
+        assert_eq!(bundle.atts_next, None);
+    }
+
+    #[test]
+    fn fact_dump_pages_survive_snapshots_and_sentinel_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = idx(dir.path(), "a", &["b", "c"]);
+        // Enough facts that a floor-sized page (256 KiB) cannot carry them all.
+        let facts: Vec<proto::Attestation> = (0..5000)
+            .map(|i| proto::Attestation {
+                store_path: format!("/nix/store/{i:032}-f"),
+                nar_hash: {
+                    let mut h = [0u8; 32];
+                    h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                    h.to_vec()
+                },
+                nar_size: 1,
+                references: vec!["x".repeat(64)],
+                ca: "fixed:r:sha256:x".into(),
+                sigs: vec![],
+            })
+            .collect();
+        assert_eq!(a.merge_attests(&facts).unwrap(), 5000);
+        a.apply_snapshot("c", 1, 1, &[vec![9u8; 32]]).unwrap();
+        let (a_gen, _) = a.origin_clock("a").unwrap();
+        let req = |have: Vec<proto::OriginClock>, cursor: Vec<u8>| proto::SyncRequest {
+            requester: "b".into(),
+            have,
+            atts_cursor: cursor,
+            skip_origins: vec![],
+            ranges: vec![],
+        };
+        let caught_up = || {
+            vec![
+                proto::OriginClock {
+                    origin: "a".into(),
+                    generation: a_gen,
+                    seq: 0,
+                },
+                proto::OriginClock {
+                    origin: "c".into(),
+                    generation: 1,
+                    seq: 1,
+                },
+            ]
+        };
+
+        // A zero clock earns snapshots, which start a paged dump.
+        let bundle = a.respond_budgeted(&req(vec![], Vec::new()), 1).unwrap();
+        let first_path = bundle.attests[0].store_path.clone();
+        let mid_cursor = bundle.atts_next.clone().expect("5k facts exceed one page");
+        let mut seen: HashSet<Vec<u8>> =
+            bundle.attests.iter().map(|f| f.nar_hash.clone()).collect();
+
+        // Caught-up rounds ship no snapshot, yet the cursor keeps the dump flowing.
+        let mut cursor = mid_cursor.clone();
+        loop {
+            let bundle = a.respond_budgeted(&req(caught_up(), cursor), 1).unwrap();
+            assert!(
+                bundle.origins.iter().all(|u| !matches!(
+                    u.body,
+                    Some(proto::origin_update::Body::Snapshot(_))
+                )),
+                "caught-up rounds must not snapshot"
+            );
+            seen.extend(bundle.attests.iter().map(|f| f.nar_hash.clone()));
+            match bundle.atts_next {
+                Some(c) => cursor = c,
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 5000, "paging covers every fact exactly once");
+
+        // A mid-dump snapshot must NOT reset the responder's paging — a puller that is
+        // merely behind cannot afford to lose dump progress to its own lag; invalidation
+        // is the puller's call (sync.rs), made when IT applies a snapshot.
+        let bundle = a
+            .respond_budgeted(&req(vec![], mid_cursor.clone()), 1)
+            .unwrap();
+        assert!(
+            bundle
+                .origins
+                .iter()
+                .any(|u| matches!(u.body, Some(proto::origin_update::Body::Snapshot(_)))),
+            "a zero clock earns snapshots"
+        );
+        assert_ne!(
+            bundle.attests[0].store_path, first_path,
+            "the page continues from the cursor, snapshots or not"
+        );
+
+        // The puller restarts by sending the sentinel cursor — a key below every real one —
+        // which pages from the very beginning without any responder-side state.
+        let bundle = a.respond_budgeted(&req(caught_up(), vec![0]), 1).unwrap();
+        assert_eq!(
+            bundle.attests[0].store_path, first_path,
+            "the sentinel cursor restarts the dump"
+        );
+        assert!(bundle.atts_next.is_some());
+    }
+
+    #[test]
     fn first_contact_gets_snapshot_with_facts_then_suffixes_then_compaction() {
         let dir = tempfile::tempdir().unwrap();
         // Node a: exports its own fake store.
@@ -1162,6 +1426,9 @@ mod tests {
         let req = proto::SyncRequest {
             requester: "b".into(),
             have: b.clock_vector().unwrap(),
+            atts_cursor: Vec::new(),
+            skip_origins: vec![],
+            ranges: vec![],
         };
         let bundle = a.respond(&req).unwrap();
         let up = bundle.origins.iter().find(|u| u.origin == "a").unwrap();
@@ -1186,6 +1453,9 @@ mod tests {
         let req = proto::SyncRequest {
             requester: "b".into(),
             have: b.clock_vector().unwrap(),
+            atts_cursor: Vec::new(),
+            skip_origins: vec![],
+            ranges: vec![],
         };
         let bundle = a.respond(&req).unwrap();
         assert!(bundle.attests.is_empty(), "no snapshot, no fact dump");
@@ -1221,6 +1491,9 @@ mod tests {
         let req = proto::SyncRequest {
             requester: "c".into(),
             have: fresh.clock_vector().unwrap(),
+            atts_cursor: Vec::new(),
+            skip_origins: vec![],
+            ranges: vec![],
         };
         let bundle = a.respond(&req).unwrap();
         let up = bundle.origins.iter().find(|u| u.origin == "a").unwrap();
@@ -1251,6 +1524,9 @@ mod tests {
         let req = proto::SyncRequest {
             requester: "c".into(),
             have: c.clock_vector().unwrap(),
+            atts_cursor: Vec::new(),
+            skip_origins: vec![],
+            ranges: vec![],
         };
         let bundle = b.respond(&req).unwrap();
         let up = bundle.origins.iter().find(|u| u.origin == "a").unwrap();
@@ -1438,6 +1714,9 @@ mod tests {
         let req = proto::SyncRequest {
             requester: "c".into(),
             have: c.clock_vector().unwrap(),
+            atts_cursor: Vec::new(),
+            skip_origins: vec![],
+            ranges: vec![],
         };
         let bundle = x.respond_budgeted(&req, 1).unwrap();
         let ups = &bundle.origins;
@@ -1477,6 +1756,9 @@ mod tests {
         let req = proto::SyncRequest {
             requester: "c".into(),
             have: c.clock_vector().unwrap(),
+            atts_cursor: Vec::new(),
+            skip_origins: vec![],
+            ranges: vec![],
         };
         let bundle = x.respond_budgeted(&req, usize::MAX).unwrap();
         for u in &bundle.origins {

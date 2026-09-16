@@ -246,6 +246,27 @@ fn row_to_att(row: &postgres::Row) -> proto::Attestation {
 
 const ATT_COLS: &str = "store_path, nar_hash, nar_size, refs, ca, sigs";
 
+/// Fact-dump cursor: the (hash_part, nar_hash) primary key of the last row served, as
+/// hash_part's 32 utf8 bytes followed by the 32 hash bytes. Opaque outside this backend; a
+/// malformed cursor (never produced by us, but the wire cannot promise one) degrades to a
+/// dump from the start — over-delivery, which grow-only dedup absorbs.
+fn split_cursor(cursor: &[u8]) -> (String, Vec<u8>) {
+    if cursor.len() < 32 {
+        return (String::new(), Vec::new());
+    }
+    match std::str::from_utf8(&cursor[..32]) {
+        Ok(hp) => (hp.to_owned(), cursor[32..].to_vec()),
+        Err(_) => (String::new(), Vec::new()),
+    }
+}
+
+fn join_cursor(hash_part: &str, nar_hash: &[u8]) -> Vec<u8> {
+    let mut c = Vec::with_capacity(hash_part.len() + nar_hash.len());
+    c.extend_from_slice(hash_part.as_bytes());
+    c.extend_from_slice(nar_hash);
+    c
+}
+
 impl PgStore {
     /// `url` is a postgres connection string (URL or key=value form); `schema` isolates one
     /// index per database (the production default is "narshare").
@@ -545,14 +566,44 @@ impl SyncStore for PgStore {
         })
     }
 
-    fn all_attestations(&self) -> Result<Vec<proto::Attestation>> {
+    fn attestation_page(
+        &self,
+        cursor: &[u8],
+        max_bytes: usize,
+    ) -> Result<(Vec<proto::Attestation>, Option<Vec<u8>>)> {
+        use prost::Message as _;
+        const FETCH: i64 = 1024;
+        let (mut hp, mut nh) = split_cursor(cursor);
         self.with_conn(|c| {
-            Ok(
-                c.query(&format!("SELECT {ATT_COLS} FROM attestations"), &[])?
-                    .iter()
-                    .map(row_to_att)
-                    .collect(),
-            )
+            let mut page: Vec<proto::Attestation> = Vec::new();
+            let mut used = 0usize;
+            loop {
+                // Keyset pagination on the primary key: O(FETCH) client memory per round,
+                // index-ordered on the server, valid across concurrent merges and reaps.
+                let rows = c.query(
+                    &format!(
+                        "SELECT {ATT_COLS}, hash_part FROM attestations
+                         WHERE (hash_part, nar_hash) > ($1, $2)
+                         ORDER BY hash_part, nar_hash LIMIT $3"
+                    ),
+                    &[&hp, &nh, &FETCH],
+                )?;
+                let exhausted = rows.len() < FETCH as usize;
+                for r in &rows {
+                    let att = row_to_att(r);
+                    let len = att.encoded_len();
+                    if used + len > max_bytes && !page.is_empty() {
+                        return Ok((page, Some(join_cursor(&hp, &nh))));
+                    }
+                    used += len;
+                    hp = r.get(6);
+                    nh = r.get(1);
+                    page.push(att);
+                }
+                if exhausted {
+                    return Ok((page, None));
+                }
+            }
         })
     }
 
@@ -665,14 +716,33 @@ impl SyncStore for PgStore {
         })
     }
 
-    fn attested_claims(&self) -> Result<Vec<(String, Vec<u8>, Vec<String>)>> {
+    fn for_each_claim(
+        &self,
+        f: &mut dyn FnMut(super::ClaimRow) -> Result<()>,
+    ) -> Result<()> {
+        const FETCH: i64 = 4096;
         self.with_conn(|c| {
-            Ok(
-                c.query("SELECT store_path, nar_hash, sigs FROM attestations", &[])?
-                    .into_iter()
-                    .map(|r| (r.get(0), r.get(1), r.get(2)))
-                    .collect(),
-            )
+            let (mut hp, mut nh) = split_cursor(b"");
+            loop {
+                // Keyset pagination (see attestation_page): the claim set is O(mesh) and must
+                // never be materialized whole on either end of the wire.
+                let rows = c.query(
+                    "SELECT store_path, nar_hash, sigs, hash_part FROM attestations
+                     WHERE (hash_part, nar_hash) > ($1, $2)
+                     ORDER BY hash_part, nar_hash LIMIT $3",
+                    &[&hp, &nh, &FETCH],
+                )?;
+                let exhausted = rows.len() < FETCH as usize;
+                for r in rows {
+                    hp = r.get(3);
+                    let hash: Vec<u8> = r.get(1);
+                    nh = hash.clone();
+                    f((r.get(0), hash, r.get(2)))?;
+                }
+                if exhausted {
+                    return Ok(());
+                }
+            }
         })
     }
 

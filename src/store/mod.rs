@@ -110,9 +110,15 @@ pub trait SyncStore: Send + Sync {
     ) -> Result<bool>;
 
     /// Snapshot recovery: unless stale (generation below the current one, or equal generation
-    /// with seq below the current seq), atomically wipe-replace the origin's possession set,
-    /// empty its journal, and set clock = (generation, seq, tail_seq = seq). Returns whether
-    /// it applied. Retention stamps are maintained exactly as for apply_events.
+    /// with seq below the current seq), wipe-replace the origin's possession set, empty its
+    /// journal, and set clock = (generation, seq, tail_seq = seq). Returns whether it applied.
+    /// Retention stamps are maintained exactly as for apply_events.
+    ///
+    /// NOT atomic against readers: a snapshot spans a peer's whole store, so backends commit
+    /// it in bounded chunks (memory stays O(chunk)) under their writer exclusion, with the
+    /// clock written last. Readers may briefly see a partial possession set (a lookup miss
+    /// falls back upstream — this is a cache); a crash mid-apply leaves the clock unmoved,
+    /// so the next pull re-offers the same snapshot wholesale.
     fn replace_holdings(
         &self,
         origin: &str,
@@ -138,8 +144,19 @@ pub trait SyncStore: Send + Sync {
     ) -> Result<(Vec<Vec<u8>>, bool)>;
     /// The origin's complete current possession set.
     fn holdings(&self, origin: &str) -> Result<Vec<[u8; 32]>>;
-    /// Every retained attestation (the recovery dump; includes grace-retained unheld facts).
-    fn all_attestations(&self) -> Result<Vec<proto::Attestation>>;
+    /// One page of the retained attestation dump (the recovery path; includes grace-retained
+    /// unheld facts), in a stable storage order, starting strictly after `cursor` (empty =
+    /// from the start). The page stops before the attestation whose encoded size would push
+    /// it past `max_bytes` — but never truncates to zero rows. Returns the page and the
+    /// cursor to resume from; None means the dump is complete. Cursors are opaque to callers
+    /// and remain valid across concurrent merges and reaps (rows added or removed mid-dump
+    /// are over- or under-delivered, which grow-only dedup and re-teaching make harmless).
+    /// Memory on both sides of the trait is O(page), never O(table).
+    fn attestation_page(
+        &self,
+        cursor: &[u8],
+        max_bytes: usize,
+    ) -> Result<(Vec<proto::Attestation>, Option<Vec<u8>>)>;
 
     // ---- maintenance ----
     /// Drop journal rows with seq <= floor and raise tail_seq to floor. No-op when
@@ -158,9 +175,11 @@ pub trait SyncStore: Send + Sync {
     fn lookup_hash_part(&self, hash_part: &str) -> Result<Vec<(proto::Attestation, Vec<String>)>>;
     /// Attestations for this nar hash, each with its current holders; same no-holder rule.
     fn lookup_nar_hash(&self, nar_hash: &[u8; 32]) -> Result<Vec<FoundRow>>;
-    /// Slim full scan for the export differ: (store_path, nar_hash, sigs) of every retained
-    /// attestation.
-    fn attested_claims(&self) -> Result<Vec<ClaimRow>>;
+    /// Stream the differ's slim view — (store_path, nar_hash, sigs) — of every retained
+    /// attestation, one row at a time in storage order. Streaming, deliberately: the full
+    /// claim set is O(mesh), and materializing it per differ cycle was measured at ~400 MiB
+    /// of transient heap at production scale — heap that glibc then largely kept.
+    fn for_each_claim(&self, f: &mut dyn FnMut(ClaimRow) -> Result<()>) -> Result<()>;
     /// One fact's signature set, or None if the fact is not retained — the incremental
     /// differ's point-wise change test (a handful of new rows must not cost a table scan).
     fn attestation_sigs(&self, hash_part: &str, nar_hash: &[u8]) -> Result<Option<Vec<String>>>;
@@ -203,8 +222,8 @@ pub mod bench {
     use crate::index::proto;
     use std::time::Instant;
 
-    const FACTS: usize = 200_000;
-    const HELD: usize = 100_000;
+    const FACTS: usize = 320_000;
+    const HELD: usize = 200_000;
     const LOOKUPS: usize = 20_000;
 
     fn h(i: usize) -> [u8; 32] {
@@ -214,15 +233,30 @@ pub mod bench {
         b
     }
 
+    /// Shaped like a production fact: a full store path, a dozen reference basenames, one
+    /// binary-cache signature. Row size drives every scan/dump figure, so it must be honest.
     fn att(i: usize) -> proto::Attestation {
         proto::Attestation {
             store_path: format!("/nix/store/{:032x}-pkg-{i}", i),
             nar_hash: h(i).to_vec(),
             nar_size: 4096,
-            references: vec!["aaaa-dep".into(), "bbbb-dep".into()],
-            ca: "fixed:r:sha256:dummy".into(),
-            sigs: vec![],
+            references: (0..12)
+                .map(|r| format!("{:032x}-dependency-{r}-1.2.{i}", i.wrapping_mul(31) + r))
+                .collect(),
+            ca: String::new(),
+            sigs: vec![format!("cache.example.org-1:{i:086}")],
         }
+    }
+
+    /// This process's resident set, for the per-phase memory report — the number that decides
+    /// whether the control plane fits small hosts.
+    fn rss_mib() -> f64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        s.lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.trim().trim_end_matches(" kB").parse::<f64>().ok())
+            .unwrap_or(0.0)
+            / 1024.0
     }
 
     /// Per-phase resource meter: wall clock, this process's CPU (user+sys via getrusage) and
@@ -300,10 +334,11 @@ pub mod bench {
                 .map(|l| format!(", write-amp {:.2}x", dw as f64 / l as f64))
                 .unwrap_or_default();
             println!(
-                "[bench]   {label}: wall {wall:?}, cpu {cpu:.3}s, io r/w {}/{} KiB{amp}, {:.1} µs/op ({ops} ops)",
+                "[bench]   {label}: wall {wall:?}, cpu {cpu:.3}s, io r/w {}/{} KiB{amp}, {:.1} µs/op ({ops} ops), rss {:.0} MiB",
                 dr / 1024,
                 dw / 1024,
-                wall.as_secs_f64() * 1e6 / ops.max(1) as f64
+                wall.as_secs_f64() * 1e6 / ops.max(1) as f64,
+                rss_mib()
             );
         }
     }
@@ -364,9 +399,14 @@ pub mod bench {
 
         // The differ's per-cycle scans.
         let m = Meter::start(ext);
-        let claims = s.attested_claims().unwrap();
-        let n = claims.len();
-        m.stop("attested_claims scan", n, None);
+        let mut n = 0usize;
+        s.for_each_claim(&mut |_| {
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, FACTS);
+        m.stop("claims stream", n, None);
         let m = Meter::start(ext);
         let held = s.holdings("peer-a").unwrap();
         let n = held.len();
@@ -380,6 +420,34 @@ pub mod bench {
         let reaped = s.reap_attestations(0).unwrap();
         assert_eq!(reaped, 0);
         m.stop("reap scan (nothing due)", FACTS, None);
+
+        // The recovery dump, as sync.rs drives it: page from the store, encode, compress,
+        // release — per-page memory, whatever the table size.
+        let m = Meter::start(ext);
+        let mut cursor: Vec<u8> = Vec::new();
+        let (mut pages, mut rows, mut wire, mut zbytes) = (0usize, 0usize, 0usize, 0usize);
+        loop {
+            let (page, next) = s.attestation_page(&cursor, 8 << 20).unwrap();
+            rows += page.len();
+            let mut buf = Vec::new();
+            for a in &page {
+                a.encode_length_delimited(&mut buf).unwrap();
+            }
+            wire += buf.len();
+            zbytes += zstd::stream::encode_all(&buf[..], 3).unwrap().len();
+            pages += 1;
+            match next {
+                Some(c) => cursor = c,
+                None => break,
+            }
+        }
+        assert_eq!(rows, FACTS);
+        println!(
+            "[bench]   fact dump: {pages} pages, wire {} MiB, zstd {} MiB",
+            wire >> 20,
+            zbytes >> 20
+        );
+        m.stop("paged fact dump", FACTS, None);
     }
 }
 
@@ -419,6 +487,7 @@ pub mod conformance {
         journal_suffix_and_compaction(&*mk("journal"));
         holdings_replace_and_staleness(&*mk("holdings"));
         attestations_merge_union_and_lookup(&*mk("attest"));
+        attestation_paging(&*mk("paging"));
         retention_stamps_and_reaper(&*mk("retention"));
         watermarks_and_retain_origins(&*mk("wm"));
         mw_state_roundtrip(&*mk("mw"));
@@ -613,12 +682,48 @@ pub mod conformance {
         assert!(s.is_held("x", &h(1)).unwrap());
         assert!(!s.is_held("x", &h(9)).unwrap());
         assert!(!s.is_held("nobody", &h(1)).unwrap());
-        // Distinct (path, hash) facts coexist; claims scan sees both.
+        // Distinct (path, hash) facts coexist; the claims stream sees both.
         let b = att("p", 2, &[]);
         s.merge_attestations(&[b], 0).unwrap();
         assert_eq!(s.count_attestations().unwrap(), 2);
-        assert_eq!(s.attested_claims().unwrap().len(), 2);
-        assert_eq!(s.all_attestations().unwrap().len(), 2);
+        let mut claims = 0usize;
+        s.for_each_claim(&mut |_| {
+            claims += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(claims, 2);
+        let (page, next) = s.attestation_page(b"", usize::MAX).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(next, None);
+    }
+
+    fn attestation_paging(s: &dyn SyncStore) {
+        let atts: Vec<proto::Attestation> = (0..7).map(|i| att("pg", i, &["k:S"])).collect();
+        s.merge_attestations(&atts, 0).unwrap();
+        // Tiny budget: pages never truncate to zero rows, cursors resume without overlap or
+        // loss, and the final page reports completion.
+        let mut cursor: Vec<u8> = Vec::new();
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let (page, next) = s.attestation_page(&cursor, 1).unwrap();
+            assert!(!page.is_empty(), "a page under budget must still progress");
+            seen.extend(page.iter().map(|a| a.nar_hash.clone()));
+            match next {
+                Some(c) => cursor = c,
+                None => break,
+            }
+        }
+        let mut want: Vec<Vec<u8>> = atts.iter().map(|a| a.nar_hash.clone()).collect();
+        want.sort();
+        let mut got = seen.clone();
+        got.sort();
+        assert_eq!(got, want, "paging covers every row exactly once");
+        assert_eq!(seen.len(), 7);
+        // A roomy budget takes the whole table in one page.
+        let (page, next) = s.attestation_page(b"", usize::MAX).unwrap();
+        assert_eq!(page.len(), 7);
+        assert_eq!(next, None);
     }
 
     fn retention_stamps_and_reaper(s: &dyn SyncStore) {
