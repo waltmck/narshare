@@ -52,4 +52,6 @@ prost-build = "0.13"
 tempfile = "3"
 
 [profile.release]
-lto = "thin"
+opt-level = 3
+lto = true
+codegen-units = 1
