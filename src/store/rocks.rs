@@ -1,15 +1,18 @@
 //! The embedded index backend: RocksDB, one column family per logical table.
 //!
-//! Atomicity comes from a store-wide writer lock around read-modify-write sections plus one
-//! WriteBatch per composite op — readers never take the lock and see either all of a batch or
-//! none of it. That serializes writers, which is exactly the trade accepted when the
-//! shared-table layout was chosen: applies are rare and group-committed, and correctness of
-//! the holder-count/stamp maintenance requires a consistent read of "who else holds this hash"
-//! anyway. The exception is the BULK ops — snapshot applies, the reaper, origin retirement —
-//! which commit in BATCH_OPS-bounded chunks so their memory is O(chunk) on any table size;
-//! per-hash effects are independent across chunks, and each op's clock (where it has one)
-//! moves only in the final batch, so interruption means clean re-application, never
-//! divergence.
+//! Atomicity comes from one WriteBatch per composite op, taken under STRIPED write locks —
+//! readers never take them and see either all of a batch or none of it. Every composite op
+//! needs read-modify-write over exactly one key (an origin's clock and journal, a fact's
+//! identity, a watermark), and those are disjoint, so the lock is per key-space stripe rather
+//! than store-wide; multi-key ops take their stripes in a global order, which is what makes
+//! them deadlock-free. (It WAS store-wide, justified by retention stamps needing a consistent
+//! read of "who else holds this hash" — removing the reaper removed that requirement, and with
+//! it the only reason to serialize unrelated writers.)
+//!
+//! The exception is the BULK ops — snapshot applies and origin retirement — which commit in
+//! BATCH_OPS-bounded chunks so their memory is O(chunk) on any table size; per-hash effects
+//! are independent across chunks, and each op's clock (where it has one) moves only in the
+//! final batch, so interruption means clean re-application, never divergence.
 //!
 //! Durability: only SELF-origin applies (and the meta writes that name the self generation)
 //! are fsynced — a seq a peer has observed must never be reissued with different events, and
@@ -18,13 +21,15 @@
 //! at write() time — a narshare crash within one boot loses nothing, and a host crash rolls
 //! replicas back to an ordered prefix they can only have FORGOTTEN (single writer: another
 //! origin's content at a (gen, seq) is immutable mesh-wide), which the next pull re-learns.
-//! Maintenance writes (compaction, reaping, watermarks, MW state) ride along: losing them only
+//! Maintenance writes (compaction, watermarks, MW state) ride along: losing them only
 //! retains extra history or re-learns state, never diverges.
 //!
 //! Layout versioning is wipe-and-resync like every narshare cache: a `layout` marker mismatch
 //! destroys the database and lets the mesh snapshot us back up.
 
-use super::{hash_part_of, Clock, HoldOp, SyncStore};
+use super::{
+    attestation_hash, hash_part_of, leaf_of, merge_into, path_key_of, Clock, HoldOp, SyncStore,
+};
 use crate::index::proto;
 use anyhow::{bail, Context, Result};
 use prost::Message as _;
@@ -41,35 +46,115 @@ type Kv = (Box<[u8]>, Box<[u8]>);
 /// Streaming-scan visitor: (key, value) → keep going? See each_opt.
 type RowVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<bool> + 'a;
 
-const LAYOUT: &str = "narshare-rocks-2";
+const LAYOUT: &str = "narshare-rocks-3";
 /// CFs whose keys start with a fixed 32-byte hash — the hot lookup path. They get a prefix
 /// extractor, prefix bloom filters (memtable and SST), and a shared block cache: the proxy is
 /// consulted for every substitution the machine attempts, so both hits (common: the mesh holds
 /// most of what cache.nixos.org served everyone) and misses (fresh nixpkgs bumps) must resolve
-/// in memory, not per-seek SST index reads.
-const HASH_PREFIX_CFS: &[&str] = &["att", "attby", "holdby", "stamp"];
+/// in memory, not per-seek SST index reads. `att` is NOT among them: it is keyed by
+/// attestation hash, and the substituter reaches it through `att_path` (see CFS).
+const HASH_PREFIX_CFS: &[&str] = &["att_path", "att_nar", "holdby"];
 /// Shared block cache for the hot CFs. 64 MiB comfortably holds the working set of a
 /// mesh-wide fact table (~500k rows) plus holder edges.
 const BLOCK_CACHE_BYTES: usize = 64 << 20;
-/// Flush threshold for the bulk maintenance batches (snapshot applies, the reaper, origin
-/// retirement). One giant WriteBatch over a peer's whole possession set was a ~600 MiB spike
+/// Flush threshold for the bulk maintenance batches (snapshot applies, origin retirement). One giant WriteBatch over a peer's whole possession set was a ~600 MiB spike
 /// at production scale; per-hash effects are independent, so bounded batches change only how
 /// much of the pass a reader can observe mid-way — a crash before the final clock write leaves
 /// the clock unmoved and the operation re-applies wholesale.
 const BATCH_OPS: usize = 32_768;
-/// Retention stamps live in their OWN column family (att key → 8-byte unheld_since; row
-/// present = stamped), not in the att value: stamps flip on every holder churn — a snapshot
-/// apply touches every fact of every hash it moves — and rewriting ~850-byte fact bodies to
-/// flip 9 bytes was 180 MB of memtable/compaction churn per 200k-holding snapshot (measured:
-/// most of that phase's CPU and its 44x write amplification).
+/// `att` is keyed by ATTESTATION HASH (16 bytes) ‖ hash_part ‖ nar_hash, so key order is
+/// Merkle order: a reconciliation leaf is a contiguous range, repair is a range scan, and a
+/// full dump is the same scan over the whole range. The two secondary indexes map the
+/// lookup identities onto it — and because they hold 16-byte values instead of ~800-byte
+/// attestation bodies, the substituter's working set is the INDEX, which stays cache-resident
+/// long after the fact table stops fitting (measured: a miss costs 1.2 µs against the index
+/// vs 828 µs against the table).
 const CFS: &[&str] = &[
-    "meta", "clocks", "journal", "hold", "holdby", "att", "attby", "stamp", "wm", "mw",
+    "meta", "clocks", "journal", "hold", "holdby", "att", "att_path", "att_nar", "wm", "mw",
 ];
+/// A 256-ary Merkle tree of FIXED depth two over the attestation hashes: 256 coarse buckets,
+/// each with 256 leaves (65536 in all). Depth is a protocol constant, never adaptive — both
+/// ends must address the same leaves, so changing it is a flag day (cheap: the index is
+/// disposable). At 320k facts a leaf holds ~5 attestations (~4 KiB), at 3M ~50 (~45 KiB), so
+/// one differing leaf is always a small range scan.
+const MERKLE_FANOUT: usize = 256;
+
+/// The Merkle aggregates, grown LAZILY: a coarse bucket with no attestations under it is a
+/// stub, not 4 KiB of zeros. An absent subtree and an all-zero one are the same value — XOR
+/// over nothing IS zero — so sparsity costs the protocol nothing and an empty index costs
+/// ~6 KiB instead of a megabyte.
+///
+/// Granularity is the 256-leaf block rather than the individual leaf, deliberately. Because
+/// attestation hashes are uniform, leaves fill fast: at 320k facts ~99% of leaves are already
+/// occupied, so a per-leaf map would store 65k hash-table entries (~3 MiB) to avoid 1 MiB of
+/// array — worse at the scale that matters, better only below a few thousand facts. Block
+/// granularity is strictly better than the flat array everywhere and much better when small.
+///
+/// The root and the coarse level are maintained INCREMENTALLY. They were recomputed per call
+/// before, which cost 78 µs and 43 µs on every sync response — while holding this lock, which
+/// widened the window a reader could block in. Now both are O(1) to read and one extra XOR to
+/// update.
+struct Aggregates {
+    /// 256 coarse blocks of 256 leaves; None = nothing under it.
+    blocks: Vec<Option<Box<[[u8; 16]; MERKLE_FANOUT]>>>,
+    coarse: Vec<[u8; 16]>,
+    root: [u8; 16],
+}
+
+impl Aggregates {
+    fn new() -> Self {
+        Self {
+            blocks: (0..MERKLE_FANOUT).map(|_| None).collect(),
+            coarse: vec![[0u8; 16]; MERKLE_FANOUT],
+            root: [0u8; 16],
+        }
+    }
+
+    /// Fold one attestation hash in or out — XOR is its own inverse, so both are this.
+    fn xor(&mut self, h: &[u8; 16]) {
+        let leaf = leaf_of(h) as usize;
+        let (block, slot) = (leaf >> 8, leaf & 0xff);
+        let cells = self.blocks[block]
+            .get_or_insert_with(|| Box::new([[0u8; 16]; MERKLE_FANOUT]));
+        xor_into(&mut cells[slot], h);
+        xor_into(&mut self.coarse[block], h);
+        xor_into(&mut self.root, h);
+    }
+
+    /// One coarse block's 256 leaves; an unmaterialized block reads as all-empty.
+    fn leaves(&self, block: usize) -> Vec<[u8; 16]> {
+        match &self.blocks[block] {
+            Some(cells) => cells.to_vec(),
+            None => vec![[0u8; 16]; MERKLE_FANOUT],
+        }
+    }
+}
+
+/// Write-lock stripes. Every composite op needs read-modify-write atomicity over ONE key —
+/// an origin's clock and journal, a fact's (hash_part, nar_hash), a (peer, origin) watermark —
+/// and those are disjoint, so one lock per key-space stripe is the right granularity.
+///
+/// This used to be a single store-wide mutex, and that was justified: retention stamps had to
+/// decide "did the LAST holder just leave?", which needs a consistent read across every
+/// origin's holdings. Removing the reaper removed that requirement — no write path reads
+/// cross-key state any more — leaving the global lock as pure over-serialization, which
+/// showed up as concurrent peers' merges queueing behind each other.
+const LOCK_STRIPES: usize = 64;
+
+fn stripe_of(key: &[u8]) -> usize {
+    let h = blake3::hash(key);
+    let b = h.as_bytes();
+    (u16::from_le_bytes([b[0], b[1]]) as usize) % LOCK_STRIPES
+}
 
 pub struct RocksStore {
     db: DB,
-    /// Serializes composite writes; reads are lock-free against atomic batches.
-    write: Mutex<()>,
+    /// Derived state, rebuilt at open from `att_path` (16-byte values = the hashes, so the
+    /// rebuild reads the INDEX, not the ~800-byte bodies). Being derived, it cannot drift
+    /// across a crash.
+    agg: Mutex<Aggregates>,
+    /// Per-stripe write locks (see LOCK_STRIPES); reads never take them.
+    stripes: Vec<Mutex<()>>,
     /// The shared block cache, kept for resizing under memory pressure (mem.rs). `Cache` is a
     /// handle onto one refcounted rocksdb object, so this clone IS the cache the CFs use.
     cache: Cache,
@@ -111,8 +196,7 @@ fn clock_from(b: &[u8]) -> Result<Clock> {
     })
 }
 
-/// Attestation row value: the encoded Attestation, nothing else — the unheld_since stamp
-/// lives in the `stamp` CF (see CFS) so holder churn never rewrites fact bodies.
+/// Attestation row value: the encoded Attestation, nothing else.
 fn att_value(att: &proto::Attestation) -> Vec<u8> {
     att.encode_to_vec()
 }
@@ -121,11 +205,26 @@ fn att_decode(v: &[u8]) -> Result<proto::Attestation> {
     proto::Attestation::decode(v).context("corrupt attestation body")
 }
 
-fn att_key(att: &proto::Attestation) -> Vec<u8> {
-    let mut k = Vec::with_capacity(64);
-    k.extend_from_slice(hash_part_of(&att.store_path).as_bytes());
-    k.extend_from_slice(&att.nar_hash);
+/// The `att` key: attestation hash first, so storage order IS Merkle order.
+fn att_key(att_hash: &[u8; 16], path_key: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(80);
+    k.extend_from_slice(att_hash);
+    k.extend_from_slice(path_key);
     k
+}
+
+/// The `att_nar` key: (nar_hash, hash_part) — the NAR-hash lookup identity.
+fn nar_key(att: &proto::Attestation) -> Vec<u8> {
+    let mut k = Vec::with_capacity(64);
+    k.extend_from_slice(&att.nar_hash);
+    k.extend_from_slice(hash_part_of(&att.store_path).as_bytes());
+    k
+}
+
+fn xor_into(dst: &mut [u8; 16], src: &[u8; 16]) {
+    for (a, b) in dst.iter_mut().zip(src.iter()) {
+        *a ^= *b;
+    }
 }
 
 impl RocksStore {
@@ -159,6 +258,15 @@ impl RocksStore {
                     // accumulating unbounded in the heap.
                     bb.set_cache_index_and_filter_blocks(true);
                     bb.set_pin_l0_filter_and_index_blocks_in_cache(true);
+                    // PARTITIONED, and with the top level pinned. Without this, a filter is
+                    // one monolithic block per SST — ~400 KB once a CF holds a few hundred
+                    // thousand rows — so as soon as the CF outgrows the shared cache, EVERY
+                    // lookup re-reads and decompresses the whole thing. Measured at 320k
+                    // facts with uniformly distributed hash parts: ~830 µs per narinfo
+                    // lookup, hit or miss. Partitioning loads only the relevant few KB.
+                    bb.set_index_type(rocksdb::BlockBasedIndexType::TwoLevelIndexSearch);
+                    bb.set_partition_filters(true);
+                    bb.set_pin_top_level_index_and_filter(true);
                     if HASH_PREFIX_CFS.contains(n) {
                         o.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
                         o.set_memtable_prefix_bloom_ratio(0.2);
@@ -174,11 +282,15 @@ impl RocksStore {
                 .with_context(|| format!("opening rocksdb index at {}", dir.display()))?;
             let store = Self {
                 db,
-                write: Mutex::new(()),
+                stripes: (0..LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
                 cache,
+                agg: Mutex::new(Aggregates::new()),
             };
             match store.meta_get("layout")? {
-                Some(l) if l == LAYOUT => return Ok(store),
+                Some(l) if l == LAYOUT => {
+                    store.rebuild_aggregates()?;
+                    return Ok(store);
+                }
                 None => {
                     store.meta_put("layout", LAYOUT)?;
                     return Ok(store);
@@ -195,6 +307,30 @@ impl RocksStore {
             }
         }
         unreachable!("two attempts always return or bail");
+    }
+
+    /// Lock the stripes covering `keys`, in a global order so two ops that need overlapping
+    /// sets can never deadlock. Returning the guards keeps them held for the caller's scope.
+    fn lock_keys<'a>(
+        &'a self,
+        keys: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Vec<std::sync::MutexGuard<'a, ()>> {
+        let mut idx: Vec<usize> = keys.into_iter().map(stripe_of).collect();
+        idx.sort_unstable();
+        idx.dedup();
+        idx.into_iter()
+            .map(|i| self.stripes[i].lock().unwrap())
+            .collect()
+    }
+
+    /// Lock one key's stripe.
+    fn lock_key(&self, key: &[u8]) -> std::sync::MutexGuard<'_, ()> {
+        self.stripes[stripe_of(key)].lock().unwrap()
+    }
+
+    /// Lock EVERY stripe — for the rare ops whose key set is the whole store.
+    fn lock_all(&self) -> Vec<std::sync::MutexGuard<'_, ()>> {
+        self.stripes.iter().map(|m| m.lock().unwrap()).collect()
     }
 
     fn cf(&self, name: &str) -> &rocksdb::ColumnFamily {
@@ -228,17 +364,6 @@ impl RocksStore {
         self.scan_opt(cf, prefix, ro)
     }
 
-    /// att-CF rows for one store-path hash part; the bloom-accelerated path requires the
-    /// exact 32-byte prefix, anything else (never produced by the proxy, but the trait cannot
-    /// promise it) falls back to a total-order scan.
-    fn scan_att_by_hash_part(&self, hash_part: &str) -> Vec<Kv> {
-        if hash_part.len() == 32 {
-            self.scan_prefix32("att", hash_part.as_bytes())
-        } else {
-            self.scan("att", hash_part.as_bytes())
-        }
-    }
-
     fn scan_opt(&self, cf: &str, prefix: &[u8], ro: ReadOptions) -> Vec<Kv> {
         let mut out = Vec::new();
         // Iterator errors end the scan early, as they always have here.
@@ -251,7 +376,7 @@ impl RocksStore {
 
     /// The streaming core every scan is built on: seek to `from`, then visit rows while their
     /// keys still start with `prefix`, one at a time, WITHOUT materializing the range.
-    /// Full-table walks (claims, dump pages, the reaper) must use this — collecting the att
+    /// Full-table walks (claims, dump pages) must use this — collecting the att
     /// table was measured at ~400 MiB of transient heap at production scale. The visitor
     /// returns false to stop early.
     fn each_opt(
@@ -298,35 +423,9 @@ impl RocksStore {
             .collect()
     }
 
-    /// Stamp (or clear) unheld_since on every attestation of `hash`, into `batch`. Touches
-    /// only the tiny stamp rows — fact bodies are immutable under holder churn.
-    fn restamp(&self, batch: &mut WriteBatch, hash: &[u8; 32], stamp: Option<u64>) -> Result<()> {
-        for (k, _) in self.scan_prefix32("attby", hash) {
-            let hp = &k[32..];
-            let mut skey = hp.to_vec();
-            skey.extend_from_slice(hash);
-            match stamp {
-                // Keep the EARLIEST unheld stamp: write only where none exists.
-                Some(s) => {
-                    if self.db.get_cf(self.cf("stamp"), &skey)?.is_none() {
-                        batch.put_cf(self.cf("stamp"), skey, s.to_be_bytes());
-                    }
-                }
-                None => batch.delete_cf(self.cf("stamp"), skey),
-            }
-        }
-        Ok(())
-    }
-
     /// Fold possession ops into `batch` with their retention side effects. Ops are deduped to
     /// the last op per hash; `origin`'s own row changes are reflected in the holder checks.
-    fn apply_holds(
-        &self,
-        batch: &mut WriteBatch,
-        origin: &str,
-        holds: &[HoldOp],
-        now: u64,
-    ) -> Result<()> {
+    fn apply_holds(&self, batch: &mut WriteBatch, origin: &str, holds: &[HoldOp]) -> Result<()> {
         let mut fin: HashMap<[u8; 32], bool> = HashMap::new(); // true = held after the batch
         for op in holds {
             match op {
@@ -342,86 +441,128 @@ impl RocksStore {
             if held {
                 batch.put_cf(self.cf("hold"), hold_key, b"");
                 batch.put_cf(self.cf("holdby"), holdby_key, b"");
-                self.restamp(batch, &h, None)?;
             } else {
                 batch.delete_cf(self.cf("hold"), hold_key);
                 batch.delete_cf(self.cf("holdby"), holdby_key);
-                if self.holders_of(&h, Some(origin)).is_empty() {
-                    self.restamp(batch, &h, Some(now))?;
-                }
             }
         }
         Ok(())
     }
 
-    /// Fold attestation merges into `batch`; returns how many rows were new or changed.
-    /// `newly_held`/`newly_dropped` bias the holder check for hashes this same batch changes
-    /// for `origin` (the batch is not yet visible to reads).
-    #[allow(clippy::too_many_arguments)]
+    /// Fold attestation merges into `batch`, collecting the attestation hashes that leave
+    /// and enter the tree. Facts are grow-only: signatures union, bodies choose their
+    /// deterministic maximum, nothing is deleted — but a CHANGED fact moves, because its key
+    /// is its hash.
     fn merge_atts(
         &self,
         batch: &mut WriteBatch,
         attests: &[proto::Attestation],
-        newly_held: &HashSet<[u8; 32]>,
-        newly_dropped: &HashSet<[u8; 32]>,
-        origin: Option<&str>,
-        now: u64,
+        delta: &mut Vec<[u8; 16]>,
     ) -> Result<usize> {
-        let mut changed = 0usize;
-        for att in attests {
-            let key = att_key(att);
-            let hash: [u8; 32] = match <[u8; 32]>::try_from(att.nar_hash.as_slice()) {
-                Ok(h) => h,
-                Err(_) => continue, // malformed; the index validates, this is a backstop
-            };
-            let exclude = if newly_dropped.contains(&hash) {
-                origin
-            } else {
-                None
-            };
-            let held = newly_held.contains(&hash) || !self.holders_of(&hash, exclude).is_empty();
-            match self.db.get_cf(self.cf("att"), &key)? {
-                None => {
-                    batch.put_cf(self.cf("att"), &key, att_value(att));
-                    if !held {
-                        batch.put_cf(self.cf("stamp"), &key, now.to_be_bytes());
-                    }
-                    let mut by = hash.to_vec();
-                    by.extend_from_slice(hash_part_of(&att.store_path).as_bytes());
-                    batch.put_cf(self.cf("attby"), by, b"");
-                    changed += 1;
-                }
-                Some(v) => {
-                    let mut cur = att_decode(&v)?;
-                    let before_sigs = cur.sigs.len();
-                    for s in &att.sigs {
-                        if !cur.sigs.contains(s) {
-                            cur.sigs.push(s.clone());
-                        }
-                    }
-                    let body_changed = cur.nar_size != att.nar_size
-                        || cur.references != att.references
-                        || cur.ca != att.ca;
-                    if body_changed {
-                        // Body LWW: any surviving signature must verify over the CURRENT body
-                        // at use time, so a divergent claim can only make itself inert.
-                        cur.nar_size = att.nar_size;
-                        cur.references = att.references.clone();
-                        cur.ca = att.ca.clone();
-                    }
-                    if body_changed || cur.sigs.len() != before_sigs {
-                        batch.put_cf(self.cf("att"), &key, att_value(&cur));
-                        if held {
-                            batch.delete_cf(self.cf("stamp"), &key);
-                        }
-                        changed += 1;
-                    }
-                }
+        // A RocksDB WriteBatch is not visible to `db.get_cf`. Coalesce repeated identities
+        // first, so every database row is read and moved exactly once. Without this overlay,
+        // two attestations for one new identity both observed "absent": exact duplicates
+        // XOR-ed the new hash into the aggregate twice (cancelling it), while differing rows
+        // also left an orphaned `att` key behind the final `att_path` entry.
+        let mut positions: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut coalesced: Vec<(Vec<u8>, proto::Attestation)> = Vec::new();
+        for incoming in attests {
+            if <[u8; 32]>::try_from(incoming.nar_hash.as_slice()).is_err() {
+                continue; // malformed; the index validates, this is a backstop
             }
+            let pk = path_key_of(incoming);
+            if let Some(&i) = positions.get(&pk) {
+                if let Some(merged) = merge_into(Some(coalesced[i].1.clone()), incoming) {
+                    coalesced[i].1 = merged;
+                }
+            } else if let Some(fresh) = merge_into(None, incoming) {
+                positions.insert(pk.clone(), coalesced.len());
+                coalesced.push((pk, fresh));
+            }
+        }
+
+        let mut changed = 0usize;
+        for (pk, incoming) in coalesced {
+            let old = match self.db.get_cf(self.cf("att_path"), &pk)? {
+                Some(raw) => {
+                    let oh: [u8; 16] = raw[..].try_into().context("corrupt att_path row")?;
+                    Some((oh, self.att_at(&raw, &pk)?))
+                }
+                None => None,
+            };
+            let existing = old.as_ref().and_then(|(_, a)| a.clone());
+            let Some(merged) = merge_into(existing, &incoming) else {
+                continue; // exact duplicate: no row change, no tree movement
+            };
+            let nh = attestation_hash(&merged);
+            if old.as_ref().map(|(oh, _)| *oh) == Some(nh) {
+                continue;
+            }
+            if let Some((oh, _)) = old {
+                // The key IS the hash, so a changed fact MOVES.
+                batch.delete_cf(self.cf("att"), att_key(&oh, &pk));
+                delta.push(oh);
+            }
+            batch.put_cf(self.cf("att"), att_key(&nh, &pk), att_value(&merged));
+            batch.put_cf(self.cf("att_path"), &pk, nh);
+            batch.put_cf(self.cf("att_nar"), nar_key(&merged), nh);
+            delta.push(nh);
+            changed += 1;
         }
         Ok(changed)
     }
 
+    /// Commit a batch, then fold its attestation-hash changes into the aggregates.
+    ///
+    /// ORDER IS LOAD-BEARING, in one direction only. XOR-ing before the commit would, on a
+    /// failed write, leave the tree permanently claiming a fact that does not exist — a
+    /// durable lie, until the next restart rebuilds. XOR-ing after can only leave rows
+    /// momentarily ahead of the tree, which makes us UNDER-advertise: a peer concludes we are
+    /// missing something, sends facts we already have, and the merge is a no-op. A wasted
+    /// round trip, self-correcting, and microseconds wide.
+    ///
+    /// The aggregate lock is deliberately NOT held across the write. It was, which made the
+    /// pair atomic to readers — but with striped write locks that single mutex would
+    /// re-serialize every concurrent writer and give back exactly what striping buys. It also
+    /// cost readers a measured 2.45 ms tail, since a root request could land behind a commit.
+    /// Now the critical section is a few XORs.
+    ///
+    /// Nothing durable can half-complete either way: the rocksdb batch is atomic, and the
+    /// aggregates are DERIVED state that a crash discards wholesale (rebuild_aggregates at
+    /// open recomputes them from the committed rows).
+    fn commit_with_delta(
+        &self,
+        batch: WriteBatch,
+        delta: &[[u8; 16]],
+        durable: bool,
+    ) -> Result<()> {
+        if durable {
+            self.db.write_opt(batch, &Self::sync_wo())?;
+        } else {
+            self.db.write(batch)?;
+        }
+        if !delta.is_empty() {
+            let mut agg = self.agg.lock().unwrap();
+            for h in delta {
+                agg.xor(h);
+            }
+        }
+        Ok(())
+    }
+
+    /// Recompute every leaf aggregate from `att_path` (16-byte values = the hashes).
+    fn rebuild_aggregates(&self) -> Result<()> {
+        let mut fresh = Aggregates::new();
+        self.each("att_path", b"", b"", &mut |_, v| {
+            let h: [u8; 16] = v.try_into().context("corrupt att_path row")?;
+            fresh.xor(&h);
+            Ok(true)
+        })?;
+        *self.agg.lock().unwrap() = fresh;
+        Ok(())
+    }
+
+    /// Attach current holders, dropping rows nobody can serve.
     fn lookup_atts(
         &self,
         rows: Vec<proto::Attestation>,
@@ -437,6 +578,18 @@ impl RocksStore {
             }
         }
         Ok(out)
+    }
+
+    /// Fetch one attestation by index entry: the index holds its hash, which with the path
+    /// key IS its `att` key.
+    fn att_at(&self, attestation_hash: &[u8], path_key: &[u8]) -> Result<Option<proto::Attestation>> {
+        let h: [u8; 16] = attestation_hash
+            .try_into()
+            .context("corrupt attestation-hash index entry")?;
+        match self.db.get_cf(self.cf("att"), att_key(&h, path_key))? {
+            Some(v) => Ok(Some(att_decode(&v)?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -457,7 +610,7 @@ impl SyncStore for RocksStore {
     }
 
     fn meta_put(&self, key: &str, value: &str) -> Result<()> {
-        let _g = self.write.lock().unwrap();
+        let _g = self.lock_key(key.as_bytes());
         self.db.put_cf_opt(
             self.cf("meta"),
             key.as_bytes(),
@@ -475,7 +628,7 @@ impl SyncStore for RocksStore {
     }
 
     fn set_generation(&self, origin: &str, generation: u64) -> Result<()> {
-        let _g = self.write.lock().unwrap();
+        let _g = self.lock_key(origin.as_bytes());
         let mut c = self.clock(origin)?;
         c.generation = generation;
         self.db.put_cf_opt(
@@ -495,10 +648,13 @@ impl SyncStore for RocksStore {
         journal: &[(u64, Vec<u8>)],
         holds: &[HoldOp],
         attests: &[proto::Attestation],
-        now: u64,
         durable: bool,
     ) -> Result<bool> {
-        let _g = self.write.lock().unwrap();
+        // This origin's clock, and every fact this batch merges: disjoint from any other
+        // origin's apply, and from merges of other facts.
+        let mut keys: Vec<Vec<u8>> = vec![origin.as_bytes().to_vec()];
+        keys.extend(attests.iter().map(path_key_of));
+        let _g = self.lock_keys(keys.iter().map(|k| k.as_slice()));
         let cur = self.clock(origin)?;
         if (cur.generation, cur.seq) != expect {
             return Ok(false);
@@ -507,34 +663,16 @@ impl SyncStore for RocksStore {
         for (seq, bytes) in journal {
             batch.put_cf(self.cf("journal"), jkey(origin, *seq)?, bytes);
         }
-        let mut newly_held: HashSet<[u8; 32]> = HashSet::new();
-        let mut newly_dropped: HashSet<[u8; 32]> = HashSet::new();
-        for op in holds {
-            match op {
-                HoldOp::Add(h) => newly_held.insert(*h),
-                HoldOp::Drop(h) => newly_dropped.insert(*h),
-            };
-        }
-        self.apply_holds(&mut batch, origin, holds, now)?;
-        self.merge_atts(
-            &mut batch,
-            attests,
-            &newly_held,
-            &newly_dropped,
-            Some(origin),
-            now,
-        )?;
+        self.apply_holds(&mut batch, origin, holds)?;
+        let mut delta = Vec::new();
+        self.merge_atts(&mut batch, attests, &mut delta)?;
         let c = Clock {
             generation: set.0,
             seq: set.1,
             tail_seq: cur.tail_seq,
         };
         batch.put_cf(self.cf("clocks"), okey(origin)?, clock_bytes(c));
-        if durable {
-            self.db.write_opt(batch, &Self::sync_wo())?;
-        } else {
-            self.db.write(batch)?;
-        }
+        self.commit_with_delta(batch, &delta, durable)?;
         Ok(true)
     }
 
@@ -544,9 +682,8 @@ impl SyncStore for RocksStore {
         generation: u64,
         seq: u64,
         held: &[[u8; 32]],
-        now: u64,
     ) -> Result<bool> {
-        let _g = self.write.lock().unwrap();
+        let _g = self.lock_key(origin.as_bytes());
         let cur = self.clock(origin)?;
         if generation < cur.generation || (generation == cur.generation && seq < cur.seq) {
             return Ok(false);
@@ -569,7 +706,7 @@ impl SyncStore for RocksStore {
         // an interrupted apply is simply re-offered by the next pull.
         for chunk in ops.chunks(BATCH_OPS) {
             let mut batch = WriteBatch::default();
-            self.apply_holds(&mut batch, origin, chunk, now)?;
+            self.apply_holds(&mut batch, origin, chunk)?;
             // Snapshot applies are always replicas of OTHER origins: async (see module docs).
             self.db.write(batch)?;
         }
@@ -591,20 +728,15 @@ impl SyncStore for RocksStore {
         Ok(true)
     }
 
-    fn merge_attestations(&self, attests: &[proto::Attestation], now: u64) -> Result<usize> {
-        let _g = self.write.lock().unwrap();
+    fn merge_attestations(&self, attests: &[proto::Attestation]) -> Result<usize> {
+        let keys: Vec<Vec<u8>> = attests.iter().map(path_key_of).collect();
+        let _g = self.lock_keys(keys.iter().map(|k| k.as_slice()));
         let mut batch = WriteBatch::default();
-        let changed = self.merge_atts(
-            &mut batch,
-            attests,
-            &HashSet::new(),
-            &HashSet::new(),
-            None,
-            now,
-        )?;
+        let mut delta = Vec::new();
+        let changed = self.merge_atts(&mut batch, attests, &mut delta)?;
         if changed > 0 {
             // Facts are re-learnable from any snapshot-bearing response: async.
-            self.db.write(batch)?;
+            self.commit_with_delta(batch, &delta, false)?;
         }
         Ok(changed)
     }
@@ -647,6 +779,7 @@ impl SyncStore for RocksStore {
 
     fn attestation_page(
         &self,
+        prefix: &[u8],
         cursor: &[u8],
         max_bytes: usize,
     ) -> Result<(Vec<proto::Attestation>, Option<Vec<u8>>)> {
@@ -654,7 +787,10 @@ impl SyncStore for RocksStore {
         let mut used = 0usize;
         let mut last_key: Vec<u8> = Vec::new();
         let mut more = false;
-        self.each("att", cursor, b"", &mut |k, v| {
+        // Seek to the cursor when resuming, else to the start of the subtree; either way the
+        // walk stops at the first key outside `prefix`.
+        let from = if cursor.is_empty() { prefix } else { cursor };
+        self.each("att", from, prefix, &mut |k, v| {
             if k == cursor {
                 return Ok(true); // the seek is inclusive; resume strictly after
             }
@@ -673,7 +809,7 @@ impl SyncStore for RocksStore {
     }
 
     fn compact_journal(&self, origin: &str, floor: u64) -> Result<()> {
-        let _g = self.write.lock().unwrap();
+        let _g = self.lock_key(origin.as_bytes());
         let mut c = self.clock(origin)?;
         if floor <= c.tail_seq {
             return Ok(());
@@ -702,41 +838,8 @@ impl SyncStore for RocksStore {
         Ok(())
     }
 
-    fn reap_attestations(&self, cutoff: u64) -> Result<usize> {
-        let _g = self.write.lock().unwrap();
-        let mut batch = WriteBatch::default();
-        let mut reaped = 0usize;
-        // Only the stamp CF is read: one tiny row per UNHELD fact, so the pass costs nothing
-        // on a healthy mesh however large the fact table is. (Streaming walk — the iterator
-        // reads a consistent snapshot, so deleting behind it is safe — with bounded batches.)
-        self.each("stamp", b"", b"", &mut |k, v| {
-            if v.len() != 8 || k.len() != 64 {
-                bail!("corrupt stamp row ({}B key, {}B value)", k.len(), v.len());
-            }
-            let s = u64::from_be_bytes(<[u8; 8]>::try_from(v).unwrap());
-            if s <= cutoff {
-                // att key = hash_part ++ nar_hash; the attby key is the swap.
-                let (hp, nh) = k.split_at(32);
-                let mut by = nh.to_vec();
-                by.extend_from_slice(hp);
-                batch.delete_cf(self.cf("att"), k);
-                batch.delete_cf(self.cf("attby"), by);
-                batch.delete_cf(self.cf("stamp"), k);
-                reaped += 1;
-                if batch.len() >= BATCH_OPS {
-                    self.db.write(std::mem::take(&mut batch))?;
-                }
-            }
-            Ok(true)
-        })?;
-        if !batch.is_empty() {
-            self.db.write(batch)?;
-        }
-        Ok(reaped)
-    }
-
-    fn retain_origins(&self, keep: &[String], now: u64) -> Result<()> {
-        let _g = self.write.lock().unwrap();
+    fn retain_origins(&self, keep: &[String]) -> Result<()> {
+        let _g = self.lock_all();
         let keep: HashSet<&str> = keep.iter().map(String::as_str).collect();
         let departed: Vec<String> = self
             .scan("clocks", b"")
@@ -754,9 +857,6 @@ impl SyncStore for RocksStore {
                 by.extend_from_slice(origin.as_bytes());
                 batch.delete_cf(self.cf("hold"), k);
                 batch.delete_cf(self.cf("holdby"), by);
-                if self.holders_of(&h, Some(origin)).is_empty() {
-                    self.restamp(&mut batch, &h, Some(now))?;
-                }
                 if batch.len() >= BATCH_OPS {
                     self.db.write(std::mem::take(&mut batch))?;
                 }
@@ -784,11 +884,20 @@ impl SyncStore for RocksStore {
     }
 
     fn lookup_hash_part(&self, hash_part: &str) -> Result<Vec<(proto::Attestation, Vec<String>)>> {
-        let rows = self
-            .scan_att_by_hash_part(hash_part)
-            .into_iter()
-            .map(|(_, v)| att_decode(&v))
-            .collect::<Result<Vec<_>>>()?;
+        // Through att_path: 16-byte values keep this index cache-resident long after the
+        // attestation bodies stop fitting, which is what keeps a MISS in the microseconds.
+        let hp = hash_part.as_bytes();
+        let entries = if hp.len() == 32 {
+            self.scan_prefix32("att_path", hp)
+        } else {
+            self.scan("att_path", hp)
+        };
+        let mut rows = Vec::new();
+        for (pk, h) in entries {
+            if let Some(att) = self.att_at(&h, &pk)? {
+                rows.push(att);
+            }
+        }
         self.lookup_atts(rows)
     }
 
@@ -797,11 +906,12 @@ impl SyncStore for RocksStore {
         nar_hash: &[u8; 32],
     ) -> Result<Vec<(proto::Attestation, Vec<String>)>> {
         let mut rows = Vec::new();
-        for (k, _) in self.scan_prefix32("attby", nar_hash) {
-            let mut akey = k[32..].to_vec();
-            akey.extend_from_slice(nar_hash);
-            if let Some(v) = self.db.get_cf(self.cf("att"), &akey)? {
-                rows.push(att_decode(&v)?);
+        // att_nar is keyed (nar_hash, hash_part); the path key is the other order.
+        for (k, h) in self.scan_prefix32("att_nar", nar_hash) {
+            let mut pk = k[32..].to_vec();
+            pk.extend_from_slice(nar_hash);
+            if let Some(att) = self.att_at(&h, &pk)? {
+                rows.push(att);
             }
         }
         self.lookup_atts(rows)
@@ -830,11 +940,13 @@ impl SyncStore for RocksStore {
     }
 
     fn attestation_sigs(&self, hash_part: &str, nar_hash: &[u8]) -> Result<Option<Vec<String>>> {
-        let mut key = Vec::with_capacity(64);
-        key.extend_from_slice(hash_part.as_bytes());
-        key.extend_from_slice(nar_hash);
-        match self.db.get_cf(self.cf("att"), &key)? {
-            Some(v) => Ok(Some(att_decode(&v)?.sigs)),
+        // The path key addresses att_path, which holds the attestation hash that (with the
+        // path key) addresses the fact itself.
+        let mut pk = Vec::with_capacity(64);
+        pk.extend_from_slice(hash_part.as_bytes());
+        pk.extend_from_slice(nar_hash);
+        match self.db.get_cf(self.cf("att_path"), &pk)? {
+            Some(h) => Ok(self.att_at(&h, &pk)?.map(|a| a.sigs)),
             None => Ok(None),
         }
     }
@@ -846,7 +958,8 @@ impl SyncStore for RocksStore {
     }
 
     fn advance_watermark(&self, peer: &str, origin: &str, seq: u64) -> Result<()> {
-        let _g = self.write.lock().unwrap();
+        let key = format!("{peer}\u{0}{origin}");
+        let _g = self.lock_key(key.as_bytes());
         let mut key = okey(peer)?;
         key.extend_from_slice(origin.as_bytes());
         let cur = self
@@ -875,7 +988,7 @@ impl SyncStore for RocksStore {
     }
 
     fn mw_save(&self, rows: &[(String, f64)], updated: u64, globals: &str) -> Result<()> {
-        let _g = self.write.lock().unwrap();
+        let _g = self.lock_all();
         let mut batch = WriteBatch::default();
         for (peer, w) in rows {
             let mut v = Vec::with_capacity(16);
@@ -903,7 +1016,7 @@ impl SyncStore for RocksStore {
     }
 
     fn mw_prune(&self, keep: &[String]) -> Result<()> {
-        let _g = self.write.lock().unwrap();
+        let _g = self.lock_all();
         let keep: HashSet<&str> = keep.iter().map(String::as_str).collect();
         let mut batch = WriteBatch::default();
         for (k, _) in self.scan("mw", b"") {
@@ -919,7 +1032,7 @@ impl SyncStore for RocksStore {
     }
 
     fn mw_shift_updated(&self, secs: i64) -> Result<()> {
-        let _g = self.write.lock().unwrap();
+        let _g = self.lock_all();
         let mut batch = WriteBatch::default();
         for (k, v) in self.scan("mw", b"") {
             let w = &v[..8];
@@ -953,11 +1066,33 @@ impl SyncStore for RocksStore {
 
     fn count_attestations(&self) -> Result<u64> {
         let mut n = 0u64;
-        self.each("att", b"", b"", &mut |_, _| {
+        // att_path, not att: one 16-byte row per fact instead of an ~800-byte body.
+        self.each("att_path", b"", b"", &mut |_, _| {
             n += 1;
             Ok(true)
         })?;
         Ok(n)
+    }
+
+    fn merkle_root(&self) -> Result<[u8; 16]> {
+        Ok(self.agg.lock().unwrap().root)
+    }
+
+    fn merkle_children(&self, prefix: &[u8]) -> Result<Vec<[u8; 16]>> {
+        let agg = self.agg.lock().unwrap();
+        match prefix.len() {
+            0 => Ok(agg.coarse.clone()),
+            1 => Ok(agg.leaves(prefix[0] as usize)),
+            n => bail!("merkle tree is depth two; cannot expand a {n}-byte prefix"),
+        }
+    }
+
+    #[cfg(test)]
+    fn compact_for_bench(&self) {
+        for name in CFS {
+            self.db
+                .compact_range_cf(self.cf(name), None::<&[u8]>, None::<&[u8]>);
+        }
     }
 
     fn cache_ceiling(&self) -> u64 {
@@ -991,6 +1126,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = RocksStore::open(dir.path()).unwrap();
         crate::store::bench::run("rocksdb", &s);
+    }
+
+    #[test]
+    #[ignore] // measurement bench: cargo test --release -- --ignored --nocapture bench_merkle
+    fn bench_merkle() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = RocksStore::open(dir.path()).unwrap();
+        crate::store::bench::run_merkle("rocksdb", &s);
     }
 
     #[test]

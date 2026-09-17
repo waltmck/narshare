@@ -1,9 +1,8 @@
 //! The postgres index backend: the shared-table design in its native habitat.
 //!
 //! Atomicity is a SQL transaction per composite op; same-origin apply races are arbitrated by
-//! `SELECT … FOR UPDATE` on the clock row, and cross-origin races on retention stamps (the
-//! "did the LAST holder just leave?" check) are serialized per nar-hash with transaction-scoped
-//! advisory locks — row locks alone cannot close that phantom. Signature union is a plain
+//! `SELECT … FOR UPDATE` on the clock row. Possession rows are independent per (origin, hash),
+//! so they need no cross-row serialization now that facts carry no holder-derived state. Signature union is a plain
 //! array append of previously-unseen entries inside the upsert, so concurrent attestation
 //! merges compose without any read-modify-write in the client.
 //!
@@ -21,7 +20,9 @@
 //! Everything lives in one schema (default "narshare"); layout versioning is wipe-and-resync
 //! via `DROP SCHEMA … CASCADE` on a `layout` marker mismatch.
 
-use super::{hash_part_of, Clock, HoldOp, SyncStore};
+use super::{
+    attestation_hash, hash_part_of, leaf_of, merge_into, Clock, HoldOp, SyncStore,
+};
 use crate::index::proto;
 use anyhow::{bail, Context, Result};
 use postgres::types::Type;
@@ -29,10 +30,13 @@ use postgres::{Client, NoTls, Statement, Transaction};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-const LAYOUT: &str = "narshare-pg-1";
+const LAYOUT: &str = "narshare-pg-3";
 /// Idle connections kept for reuse; excess connects are dropped on return. Lookups and applies
 /// already serialize per call site, so a small pool covers the real concurrency.
 const POOL_MAX: usize = 4;
+/// The reconciliation tree's shape — a protocol constant, identical in every backend.
+const MERKLE_LEAVES: i32 = 1 << 16;
+const MERKLE_FANOUT: i32 = 256;
 
 pub struct PgStore {
     url: String,
@@ -70,6 +74,14 @@ impl std::ops::DerefMut for PooledConn {
     fn deref_mut(&mut self) -> &mut Client {
         &mut self.client
     }
+}
+
+/// Reassemble an attestation hash from the two bigints the aggregates are computed over.
+fn halves_to_hash(hi: i64, lo: i64) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&hi.to_be_bytes());
+    out[8..].copy_from_slice(&lo.to_be_bytes());
+    out
 }
 
 fn i2u(v: i64) -> u64 {
@@ -134,9 +146,7 @@ fn lock_clock(tx: &mut Transaction<'_>, origin: &str) -> Result<Clock> {
 /// tens of thousands of times, and re-parsing per row dominated the ingest bench.
 struct HoldStmts {
     add: Statement,
-    clear: Statement,
     del: Statement,
-    stamp: Statement,
 }
 
 fn hold_stmts(tx: &mut Transaction<'_>) -> Result<HoldStmts> {
@@ -144,112 +154,33 @@ fn hold_stmts(tx: &mut Transaction<'_>) -> Result<HoldStmts> {
         add: tx.prepare(
             "INSERT INTO holdings (origin, nar_hash) VALUES ($1, $2) ON CONFLICT DO NOTHING",
         )?,
-        clear: tx.prepare(
-            "UPDATE attestations SET unheld_since = NULL
-             WHERE nar_hash = $1 AND unheld_since IS NOT NULL",
-        )?,
         del: tx.prepare("DELETE FROM holdings WHERE origin = $1 AND nar_hash = $2")?,
-        // Keep the EARLIEST unheld stamp; only stamp when the last holder just left.
-        stamp: tx.prepare(
-            "UPDATE attestations SET unheld_since = $2
-             WHERE nar_hash = $1 AND unheld_since IS NULL
-               AND NOT EXISTS (SELECT 1 FROM holdings h WHERE h.nar_hash = $1)",
-        )?,
     })
 }
 
-/// Materialize one possession change with its retention side effects. The transaction sees its
-/// own prior writes, so batched Add/Drop sequences compose naturally.
+/// Materialize one possession change. The transaction sees its own prior writes, so batched
+/// Add/Drop sequences compose naturally.
 fn apply_hold(
     tx: &mut Transaction<'_>,
     st: &HoldStmts,
     origin: &str,
     op: &HoldOp,
-    now: u64,
 ) -> Result<()> {
     match op {
         HoldOp::Add(h) => {
-            let h = &h[..];
-            tx.execute(&st.add, &[&origin, &h])?;
-            tx.execute(&st.clear, &[&h])?;
+            tx.execute(&st.add, &[&origin, &&h[..]])?;
         }
         HoldOp::Drop(h) => {
-            let h = &h[..];
-            tx.execute(&st.del, &[&origin, &h])?;
-            tx.execute(&st.stamp, &[&h, &u2i(now)])?;
+            tx.execute(&st.del, &[&origin, &&h[..]])?;
         }
     }
     Ok(())
 }
 
-/// The fact-upsert statement, prepared once per transaction (bulk merges execute it per row).
-fn merge_stmt(tx: &mut Transaction<'_>) -> Result<Statement> {
-    tx.prepare(
-        "INSERT INTO attestations
-             (hash_part, nar_hash, store_path, nar_size, refs, ca, sigs, unheld_since)
-         VALUES ($1, $2, $3, $4, $5, $6, $7,
-                 CASE WHEN EXISTS (SELECT 1 FROM holdings h WHERE h.nar_hash = $2)
-                      THEN NULL ELSE $8::int8 END)
-         ON CONFLICT (hash_part, nar_hash) DO UPDATE SET
-             store_path = EXCLUDED.store_path,
-             nar_size   = EXCLUDED.nar_size,
-             refs       = EXCLUDED.refs,
-             ca         = EXCLUDED.ca,
-             sigs       = attestations.sigs ||
-                 (SELECT COALESCE(array_agg(s), '{}') FROM unnest(EXCLUDED.sigs) s
-                  WHERE s <> ALL (attestations.sigs))
-         WHERE attestations.nar_size IS DISTINCT FROM EXCLUDED.nar_size
-            OR attestations.refs <> EXCLUDED.refs
-            OR attestations.ca <> EXCLUDED.ca
-            OR EXISTS (SELECT 1 FROM unnest(EXCLUDED.sigs) s
-                       WHERE s <> ALL (attestations.sigs))",
-    )
-    .map_err(Into::into)
-}
-
-/// Upsert one attestation fact: body last-writer-wins, sigs union (existing order kept,
-/// unseen entries appended), fresh rows stamped unless their hash is held. Returns whether
-/// the row was new or changed.
-fn merge_att(
-    tx: &mut Transaction<'_>,
-    st: &Statement,
-    att: &proto::Attestation,
-    now: u64,
-) -> Result<bool> {
-    let hp = hash_part_of(&att.store_path).to_owned();
-    let n = tx.execute(
-        st,
-        &[
-            &hp,
-            &&att.nar_hash[..],
-            &att.store_path,
-            &u2i(att.nar_size),
-            &att.references,
-            &att.ca,
-            &att.sigs,
-            &u2i(now),
-        ],
-    )?;
-    Ok(n > 0)
-}
-
-fn row_to_att(row: &postgres::Row) -> proto::Attestation {
-    proto::Attestation {
-        store_path: row.get(0),
-        nar_hash: row.get::<_, Vec<u8>>(1),
-        nar_size: i2u(row.get(2)),
-        references: row.get(3),
-        ca: row.get(4),
-        sigs: row.get(5),
-    }
-}
-
-const ATT_COLS: &str = "store_path, nar_hash, nar_size, refs, ca, sigs";
-
-/// Fact-dump cursor: the (hash_part, nar_hash) primary key of the last row served, as
-/// hash_part's 32 utf8 bytes followed by the 32 hash bytes. Opaque outside this backend; a
-/// malformed cursor (never produced by us, but the wire cannot promise one) degrades to a
-/// dump from the start — over-delivery, which grow-only dedup absorbs.
+/// Dump cursor: the (hash_part, nar_hash) primary key of the last row served. Opaque outside
+/// this backend — only the responder that issued it ever interprets it — so paging in primary
+/// key order here is fine even though rocksdb pages in attestation-hash order. A malformed
+/// cursor degrades to a dump from the start, which grow-only dedup absorbs.
 fn split_cursor(cursor: &[u8]) -> (String, Vec<u8>) {
     if cursor.len() < 32 {
         return (String::new(), Vec::new());
@@ -265,6 +196,100 @@ fn join_cursor(hash_part: &str, nar_hash: &[u8]) -> Vec<u8> {
     c.extend_from_slice(hash_part.as_bytes());
     c.extend_from_slice(nar_hash);
     c
+}
+
+fn row_to_att(row: &postgres::Row) -> proto::Attestation {
+    proto::Attestation {
+        store_path: row.get(0),
+        nar_hash: row.get(1),
+        nar_size: i2u(row.get(2)),
+        references: row.get(3),
+        ca: row.get(4),
+        sigs: row.get(5),
+    }
+}
+
+const ATT_COLS: &str = "store_path, nar_hash, nar_size, refs, ca, sigs";
+
+/// Fold one attestation hash into the maintained aggregates. XOR is its own inverse, so this
+/// both adds and removes. The ROOT is deliberately not a stored row: it would be one hot row
+/// every fact write contends on, and a 256-row aggregate over level 1 costs nothing instead.
+fn agg_xor(tx: &mut Transaction<'_>, h: &[u8; 16]) -> Result<()> {
+    let leaf = leaf_of(h) as i32;
+    let hi = i64::from_be_bytes(<[u8; 8]>::try_from(&h[..8]).unwrap());
+    let lo = i64::from_be_bytes(<[u8; 8]>::try_from(&h[8..]).unwrap());
+    for (level, node) in [(2i16, leaf), (1i16, leaf >> 8)] {
+        tx.execute(
+            "INSERT INTO att_agg (level, node, hi, lo) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (level, node) DO UPDATE
+                 SET hi = att_agg.hi # EXCLUDED.hi, lo = att_agg.lo # EXCLUDED.lo",
+            &[&level, &node, &hi, &lo],
+        )?;
+    }
+    Ok(())
+}
+
+/// Merge one attestation: read the current row, merge in Rust (shared with every other
+/// backend, so the canonical form and its hash are identical mesh-wide), write it back with
+/// the attestation hash split into the two bigints the aggregates are computed over.
+///
+/// Client-side read-modify-write, deliberately: the SQL upsert this replaced could union
+/// signature arrays, but not put them in a canonical ORDER, and two nodes that disagree on
+/// the encoding of the same logical fact would hash it differently and never converge.
+fn merge_att(tx: &mut Transaction<'_>, att: &proto::Attestation) -> Result<bool> {
+    let hp = hash_part_of(&att.store_path).to_owned();
+    let row = tx.query_opt(
+        "SELECT store_path, nar_size, refs, ca, sigs, h_hi, h_lo FROM attestations
+         WHERE hash_part = $1 AND nar_hash = $2 FOR UPDATE",
+        &[&hp, &&att.nar_hash[..]],
+    )?;
+    let old_hash = row.as_ref().map(|r| halves_to_hash(r.get(5), r.get(6)));
+    let existing = row.as_ref().map(|r| proto::Attestation {
+        store_path: r.get(0),
+        nar_hash: att.nar_hash.clone(),
+        nar_size: i2u(r.get(1)),
+        references: r.get(2),
+        ca: r.get(3),
+        sigs: r.get(4),
+    });
+    let Some(merged) = merge_into(existing, att) else {
+        return Ok(false);
+    };
+    let h = attestation_hash(&merged);
+    if old_hash == Some(h) {
+        return Ok(false); // identical content arriving by another route: nothing moves
+    }
+    let leaf = leaf_of(&h) as i32;
+    let hi = i64::from_be_bytes(<[u8; 8]>::try_from(&h[..8]).unwrap());
+    let lo = i64::from_be_bytes(<[u8; 8]>::try_from(&h[8..]).unwrap());
+    tx.execute(
+        "INSERT INTO attestations
+             (hash_part, nar_hash, store_path, nar_size, refs, ca, sigs, leaf, h_hi, h_lo)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (hash_part, nar_hash) DO UPDATE SET
+             store_path = EXCLUDED.store_path, nar_size = EXCLUDED.nar_size,
+             refs = EXCLUDED.refs, ca = EXCLUDED.ca, sigs = EXCLUDED.sigs,
+             leaf = EXCLUDED.leaf, h_hi = EXCLUDED.h_hi, h_lo = EXCLUDED.h_lo",
+        &[
+            &hp,
+            &&merged.nar_hash[..],
+            &merged.store_path,
+            &u2i(merged.nar_size),
+            &merged.references,
+            &merged.ca,
+            &merged.sigs,
+            &leaf,
+            &hi,
+            &lo,
+        ],
+    )?;
+    // Same transaction as the row: the tree cannot describe a set that was not committed,
+    // nor miss one that was.
+    if let Some(old) = old_hash {
+        agg_xor(tx, &old)?;
+    }
+    agg_xor(tx, &h)?;
+    Ok(true)
 }
 
 impl PgStore {
@@ -352,9 +377,18 @@ impl PgStore {
              {t} attestations (hash_part text NOT NULL, nar_hash bytea NOT NULL,
                                store_path text NOT NULL, nar_size int8 NOT NULL,
                                refs text[] NOT NULL, ca text NOT NULL, sigs text[] NOT NULL,
-                               unheld_since int8,
+                               leaf int NOT NULL, h_hi int8 NOT NULL, h_lo int8 NOT NULL,
                                PRIMARY KEY (hash_part, nar_hash));
              CREATE INDEX IF NOT EXISTS attestations_by_hash ON attestations (nar_hash);
+             CREATE INDEX IF NOT EXISTS attestations_by_leaf ON attestations (leaf);
+             -- The Merkle aggregates, MAINTAINED rather than recomputed: one row per
+             -- non-empty node (level 2 = leaf, level 1 = coarse), XOR-merged in the SAME
+             -- transaction as the fact write. Recomputing meant a table aggregate per
+             -- response; this makes the root and a descent 256-row reads at any table size.
+             -- Sparse by construction: an unwritten node has no row, and absent == zero.
+             {t} att_agg (level int2 NOT NULL, node int NOT NULL,
+                          hi int8 NOT NULL, lo int8 NOT NULL,
+                          PRIMARY KEY (level, node));
              {t} watermarks (peer text NOT NULL, origin text NOT NULL, seq int8 NOT NULL,
                              PRIMARY KEY (peer, origin));
              {t} mw_state (peer text PRIMARY KEY, weight float8 NOT NULL, updated int8 NOT NULL);
@@ -429,7 +463,6 @@ impl SyncStore for PgStore {
         journal: &[(u64, Vec<u8>)],
         holds: &[HoldOp],
         attests: &[proto::Attestation],
-        now: u64,
         durable: bool,
     ) -> Result<bool> {
         self.with_conn(|c| {
@@ -457,11 +490,10 @@ impl SyncStore for PgStore {
             }
             let hst = hold_stmts(&mut tx)?;
             for op in holds {
-                apply_hold(&mut tx, &hst, origin, op, now)?;
+                apply_hold(&mut tx, &hst, origin, op)?;
             }
-            let mst = merge_stmt(&mut tx)?;
             for att in attests {
-                merge_att(&mut tx, &mst, att, now)?;
+                merge_att(&mut tx, att)?;
             }
             tx.execute(
                 "UPDATE clocks SET generation = $2, seq = $3 WHERE origin = $1",
@@ -478,7 +510,6 @@ impl SyncStore for PgStore {
         generation: u64,
         seq: u64,
         held: &[[u8; 32]],
-        now: u64,
     ) -> Result<bool> {
         self.with_conn(|c| {
             let mut tx = c.transaction()?;
@@ -499,11 +530,11 @@ impl SyncStore for PgStore {
             let hst = hold_stmts(&mut tx)?;
             for h in old.difference(&new) {
                 let h32 = <[u8; 32]>::try_from(&h[..]).context("corrupt holding row")?;
-                apply_hold(&mut tx, &hst, origin, &HoldOp::Drop(h32), now)?;
+                apply_hold(&mut tx, &hst, origin, &HoldOp::Drop(h32))?;
             }
             for h in new.difference(&old) {
                 let h32 = <[u8; 32]>::try_from(&h[..]).unwrap();
-                apply_hold(&mut tx, &hst, origin, &HoldOp::Add(h32), now)?;
+                apply_hold(&mut tx, &hst, origin, &HoldOp::Add(h32))?;
             }
             tx.execute("DELETE FROM journal WHERE origin = $1", &[&origin])?;
             tx.execute(
@@ -515,14 +546,13 @@ impl SyncStore for PgStore {
         })
     }
 
-    fn merge_attestations(&self, attests: &[proto::Attestation], now: u64) -> Result<usize> {
+    fn merge_attestations(&self, attests: &[proto::Attestation]) -> Result<usize> {
         self.with_conn(|c| {
             let mut tx = c.transaction()?;
             lock_hashes(&mut tx, attests.iter().map(|a| &a.nar_hash[..]))?;
-            let mst = merge_stmt(&mut tx)?;
             let mut changed = 0usize;
             for att in attests {
-                changed += merge_att(&mut tx, &mst, att, now)? as usize;
+                changed += merge_att(&mut tx, att)? as usize;
             }
             tx.commit()?;
             Ok(changed)
@@ -568,25 +598,40 @@ impl SyncStore for PgStore {
 
     fn attestation_page(
         &self,
+        prefix: &[u8],
         cursor: &[u8],
         max_bytes: usize,
     ) -> Result<(Vec<proto::Attestation>, Option<Vec<u8>>)> {
         use prost::Message as _;
         const FETCH: i64 = 1024;
+        // The Merkle node as a leaf range — this backend keys rows by path identity, so the
+        // subtree is expressed as a filter rather than a key range, but it selects exactly
+        // the same attestations as the rocksdb range scan does.
+        let (leaf_lo, leaf_hi): (i32, i32) = match prefix.len() {
+            0 => (0, MERKLE_LEAVES),
+            1 => {
+                let base = prefix[0] as i32 * MERKLE_FANOUT;
+                (base, base + MERKLE_FANOUT)
+            }
+            2 => {
+                let leaf = u16::from_be_bytes([prefix[0], prefix[1]]) as i32;
+                (leaf, leaf + 1)
+            }
+            n => bail!("merkle tree is depth two; cannot address a {n}-byte prefix"),
+        };
         let (mut hp, mut nh) = split_cursor(cursor);
         self.with_conn(|c| {
             let mut page: Vec<proto::Attestation> = Vec::new();
             let mut used = 0usize;
             loop {
-                // Keyset pagination on the primary key: O(FETCH) client memory per round,
-                // index-ordered on the server, valid across concurrent merges and reaps.
                 let rows = c.query(
                     &format!(
                         "SELECT {ATT_COLS}, hash_part FROM attestations
                          WHERE (hash_part, nar_hash) > ($1, $2)
-                         ORDER BY hash_part, nar_hash LIMIT $3"
+                           AND leaf >= $3 AND leaf < $4
+                         ORDER BY hash_part, nar_hash LIMIT $5"
                     ),
-                    &[&hp, &nh, &FETCH],
+                    &[&hp, &nh, &leaf_lo, &leaf_hi, &FETCH],
                 )?;
                 let exhausted = rows.len() < FETCH as usize;
                 for r in &rows {
@@ -627,16 +672,7 @@ impl SyncStore for PgStore {
         })
     }
 
-    fn reap_attestations(&self, cutoff: u64) -> Result<usize> {
-        self.with_conn(|c| {
-            Ok(c.execute(
-                "DELETE FROM attestations WHERE unheld_since IS NOT NULL AND unheld_since <= $1",
-                &[&u2i(cutoff)],
-            )? as usize)
-        })
-    }
-
-    fn retain_origins(&self, keep: &[String], now: u64) -> Result<()> {
+    fn retain_origins(&self, keep: &[String]) -> Result<()> {
         let keep: Vec<String> = keep.to_vec();
         self.with_conn(|c| {
             let mut tx = c.transaction()?;
@@ -659,7 +695,7 @@ impl SyncStore for PgStore {
                 let hst = hold_stmts(&mut tx)?;
                 for h in held {
                     let h32 = <[u8; 32]>::try_from(&h[..]).context("corrupt holding row")?;
-                    apply_hold(&mut tx, &hst, origin, &HoldOp::Drop(h32), now)?;
+                    apply_hold(&mut tx, &hst, origin, &HoldOp::Drop(h32))?;
                 }
                 tx.execute("DELETE FROM journal WHERE origin = $1", &[origin])?;
                 tx.execute("DELETE FROM clocks WHERE origin = $1", &[origin])?;
@@ -866,6 +902,43 @@ impl SyncStore for PgStore {
                 )?
                 .get(0);
             Ok((j as u64, h as u64))
+        })
+    }
+
+    fn merkle_root(&self) -> Result<[u8; 16]> {
+        // 256 rows at most — never the fact table.
+        self.with_conn(|c| {
+            let row = c.query_one(
+                "SELECT COALESCE(bit_xor(hi), 0), COALESCE(bit_xor(lo), 0)
+                 FROM att_agg WHERE level = 1",
+                &[],
+            )?;
+            Ok(halves_to_hash(row.get(0), row.get(1)))
+        })
+    }
+
+    fn merkle_children(&self, prefix: &[u8]) -> Result<Vec<[u8; 16]>> {
+        // Read from the maintained rows: no cache to go stale (this backend is SHARED between
+        // processes, and a stale aggregate that happened to match would read as "in sync" —
+        // the one failure worse than no reconciliation) and no table aggregate either.
+        let (level, lo, hi): (i16, i32, i32) = match prefix.len() {
+            0 => (1, 0, MERKLE_FANOUT),
+            1 => {
+                let base = prefix[0] as i32 * MERKLE_FANOUT;
+                (2, base, base + MERKLE_FANOUT)
+            }
+            n => bail!("merkle tree is depth two; cannot expand a {n}-byte prefix"),
+        };
+        self.with_conn(|c| {
+            let mut out = vec![[0u8; 16]; MERKLE_FANOUT as usize];
+            for r in c.query(
+                "SELECT node, hi, lo FROM att_agg WHERE level = $1 AND node >= $2 AND node < $3",
+                &[&level, &lo, &hi],
+            )? {
+                let node: i32 = r.get(0);
+                out[(node - lo) as usize] = halves_to_hash(r.get(1), r.get(2));
+            }
+            Ok(out)
         })
     }
 

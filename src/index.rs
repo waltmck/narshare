@@ -14,8 +14,8 @@
 //! (store path, NAR hash) with signature sets unioned. Because facts outlive holdings, a
 //! signature survives holder churn: a node that GC'd a path re-substitutes it later — from a
 //! peer that copied it, or one that rebuilt it bit-identically — under its own old signature.
-//! Retention is the held-plus-grace policy: a fact whose hash nobody has held for the grace
-//! window is reaped.
+//! Facts are never deleted: the set is exactly grow-only, which is what lets two nodes
+//! reconcile it by comparing hashes.
 //!
 //! Trust is enforced at USE, not at ingestion: any well-formed attestation is stored and
 //! relayed verbatim (it is journaled at its origin either way), and lookups re-verify — CA, or
@@ -70,6 +70,11 @@ const RANGE_BYTES_CAP: usize = 2 << 20;
 /// Range asks answered per request — the engine's window never comes close, and a broken
 /// peer must not be able to ask for unbounded work in one exchange.
 const RANGE_ASKS_MAX: usize = 16;
+/// Merkle asks answered per request — bounds what a peer can make us do in one exchange; a
+/// reconciliation needing more simply takes more rounds, at a round trip each.
+pub(crate) const MERKLE_ASKS_MAX: usize = 8;
+/// Byte cap on the attestations one merkle response carries (one subtree page).
+const MERKLE_FACTS_CAP: usize = 4 << 20;
 /// Soft byte budget for one WHOLE sync response (suffix events + snapshot hashes + the
 /// attestation dump, encoded). Origins that would overflow it are deferred with an empty
 /// truncated suffix and picked up by the puller's truncated loop next round.
@@ -86,17 +91,13 @@ pub struct Index {
     origin_set: HashSet<String>,
     peer_names: Vec<String>,
     trusted: TrustedKeys,
-    /// How long an attestation outlives its last holder.
-    grace: Duration,
     /// Serializes ALL self-origin exports (differ + serve-side retractions): the store's
     /// expect-gate would only detect the race and bail; this prevents it.
     self_write: Mutex<()>,
-    /// Pacing for the maintenance pass: sync traffic calls maybe_compact() on every
-    /// request/pull, but journal floors move at most once a minute and the attestation
-    /// reaper — a full-table scan — at most every ten. Unpaced compact() stays for tests
-    /// and for callers that just did something reap-worthy.
+    /// Pacing for the maintenance pass: sync traffic calls maybe_compact() on every request
+    /// and pull, but journal floors move at most once a minute. Unpaced compact() stays for
+    /// tests and for callers that just did something worth compacting.
     last_compact: Mutex<Option<std::time::Instant>>,
-    last_reap: Mutex<Option<std::time::Instant>>,
     /// Deriver drv path -> "may this output be substituted" verdict cache. Reading and
     /// scanning a drv file happens at most once per deriver per process lifetime; without the
     /// cache, paths filtered by allowSubstitutes=false would re-read their drv on every diff
@@ -148,12 +149,26 @@ pub enum Apply {
 /// cursor for the following page; None when the dump is complete. Paged so that neither side
 /// ever holds the whole fact table in memory: the dump is O(mesh) and materializing it was
 /// most of a measured ~1.15 GiB production peak.
+/// What a merkle ask produces: expanded nodes, a subtree page, and where to resume it.
+type MerkleAnswer = (Vec<proto::MerkleNode>, Vec<proto::Attestation>, Option<Vec<u8>>);
+
 pub struct RespondBundle {
     pub origins: Vec<proto::OriginUpdate>,
     pub attests: Vec<proto::Attestation>,
     pub atts_next: Option<Vec<u8>>,
     /// Answers to a range-only request (the catch-up engine); empty otherwise.
     pub ranges: Vec<proto::RangeReply>,
+    /// XOR of every attestation hash we hold, on the responses whose requester actually
+    /// consumes it (the classic pull). None elsewhere — ABSENT, not zero, which the requester
+    /// reads as "no opinion" rather than "this peer holds nothing".
+    ///
+    /// Computing it unconditionally was a real cost: on the postgres backend the root is a
+    /// table aggregate, and range-only requests arrive once per catch-up chunk with the
+    /// window wide open — so a catch-up storm meant a full-table scan per chunk, for a value
+    /// the catch-up engine discards.
+    pub fact_root: Option<[u8; 16]>,
+    /// Answers to merkle asks (requested leaves' attestations ride `attests`).
+    pub merkle: Vec<proto::MerkleNode>,
 }
 
 fn unix_now() -> u64 {
@@ -191,7 +206,6 @@ impl Index {
         self_name: &str,
         peer_names: &[String],
         trusted: TrustedKeys,
-        grace: Duration,
     ) -> Result<Self> {
         let mut origin_set: HashSet<String> = peer_names.iter().cloned().collect();
         origin_set.insert(self_name.to_owned());
@@ -217,7 +231,7 @@ impl Index {
         // Reap origins that left the config: their holdings and journals, and — crucially —
         // their watermark contribution, which would otherwise pin journal compaction forever.
         let keep: Vec<String> = origin_set.iter().cloned().collect();
-        store.retain_origins(&keep, unix_now())?;
+        store.retain_origins(&keep)?;
 
         Ok(Self {
             store,
@@ -225,10 +239,8 @@ impl Index {
             origin_set,
             peer_names: peer_names.to_vec(),
             trusted,
-            grace,
             self_write: Mutex::new(()),
             last_compact: Mutex::new(None),
-            last_reap: Mutex::new(None),
             nosub: Mutex::new(HashMap::new()),
         })
     }
@@ -297,6 +309,21 @@ impl Index {
                 attests: Vec::new(),
                 atts_next: None,
                 ranges: self.respond_ranges(&req.ranges)?,
+                fact_root: None,
+                merkle: Vec::new(),
+            });
+        }
+        // Merkle-only requests (the reconciliation walk) likewise answer just their asks.
+        if !req.merkle.is_empty() {
+            let (merkle, attests, atts_next) =
+                self.respond_merkle(&req.merkle, &req.atts_cursor)?;
+            return Ok(RespondBundle {
+                origins: Vec::new(),
+                attests,
+                atts_next,
+                ranges: Vec::new(),
+                fact_root: None,
+                merkle,
             });
         }
         let have: HashMap<&str, &proto::OriginClock> =
@@ -416,7 +443,7 @@ impl Index {
             let page_budget = ATTS_PAGE_CAP
                 .min(budget.saturating_sub(used))
                 .max(ATTS_PAGE_FLOOR);
-            self.store.attestation_page(&req.atts_cursor, page_budget)?
+            self.store.attestation_page(b"", &req.atts_cursor, page_budget)?
         } else {
             (Vec::new(), None)
         };
@@ -425,7 +452,56 @@ impl Index {
             attests,
             atts_next,
             ranges: Vec::new(),
+            // The one response a requester compares against — and the reason the check is
+            // free: it rides a round trip that was happening anyway.
+            fact_root: Some(self.store.merkle_root()?),
+            merkle: Vec::new(),
         })
+    }
+
+    /// Serve reconciliation asks: expand tree nodes, and/or return the attestations of the
+    /// requested leaves. Both are bounded per request (see MERKLE_*), so one exchange can
+    /// never be turned into unbounded work.
+    fn respond_merkle(
+        &self,
+        asks: &[proto::MerkleAsk],
+        cursor: &[u8],
+    ) -> Result<MerkleAnswer> {
+        let mut nodes = Vec::new();
+        let mut facts = Vec::new();
+        let mut next = None;
+        for ask in asks.iter().take(MERKLE_ASKS_MAX) {
+            if ask.expand {
+                let children = self.store.merkle_children(&ask.prefix)?;
+                let mut flat = Vec::with_capacity(children.len() * 16);
+                for c in &children {
+                    flat.extend_from_slice(c);
+                }
+                nodes.push(proto::MerkleNode {
+                    prefix: ask.prefix.clone(),
+                    children: flat,
+                });
+            }
+            // One subtree fetch per request: the page is the unit of work, and a second
+            // subtree would just contend for the same byte budget.
+            if ask.fetch && facts.is_empty() {
+                let (page, more) =
+                    self.store
+                        .attestation_page(&ask.prefix, cursor, MERKLE_FACTS_CAP)?;
+                facts = page;
+                next = more;
+            }
+        }
+        Ok((nodes, facts, next))
+    }
+
+    /// Our own view of the fact tree, for comparison against a peer's.
+    pub fn fact_root(&self) -> Result<[u8; 16]> {
+        self.store.merkle_root()
+    }
+
+    pub fn fact_children(&self, prefix: &[u8]) -> Result<Vec<[u8; 16]>> {
+        self.store.merkle_children(prefix)
     }
 
     /// Serve journal-range asks: each reply carries the origin's events in (after, until],
@@ -533,7 +609,6 @@ impl Index {
             &journal,
             &holds,
             &attests,
-            unix_now(),
             false, // a replica can only forget, never diverge: async is safe
         )? {
             // A concurrent pull applied this suffix first; the next round reconciles.
@@ -560,7 +635,7 @@ impl Index {
             .collect();
         if self
             .store
-            .replace_holdings(origin, generation, seq, &hashes, unix_now())?
+            .replace_holdings(origin, generation, seq, &hashes)?
         {
             Ok(hashes.len())
         } else {
@@ -575,7 +650,7 @@ impl Index {
         if valid.is_empty() {
             return Ok(0);
         }
-        self.store.merge_attestations(&valid, unix_now())
+        self.store.merge_attestations(&valid)
     }
 
     /// Remint our self generation strictly above `floor` — the self-clock-regression recovery.
@@ -760,7 +835,6 @@ impl Index {
                 &journal,
                 &chunk_holds,
                 &chunk_atts,
-                unix_now(),
                 true, // OUR seqs must never be reissued: self-origin commits are durable
             )? {
                 bail!("self-origin apply raced: the own-db loop must be the only self writer");
@@ -832,13 +906,12 @@ impl Index {
         Ok(true)
     }
 
-    /// The sync-path maintenance entry: full compaction is idempotent housekeeping, so pace
-    /// it — at most one journal-floor pass per minute and one attestation reap (a full-table
-    /// scan) per ten. This was measured to matter: unpaced, every inbound sync request paid
-    /// the reap scan, which alone was most of an idle node's CPU.
+    /// The sync-path maintenance entry: journal-floor compaction is idempotent housekeeping,
+    /// so pace it — sync traffic calls this on every request and pull, but floors move at most
+    /// once a minute. (The attestation reaper that used to run here is gone: facts are
+    /// grow-only, which is what makes them reconcilable by hash.)
     pub fn maybe_compact(&self) -> Result<()> {
         const COMPACT_EVERY: Duration = Duration::from_secs(60);
-        const REAP_EVERY: Duration = Duration::from_secs(600);
         let now = std::time::Instant::now();
         {
             let mut last = self.last_compact.lock().unwrap();
@@ -847,28 +920,13 @@ impl Index {
             }
             *last = Some(now);
         }
-        let reap = {
-            let mut last = self.last_reap.lock().unwrap();
-            if last.is_some_and(|t| now.duration_since(t) < REAP_EVERY) {
-                false
-            } else {
-                *last = Some(now);
-                true
-            }
-        };
-        self.compact_inner(reap)
+        self.compact()
     }
 
-    /// Compact journals — to the minimum watermark across all configured peers (the ack rule),
-    /// with the size backstop so a straggler cannot pin retention forever — and reap
-    /// attestations whose hash has been unheld past the grace window. Unpaced; production
-    /// traffic goes through maybe_compact(), this is for tests and explicit maintenance.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Compact journals to the minimum watermark across all configured peers (the ack rule),
+    /// with the size backstop so a straggler cannot pin retention forever. Facts are never
+    /// compacted: they are a grow-only set (see the module docs).
     pub fn compact(&self) -> Result<()> {
-        self.compact_inner(true)
-    }
-
-    fn compact_inner(&self, reap: bool) -> Result<()> {
         let marks: HashMap<(String, String), u64> = self
             .store
             .watermarks()?
@@ -889,13 +947,6 @@ impl Index {
             floor = floor.max(c.seq.saturating_sub(JOURNAL_BACKSTOP));
             if floor > c.tail_seq {
                 self.store.compact_journal(origin, floor)?;
-            }
-        }
-        if reap {
-            let cutoff = unix_now().saturating_sub(self.grace.as_secs());
-            let reaped = self.store.reap_attestations(cutoff)?;
-            if reaped > 0 {
-                debug!("reaped {reaped} attestation(s) unheld past the grace window");
             }
         }
         Ok(())
@@ -1147,14 +1198,14 @@ mod tests {
         }
     }
 
-    fn idx_grace(dir: &std::path::Path, name: &str, peers: &[&str], grace: Duration) -> Index {
+    fn idx_grace(dir: &std::path::Path, name: &str, peers: &[&str]) -> Index {
         let peers: Vec<String> = peers.iter().map(|s| s.to_string()).collect();
         let store = Arc::new(RocksStore::open(&dir.join(format!("cache-{name}"))).unwrap());
-        Index::open(store, name, &peers, TrustedKeys::none(), grace).unwrap()
+        Index::open(store, name, &peers, TrustedKeys::none()).unwrap()
     }
 
     fn idx(dir: &std::path::Path, name: &str, peers: &[&str]) -> Index {
-        idx_grace(dir, name, peers, Duration::ZERO)
+        idx_grace(dir, name, peers)
     }
 
     fn hp() -> String {
@@ -1190,34 +1241,31 @@ mod tests {
             2,
             "both contents resolvable while both are held"
         );
-        // c GCs h1: the h1 fact loses its last holder; with zero grace, compaction reaps it.
+        // c GCs h1: the h1 fact loses its last holder, so it stops being SERVED — but it is
+        // still stored, because facts are grow-only.
         b.apply_suffix("c", 1, &[drop_(2, 1)]).unwrap();
         b.compact().unwrap();
         let rows = b.lookup_hash_part(&hp()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].holders, vec!["a".to_string()]);
         assert_eq!(rows[0].info.nar_hash, [2u8; 32]);
-        assert_eq!(b.count_attestations(), 1);
+        assert_eq!(b.count_attestations(), 2, "the holderless fact is kept");
     }
 
     #[test]
-    fn signatures_survive_holder_churn_within_grace() {
+    fn signatures_survive_holder_churn() {
         // Use case: a host GCs a path, a peer rebuilds it bit-identically later; the fact
-        // (with its signatures) must bridge the churn as long as the grace window allows.
+        // (with its signatures) bridges the churn — forever, now that facts are grow-only.
         let dir = tempfile::tempdir().unwrap();
-        let b = idx_grace(dir.path(), "b", &["a", "c"], Duration::from_secs(3600));
+        let b = idx_grace(dir.path(), "b", &["a", "c"]);
         let mut fact = att("-p", 1);
         fact.sigs = vec!["walt-laptop-1:AAAA".into()];
         b.apply_suffix("a", 1, &[attest(1, fact), have(2, 1)])
             .unwrap();
-        // a GCs the path: zero holders, but the fact is stamped, not reaped (grace pending).
+        // a GCs the path: zero holders, and the fact stays.
         b.apply_suffix("a", 1, &[drop_(3, 1)]).unwrap();
         b.compact().unwrap();
-        assert_eq!(
-            b.count_attestations(),
-            1,
-            "fact retained through the grace window"
-        );
+        assert_eq!(b.count_attestations(), 1, "fact retained");
         assert!(
             b.lookup_hash_part(&hp()).unwrap().is_empty(),
             "but unservable: nobody has bytes"
@@ -1271,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn refs_round_trip_in_order_and_body_lww_on_merge() {
+    fn refs_round_trip_in_order_and_deterministic_body_merge() {
         let dir = tempfile::tempdir().unwrap();
         let b = idx(dir.path(), "b", &["a"]);
         // Deliberately NOT sorted: refs participate in the signature fingerprint, so storage
@@ -1286,9 +1334,10 @@ mod tests {
             found[0].info.references,
             ["zzz-late", "aaa-early", "mmm-mid"]
         );
-        // The same fact re-introduced with a different body: LWW replaces it whole — a
-        // shrunken list must not leave stale tail entries behind.
+        // The same fact re-introduced with a greater body under the deterministic ordering:
+        // it replaces the body whole, so a shrunken list cannot leave stale tail entries.
         let mut a2 = att("-p", 1);
+        a2.nar_size += 1;
         a2.references = vec!["only-one".into()];
         b.apply_suffix("a", 1, &[attest(3, a2)]).unwrap();
         let found = b.lookup_hash_part(&hp()).unwrap();
@@ -1342,6 +1391,7 @@ mod tests {
             atts_cursor: Vec::new(),
             skip_origins: vec![],
             ranges: vec![],
+            merkle: vec![],
         };
         let bundle = a.respond(&req).unwrap();
         let up = bundle.origins.iter().find(|u| u.origin == "c").unwrap();
@@ -1366,6 +1416,70 @@ mod tests {
     }
 
     #[test]
+    fn merkle_reconciliation_finds_and_repairs_a_missing_fact() {
+        // The case no other mechanism covers: b is missing ONE fact whose introducing journal
+        // event is long compacted away, and its possession state is perfectly in sync — so
+        // suffixes carry nothing, no snapshot ships, and the dump is never triggered. Only the
+        // fact tree can find it.
+        let dir = tempfile::tempdir().unwrap();
+        let a = idx(dir.path(), "a", &["b", "c"]);
+        let b = idx(dir.path(), "b", &["a", "c"]);
+        let facts: Vec<proto::Attestation> = (0..64)
+            .map(|i| att(&format!("f{i}"), i as u8 + 1))
+            .collect();
+        a.merge_attests(&facts).unwrap();
+        b.merge_attests(&facts[1..]).unwrap();
+
+        // Identical possession, one fact apart.
+        assert_eq!(a.count_attestations(), 64);
+        assert_eq!(b.count_attestations(), 63);
+        let root_a = a.fact_root().unwrap();
+        assert_ne!(root_a, b.fact_root().unwrap(), "divergence must be visible");
+
+        // Descend: exactly one coarse bucket and one leaf disagree, and the leaf is the
+        // missing fact's own.
+        let (mine, theirs) = (b.fact_children(&[]).unwrap(), a.fact_children(&[]).unwrap());
+        let coarse: Vec<u8> = (0..256)
+            .filter(|i| mine[*i] != theirs[*i])
+            .map(|i| i as u8)
+            .collect();
+        assert_eq!(coarse.len(), 1, "one missing fact, one differing bucket");
+        let c = coarse[0];
+        let (mine, theirs) = (
+            b.fact_children(&[c]).unwrap(),
+            a.fact_children(&[c]).unwrap(),
+        );
+        let leaves: Vec<u32> = (0..256)
+            .filter(|j| mine[*j] != theirs[*j])
+            .map(|j| ((c as u32) << 8) | j as u32)
+            .collect();
+        assert_eq!(leaves.len(), 1);
+        let missing = crate::store::attestation_hash(&facts[0]);
+        let leaf = crate::store::leaf_of(&missing);
+        assert_eq!(leaves[0], leaf as u32);
+
+        // Repair from that leaf alone, and the roots match.
+        let bundle = a
+            .respond(&proto::SyncRequest {
+                requester: "b".into(),
+                have: b.clock_vector().unwrap(),
+                atts_cursor: Vec::new(),
+                skip_origins: vec![],
+                ranges: vec![],
+                merkle: vec![proto::MerkleAsk {
+                    prefix: vec![(leaf >> 8) as u8, (leaf & 0xff) as u8],
+                    expand: false,
+                    fetch: true,
+                }],
+            })
+            .unwrap();
+        assert_eq!(bundle.attests.len(), 1, "only the differing leaf ships");
+        assert_eq!(b.merge_attests(&bundle.attests).unwrap(), 1);
+        assert_eq!(b.fact_root().unwrap(), root_a, "converged");
+        assert_eq!(b.count_attestations(), 64);
+    }
+
+    #[test]
     fn a_skipped_origin_still_earns_the_fact_dump() {
         // The lease case: another peer is serving this origin's bodies, so we ship a clock
         // line only — but the requester is still behind, and fact tables differ per peer, so
@@ -1381,6 +1495,7 @@ mod tests {
                 atts_cursor: Vec::new(),
                 skip_origins: vec!["a".into(), "c".into()],
                 ranges: vec![],
+                merkle: vec![],
             })
             .unwrap();
         assert!(
@@ -1440,6 +1555,7 @@ mod tests {
             atts_cursor: cursor,
             skip_origins: vec![],
             ranges: vec![],
+            merkle: vec![],
         };
         let caught_up = || {
             vec![
@@ -1538,6 +1654,7 @@ mod tests {
             atts_cursor: Vec::new(),
             skip_origins: vec![],
             ranges: vec![],
+            merkle: vec![],
         };
         let bundle = a.respond(&req).unwrap();
         let up = bundle.origins.iter().find(|u| u.origin == "a").unwrap();
@@ -1565,6 +1682,7 @@ mod tests {
             atts_cursor: Vec::new(),
             skip_origins: vec![],
             ranges: vec![],
+            merkle: vec![],
         };
         let bundle = a.respond(&req).unwrap();
         assert!(bundle.attests.is_empty(), "no snapshot, no fact dump");
@@ -1603,6 +1721,7 @@ mod tests {
             atts_cursor: Vec::new(),
             skip_origins: vec![],
             ranges: vec![],
+            merkle: vec![],
         };
         let bundle = a.respond(&req).unwrap();
         let up = bundle.origins.iter().find(|u| u.origin == "a").unwrap();
@@ -1636,6 +1755,7 @@ mod tests {
             atts_cursor: Vec::new(),
             skip_origins: vec![],
             ranges: vec![],
+            merkle: vec![],
         };
         let bundle = b.respond(&req).unwrap();
         let up = bundle.origins.iter().find(|u| u.origin == "a").unwrap();
@@ -1768,8 +1888,8 @@ mod tests {
         a.compact().unwrap();
         assert_eq!(
             a.count_attestations(),
-            1,
-            "zero grace: the unheld fact is reaped"
+            2,
+            "both facts survive — only possession moved"
         );
     }
 
@@ -1826,6 +1946,7 @@ mod tests {
             atts_cursor: Vec::new(),
             skip_origins: vec![],
             ranges: vec![],
+            merkle: vec![],
         };
         let bundle = x.respond_budgeted(&req, 1).unwrap();
         let ups = &bundle.origins;
@@ -1868,6 +1989,7 @@ mod tests {
             atts_cursor: Vec::new(),
             skip_origins: vec![],
             ranges: vec![],
+            merkle: vec![],
         };
         let bundle = x.respond_budgeted(&req, usize::MAX).unwrap();
         for u in &bundle.origins {
@@ -1992,14 +2114,19 @@ mod tests {
                 .unwrap();
             assert_eq!(b.lookup_hash_part(&hp()).unwrap().len(), 1);
         }
-        // Reopen with "a" removed from the config: its holdings and journal go; the fact it
-        // introduced ages out with zero grace.
+        // Reopen with "a" removed from the config: its holdings, journal and clock go. The
+        // FACT it introduced survives — facts outlive every holder, and the departed origin
+        // may well come back.
         let peers: Vec<String> = vec!["c".into()];
         let store = Arc::new(RocksStore::open(&dir.path().join("cache-b")).unwrap());
-        let b = Index::open(store, "b", &peers, TrustedKeys::none(), Duration::ZERO).unwrap();
+        let b = Index::open(store, "b", &peers, TrustedKeys::none()).unwrap();
         assert!(!b.is_known_origin("a"));
         assert!(b.lookup_hash_part(&hp()).unwrap().is_empty());
         b.compact().unwrap();
-        assert_eq!(b.count_attestations(), 0);
+        assert_eq!(
+            b.count_attestations(),
+            1,
+            "the departed origin's fact survives it, unservable but intact"
+        );
     }
 }

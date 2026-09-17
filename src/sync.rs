@@ -1,12 +1,20 @@
 //! The mesh-index sync subsystem: two endpoints on the serve listener, one pull client, and
-//! four background loops (per-peer pulls, hint fan-out, the own-db exporter, and the journal
-//! catch-up engine).
+//! five background loops (per-peer pulls, hint fan-out, the own-db exporter, the journal
+//! catch-up engine, and fact reconciliation).
 //!
 //! Pull is the ONLY data path. A node that has news sends a tiny hint ("pull from me"); pulls
 //! carry the puller's full watermark vector, which doubles as the ack stream that lets journals
 //! compact (index.rs). Pulls that insert nothing trigger no further hints, so hint cascades
 //! terminate exactly when the mesh has converged; pulls that do insert re-hint, which is what
 //! makes propagation transitive.
+//!
+//! FACTS have no watermark, so they cannot ride that machinery: they are an unordered
+//! grow-only set, reconciled by comparing hashes instead. Every response carries the
+//! responder's fact root, making "are we in sync?" a 16-byte check on an ordinary round; when
+//! roots differ, a fixed depth-two 256-ary tree locates the difference and whole SUBTREES are
+//! fetched. That repair runs in ONE loop across peers rather than inside each pull, so a
+//! missing fact is fetched once rather than once per peer — and because absorbing one peer's
+//! facts moves our own root, later peers in the sweep usually match already and cost nothing.
 //!
 //! Bodies are SINGLE-FLIGHT: each origin's suffix/snapshot stream has one server at a time
 //! (a claim for the round, or the engine while a backlog is enrolled), and every other pull
@@ -82,6 +90,33 @@ const ENGINE_WINDOW: usize = 6;
 /// Consecutive failed/unreachable fetches for one origin before the engine hands it back to
 /// the classic path (whose next round takes the snapshot the range asks could not).
 const ENGINE_STRIKES: u32 = 3;
+/// Coarse buckets examined per reconciliation round, and subtrees fetched per round. Bounded
+/// work per pull, not a loop that runs to completion: whatever is left over is found again by
+/// the next root comparison, which costs 16 bytes.
+const RECONCILE_COARSE_MAX: usize = 32;
+const RECONCILE_FETCH_MAX: usize = 64;
+/// Differing leaves within one coarse bucket beyond which the WHOLE bucket is fetched instead.
+/// Per-leaf fetches move less data but cost a round trip each; the bucket is one contiguous
+/// scan for the peer and one key-ordered insert for us. Below this, precision wins; above it,
+/// locality does.
+const RECONCILE_WHOLESALE: usize = 32;
+/// Pages one subtree fetch will follow before giving up. A SAFETY VALVE against a peer that
+/// streams forever, not a work limit — it must comfortably exceed a whole-table fetch, since
+/// the cursor restarts at the beginning on the next call and a too-small bound would silently
+/// truncate the tail forever. (It was MAX_ROUNDS = 64, which is the suffix-pull cap: at 4 MiB
+/// a page that is 256 MiB, and a 320k-fact table is already past it.)
+const SUBTREE_PAGES_MAX: usize = 4096;
+/// Subtree fetches in flight against the peer at once — pipelining, so a walk that needs
+/// several fetches pays one round trip's latency rather than N.
+///
+/// This is also what bounds reconciliation MEMORY. Every other structure on this path is a
+/// constant: 256 aggregates per level (4 KiB), at most RECONCILE_COARSE_MAX buckets examined,
+/// at most RECONCILE_FETCH_MAX two-byte prefixes queued. The only thing proportional to
+/// anything is the in-flight pages — and a subtree is fetched page-by-page through its own
+/// cursor, each page capped by the responder, so the peak is WINDOW × page and NOT a function
+/// of how large the difference is. Repairing one fact and repairing the whole table cost the
+/// same resident memory; they differ only in how many pages go by.
+const RECONCILE_WINDOW: usize = 4;
 
 /// An origin's bodies flow from ONE place at a time: a classic pull round (whoever claimed it
 /// for that round) or the catch-up engine. Everyone else's requests skip the origin (clock
@@ -279,6 +314,12 @@ pub struct Sync {
     pool: Arc<HostPool>,
     /// origin → its current body server (see Holder).
     leases: std::sync::Mutex<HashMap<String, Lease>>,
+    /// The last fact root each peer reported, recorded by its pull loop. Reconciliation is
+    /// driven from these rather than inline, so it can run ONE PEER AT A TIME.
+    peer_fact_root: Vec<std::sync::Mutex<Vec<u8>>>,
+    /// Pinged when a recorded root differs from ours; wakes the reconcile loop.
+    reconcile_tx: mpsc::Sender<()>,
+    reconcile_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
     /// Classic rounds hand real backlogs to the catch-up engine here.
     engine_tx: mpsc::UnboundedSender<Enroll>,
     engine_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Enroll>>>,
@@ -339,11 +380,15 @@ impl Sync {
         }
         let (hint_tx, hint_rx) = mpsc::channel(1);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel();
+        let (reconcile_tx, reconcile_rx) = mpsc::channel(1);
         Arc::new(Self {
             index,
             peers,
             pool,
             leases: std::sync::Mutex::new(HashMap::new()),
+            peer_fact_root: (0..n).map(|_| std::sync::Mutex::new(Vec::new())).collect(),
+            reconcile_tx,
+            reconcile_rx: std::sync::Mutex::new(Some(reconcile_rx)),
             engine_tx,
             engine_rx: std::sync::Mutex::new(Some(engine_rx)),
             db,
@@ -445,7 +490,7 @@ impl Sync {
 
     /// One full sync with a peer: pull journal suffixes / snapshots for every origin until
     /// nothing is truncated. Returns whether anything changed locally.
-    pub async fn pull_from(&self, idx: usize) -> Result<bool> {
+    pub async fn pull_from(self: &Arc<Self>, idx: usize) -> Result<bool> {
         use std::sync::atomic::Ordering::Relaxed;
         let r = self.pull_from_inner(idx).await;
         match &r {
@@ -462,9 +507,10 @@ impl Sync {
         r
     }
 
-    async fn pull_from_inner(&self, idx: usize) -> Result<bool> {
+    async fn pull_from_inner(self: &Arc<Self>, idx: usize) -> Result<bool> {
         use std::sync::atomic::Ordering::Relaxed;
         let mut changed_any = false;
+        let mut fact_root: Vec<u8> = Vec::new();
         for _ in 0..MAX_ROUNDS {
             let have = self.index.clock_vector()?;
             let skip_origins = self.claim_origins(idx, &have);
@@ -477,6 +523,7 @@ impl Sync {
                 atts_cursor: self.index.dump_cursor(&self.peers.list[idx].name)?,
                 skip_origins,
                 ranges: vec![],
+                merkle: vec![],
             };
             let t0 = Instant::now();
             let mut resp = match self.peers.sync_pull(idx, &req).await {
@@ -654,8 +701,20 @@ impl Sync {
                 }
             }
             self.settle_leases(idx, &adv);
+            fact_root = std::mem::take(&mut resp.fact_root);
             if !truncated {
                 break;
+            }
+        }
+        // Facts: every response carried the peer's root — a complete divergence check for 16
+        // bytes. Record it and let the reconcile loop act, so repairs run one peer at a time
+        // (see reconcile_loop) instead of every peer loop chasing the same missing facts.
+        if !fact_root.is_empty() {
+            let ours = self.index.fact_root()?;
+            let differs = fact_root != ours;
+            *self.peer_fact_root[idx].lock().unwrap() = fact_root;
+            if differs {
+                let _ = self.reconcile_tx.try_send(());
             }
         }
         if changed_any {
@@ -765,12 +824,65 @@ impl Sync {
         if let Some(rx) = self.hint_rx.lock().unwrap().take() {
             tokio::spawn(self.clone().hint_loop(rx, shutdown.clone()));
         }
+        // Fact reconciliation, one peer at a time.
+        if let Some(rx) = self.reconcile_rx.lock().unwrap().take() {
+            tokio::spawn(self.clone().reconcile_loop(rx, shutdown.clone()));
+        }
         // The journal catch-up engine.
         if let Some(rx) = self.engine_rx.lock().unwrap().take() {
             tokio::spawn(self.clone().engine_loop(rx, shutdown.clone()));
         }
         // The own-db exporter.
         tokio::spawn(self.clone().own_db_loop(shutdown));
+    }
+
+    /// Fact reconciliation, SEQUENTIALLY across peers.
+    ///
+    /// Inline per-peer reconciliation had every peer loop independently notice the same
+    /// divergence and fetch the same missing facts — correct, because merging is grow-only,
+    /// but up to N times the bandwidth. Running one peer at a time removes that, and does
+    /// something better besides: absorbing peer 1's facts moves OUR root, so by the time
+    /// peer 2's turn comes its recorded root often already matches and its turn costs
+    /// nothing. Peers are swept in a rotating order so no peer is starved by a busy one.
+    ///
+    /// Idle cost is zero: the loop sleeps on a channel that pulls only ping when the root
+    /// they reported actually differs from ours.
+    async fn reconcile_loop(
+        self: Arc<Self>,
+        mut wake: mpsc::Receiver<()>,
+        mut shutdown: watch::Receiver<()>,
+    ) {
+        let mut start = 0usize;
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                msg = wake.recv() => {
+                    if msg.is_none() {
+                        return;
+                    }
+                }
+            }
+            let n = self.peers.list.len();
+            for step in 0..n {
+                let idx = (start + step) % n;
+                if !self.peers.list[idx].available() {
+                    continue;
+                }
+                let root = self.peer_fact_root[idx].lock().unwrap().clone();
+                if root.is_empty() {
+                    continue;
+                }
+                match self.reconcile_facts(idx, &root).await {
+                    Ok(true) => self.hint_peers(), // news travels, however it arrived
+                    Ok(false) => {}
+                    Err(e) => debug!(
+                        "fact reconciliation with {} failed: {e:#}",
+                        self.peers.list[idx].name
+                    ),
+                }
+            }
+            start = (start + 1) % n.max(1);
+        }
     }
 
     /// The journal catch-up engine: the data plane's windowed chunk scheduling applied to
@@ -861,6 +973,7 @@ impl Sync {
                         atts_cursor: Vec::new(),
                         skip_origins: vec![],
                         ranges: vec![ask.clone()],
+                        merkle: vec![],
                     };
                     let t0 = Instant::now();
                     let reply = match peers.sync_pull(peer, &req).await {
@@ -899,6 +1012,274 @@ impl Sync {
                 });
             }
         }
+    }
+
+    /// Reconcile the fact set with one peer: compare roots, and when they differ, walk the
+    /// fixed depth-two tree to the differing leaves and merge what that peer has.
+    ///
+    /// Facts carry no watermark — the set is unordered and grow-only — so this is the only
+    /// mechanism that can find a fact we are missing once its introducing journal event has
+    /// been compacted away. It is also the mechanism that makes divergence SELF-HEALING: the
+    /// root comparison rides an ordinary sync response for 16 bytes, so every pull checks.
+    ///
+    /// One call does bounded work (RECONCILE_* caps) and returns; anything left over is found
+    /// again by the next root comparison. Only OUR side is repaired here — the peer repairs
+    /// itself when it reconciles with us, which it does on its own pulls.
+    async fn reconcile_facts(self: &Arc<Self>, idx: usize, peer_root: &[u8]) -> Result<bool> {
+        let Ok(peer_root) = <[u8; 16]>::try_from(peer_root) else {
+            return Ok(false); // no root in the response: nothing to compare against
+        };
+        let index = self.index.clone();
+        let our_root = tokio::task::spawn_blocking(move || index.fact_root())
+            .await
+            .map_err(|e| anyhow::anyhow!("root task died: {e}"))??;
+        if our_root == peer_root {
+            return Ok(false); // the common case, and the whole point: 16 bytes and done
+        }
+
+        // Nothing at all locally: descending would only rediscover that every node differs.
+        // Take the entire table as ONE ordered stream — the coarsest node there is.
+        if our_root == [0u8; 16] {
+            let merged = self.fetch_subtree(idx, b"").await?;
+            return Ok(merged > 0);
+        }
+
+        // Level one, one round trip: which coarse buckets disagree?
+        let ours = self.fact_children(&[]).await?;
+        let theirs = self.ask_children(idx, &[]).await?;
+        let mut differing: Vec<u8> = (0..ours.len())
+            .filter(|i| ours.get(*i) != theirs.get(*i))
+            .map(|i| i as u8)
+            .collect();
+        if differing.is_empty() {
+            return Ok(false); // the tree moved under us; the next round re-checks
+        }
+        // NOTE: a "most buckets differ → take the root" rule was tried here and MEASURED
+        // worse. Attestation hashes are uniform, so even a few hundred missing facts touch
+        // nearly every bucket — the rule fired on small drift and fetched the whole table to
+        // repair 500 facts (46 ms -> 707 ms, and 80x the bytes). Bucket COUNT says nothing
+        // about how much content differs. The empty-root case above is kept because it is
+        // exact, not a heuristic: a zero root means we hold nothing, so there is no smaller
+        // correct answer than the whole table.
+        differing.truncate(RECONCILE_COARSE_MAX);
+
+        // Choose the COARSEST node worth fetching for each difference. A bucket we hold
+        // nothing under is taken wholesale without expanding it at all — the expansion could
+        // only report that all 256 leaves differ.
+        let mut targets: Vec<Vec<u8>> = Vec::new();
+        let mut expand: Vec<u8> = Vec::new();
+        for c in differing {
+            if ours[c as usize] == [0u8; 16] {
+                targets.push(vec![c]);
+            } else {
+                expand.push(c);
+            }
+        }
+
+        // Level two, BATCHED: one round trip per MERKLE_ASKS_MAX buckets rather than per
+        // bucket. Expansions are independent, so there is no reason to serialize them.
+        for chunk in expand.chunks(crate::index::MERKLE_ASKS_MAX) {
+            let answers = self.ask_children_many(idx, chunk).await?;
+            for (c, theirs) in chunk.iter().zip(answers) {
+                let ours = self.fact_children(&[*c]).await?;
+                let leaves: Vec<u8> = (0..ours.len())
+                    .filter(|j| ours.get(*j) != theirs.get(*j))
+                    .map(|j| j as u8)
+                    .collect();
+                if leaves.len() >= RECONCILE_WHOLESALE {
+                    targets.push(vec![*c]);
+                } else {
+                    targets.extend(leaves.into_iter().map(|j| vec![*c, j]));
+                }
+            }
+        }
+        targets.truncate(RECONCILE_FETCH_MAX);
+        if targets.is_empty() {
+            return Ok(false);
+        }
+
+        // Fetch them through a SLIDING window: RECONCILE_WINDOW subtrees in flight, and the
+        // moment one finishes the next starts. Each subtree is contiguous on the peer, pages
+        // through its own cursor, and lands here in key order — so the window overlaps
+        // latency without giving up the sequential access that made subtrees worth fetching.
+        // (A chunked barrier would idle the other slots behind the slowest subtree.)
+        let mut queue: VecDeque<Vec<u8>> = targets.iter().cloned().collect();
+        let mut set = tokio::task::JoinSet::new();
+        let launch = |set: &mut tokio::task::JoinSet<Result<usize>>,
+                          queue: &mut VecDeque<Vec<u8>>| {
+            if let Some(prefix) = queue.pop_front() {
+                let me = self.clone();
+                set.spawn(async move { me.fetch_subtree(idx, &prefix).await });
+            }
+        };
+        for _ in 0..RECONCILE_WINDOW {
+            launch(&mut set, &mut queue);
+        }
+        let mut merged = 0usize;
+        while let Some(joined) = set.join_next().await {
+            merged += joined.map_err(|e| anyhow::anyhow!("subtree task died: {e}"))??;
+            launch(&mut set, &mut queue);
+        }
+        if merged > 0 {
+            debug!(
+                "reconciled {merged} attestation(s) from {} across {} subtree(s)",
+                self.peers.list[idx].name,
+                targets.len()
+            );
+        }
+        Ok(merged > 0)
+    }
+
+    /// The PREVIOUS walk, kept for the A/B bench only: expand the root, then expand each
+    /// differing bucket one request at a time, then fetch each differing LEAF one at a time.
+    /// Leaf granularity and no pipelining — the two things the current walk changed.
+    #[cfg(test)]
+    pub(crate) async fn reconcile_facts_legacy(
+        self: &Arc<Self>,
+        idx: usize,
+        peer_root: &[u8],
+    ) -> Result<bool> {
+        let Ok(peer_root) = <[u8; 16]>::try_from(peer_root) else {
+            return Ok(false);
+        };
+        let index = self.index.clone();
+        if tokio::task::spawn_blocking(move || index.fact_root())
+            .await
+            .map_err(|e| anyhow::anyhow!("root task died: {e}"))??
+            == peer_root
+        {
+            return Ok(false);
+        }
+        let ours = self.fact_children(&[]).await?;
+        let theirs = self.ask_children(idx, &[]).await?;
+        let coarse: Vec<u8> = (0..ours.len())
+            .filter(|i| ours.get(*i) != theirs.get(*i))
+            .take(8)
+            .map(|i| i as u8)
+            .collect();
+        let mut leaves: Vec<u32> = Vec::new();
+        for c in coarse {
+            let ours = self.fact_children(&[c]).await?;
+            let theirs = self.ask_children(idx, &[c]).await?;
+            for j in 0..ours.len() {
+                if ours.get(j) != theirs.get(j) && leaves.len() < 64 {
+                    leaves.push(((c as u32) << 8) | j as u32);
+                }
+            }
+        }
+        let mut merged = 0usize;
+        for leaf in leaves {
+            merged += self
+                .fetch_subtree(idx, &[(leaf >> 8) as u8, (leaf & 0xff) as u8])
+                .await?;
+        }
+        Ok(merged > 0)
+    }
+
+    /// Expand several nodes in ONE request — they are independent, so serializing them would
+    /// pay a round trip per bucket for no reason.
+    async fn ask_children_many(
+        &self,
+        idx: usize,
+        prefixes: &[u8],
+    ) -> Result<Vec<Vec<[u8; 16]>>> {
+        let req = proto::SyncRequest {
+            requester: self.index.self_name.clone(),
+            have: vec![],
+            atts_cursor: Vec::new(),
+            skip_origins: vec![],
+            ranges: vec![],
+            merkle: prefixes
+                .iter()
+                .map(|c| proto::MerkleAsk {
+                    prefix: vec![*c],
+                    expand: true,
+                    fetch: false,
+                })
+                .collect(),
+        };
+        let (resp, _) = self.peers.sync_pull(idx, &req).await?;
+        prefixes
+            .iter()
+            .map(|c| {
+                let node = resp.merkle.iter().find(|n| n.prefix == [*c]).with_context(|| {
+                    format!(
+                        "peer {} did not answer a merkle expand — mixed narshare versions \
+                         do not sync",
+                        self.peers.list[idx].name
+                    )
+                })?;
+                Ok(unpack_children(&node.children))
+            })
+            .collect()
+    }
+
+    /// Fetch and merge every attestation under one node, paging until the subtree is done.
+    /// `prefix` empty would be the whole table — the recovery dump is the same call.
+    async fn fetch_subtree(&self, idx: usize, prefix: &[u8]) -> Result<usize> {
+        let mut cursor: Vec<u8> = Vec::new();
+        let mut merged = 0usize;
+        for _ in 0..SUBTREE_PAGES_MAX {
+            let req = proto::SyncRequest {
+                requester: self.index.self_name.clone(),
+                have: vec![],
+                atts_cursor: cursor.clone(),
+                skip_origins: vec![],
+                ranges: vec![],
+                merkle: vec![proto::MerkleAsk {
+                    prefix: prefix.to_vec(),
+                    expand: false,
+                    fetch: true,
+                }],
+            };
+            let (mut resp, _) = self.peers.sync_pull(idx, &req).await?;
+            if resp.attests.is_empty() {
+                break;
+            }
+            let atts = std::mem::take(&mut resp.attests);
+            let index = self.index.clone();
+            merged += tokio::task::spawn_blocking(move || index.merge_attests(&atts))
+                .await
+                .map_err(|e| anyhow::anyhow!("subtree merge task died: {e}"))??;
+            if !resp.atts_truncated {
+                break;
+            }
+            cursor = std::mem::take(&mut resp.atts_next);
+        }
+        Ok(merged)
+    }
+
+    /// Our aggregates for a node.
+    async fn fact_children(&self, prefix: &[u8]) -> Result<Vec<[u8; 16]>> {
+        let index = self.index.clone();
+        let prefix = prefix.to_vec();
+        tokio::task::spawn_blocking(move || index.fact_children(&prefix))
+            .await
+            .map_err(|e| anyhow::anyhow!("children task died: {e}"))?
+    }
+
+    /// A peer's aggregates for a node, unpacked from the flat 256×16 byte reply.
+    async fn ask_children(&self, idx: usize, prefix: &[u8]) -> Result<Vec<[u8; 16]>> {
+        let req = proto::SyncRequest {
+            requester: self.index.self_name.clone(),
+            have: vec![],
+            atts_cursor: Vec::new(),
+            skip_origins: vec![],
+            ranges: vec![],
+            merkle: vec![proto::MerkleAsk {
+                prefix: prefix.to_vec(),
+                expand: true,
+                fetch: false,
+            }],
+        };
+        let (resp, _) = self.peers.sync_pull(idx, &req).await?;
+        let Some(node) = resp.merkle.into_iter().find(|n| n.prefix == prefix) else {
+            bail!(
+                "peer {} did not answer a merkle expand — mixed narshare versions do not sync",
+                self.peers.list[idx].name
+            );
+        };
+        Ok(unpack_children(&node.children))
     }
 
     /// Apply every contiguous chunk at the head of an origin's reorder buffer, in order.
@@ -1129,6 +1510,13 @@ impl Sync {
     }
 }
 
+/// A node's 256 aggregates, unpacked from the flat 16-byte-per-child reply.
+fn unpack_children(flat: &[u8]) -> Vec<[u8; 16]> {
+    flat.chunks_exact(16)
+        .map(|c| <[u8; 16]>::try_from(c).expect("chunks_exact(16)"))
+        .collect()
+}
+
 async fn handle_sync(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> Response {
     if body.len() > REQUEST_CAP {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
@@ -1153,6 +1541,8 @@ async fn handle_sync(State(s): State<Arc<Sync>>, body: bytes::Bytes) -> Response
             atts_truncated: bundle.atts_next.is_some(),
             atts_next: bundle.atts_next.unwrap_or_default(),
             range_replies: bundle.ranges,
+            fact_root: bundle.fact_root.map(|r| r.to_vec()).unwrap_or_default(),
+            merkle: bundle.merkle,
         };
         let z = zstd::stream::encode_all(&resp.encode_to_vec()[..], 3)
             .context("compressing sync response")?;
@@ -1288,5 +1678,187 @@ mod tests {
         assert!(!c.finished("b"), "other origins' plans are untouched");
         // Progress slides the window: an advanced cursor tolerates the same head.
         assert!(c.enroll("c", 1, 60_000, 60_000 + backstop));
+    }
+}
+
+#[cfg(test)]
+mod net_tests {
+    //! End-to-end reconciliation cost between two REAL nodes over HTTP: the walk lives in the
+    //! network path, so store-level benches cannot see it. Reports the two numbers that
+    //! matter — requests issued (link-independent: multiply by your RTT) and wall time.
+    use super::*;
+    use crate::index::Index;
+    use crate::peers::Peers;
+    use crate::sig::TrustedKeys;
+    use crate::store::rocks::RocksStore;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::Duration;
+
+    fn att(i: usize) -> proto::Attestation {
+        let hp = blake3::hash(&(i as u64).to_le_bytes()).to_hex()[..32].to_owned();
+        proto::Attestation {
+            store_path: format!("/nix/store/{hp}-pkg-{i}"),
+            nar_hash: blake3::hash(&(i as u64).to_be_bytes()).as_bytes()[..32].to_vec(),
+            nar_size: 4096,
+            references: (0..12)
+                .map(|r| format!("{:032x}-dependency-{r}-1.2.{i}", i * 31 + r))
+                .collect(),
+            ca: String::new(),
+            sigs: vec![format!("cache.example.org-1:{i:086}")],
+        }
+    }
+
+    /// Two nodes: `server` holding `total` facts, `client` holding all but `missing` of them.
+    async fn pair(
+        dir: &std::path::Path,
+        total: usize,
+        missing: usize,
+    ) -> (Arc<Sync>, Arc<Sync>) {
+        let facts: Vec<proto::Attestation> = (0..total).map(att).collect();
+        let names = |me: &str| -> Vec<String> {
+            ["server", "client"]
+                .iter()
+                .filter(|n| **n != me)
+                .map(|n| n.to_string())
+                .collect()
+        };
+        let mk = |name: &str, hold: &[proto::Attestation]| {
+            let idx = Arc::new(
+                Index::open(
+                    Arc::new(RocksStore::open(&dir.join(name)).unwrap()),
+                    name,
+                    &names(name),
+                    TrustedKeys::none(),
+                )
+                .unwrap(),
+            );
+            idx.merge_attests(hold).unwrap();
+            idx
+        };
+        let server_idx = mk("server", &facts);
+        let client_idx = mk("client", &facts[missing..]);
+
+        // The server serves sync; the client points at it.
+        let server_sync = Sync::new(
+            server_idx,
+            Arc::new(Peers::new(&[], Duration::from_secs(5), 3, Duration::from_secs(15), 8).unwrap()),
+            Arc::new(HostPool::new(1)),
+            None,
+            None,
+            Duration::from_secs(3600),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = server_sync.router();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let cfg = vec![crate::config::Peer {
+            name: "server".into(),
+            url: format!("http://{addr}"),
+            tier: 1,
+            encoding: "zstd".into(),
+        }];
+        let client_sync = Sync::new(
+            client_idx,
+            Arc::new(Peers::new(&cfg, Duration::from_secs(5), 3, Duration::from_secs(15), 8).unwrap()),
+            Arc::new(HostPool::new(1)),
+            None,
+            None,
+            Duration::from_secs(3600),
+        );
+        (server_sync, client_sync)
+    }
+
+    /// THE REGRESSION TEST for the failure that shipped: a node permanently missing facts
+    /// that nothing repairs.
+    ///
+    /// The setup isolates reconciliation as the ONLY possible route. Possession is made to
+    /// agree first, so the classic path has nothing to say — no suffix, no snapshot, and
+    /// therefore no fact dump (the dump rides snapshots, which is precisely why the original
+    /// bug existed: a node recovering by suffix never triggered one). The first assertion
+    /// proves that isolation holds by showing a full pull does NOT close the gap; the second
+    /// proves reconciliation then does, through the ordinary loops rather than by calling the
+    /// walk directly — so a regression in the WIRING (root not recorded, loop not spawned,
+    /// wake never sent) fails this too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fact_gap_no_journal_can_carry_is_still_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, client) = pair(dir.path(), 400, 120).await;
+        let want = server.index.fact_root().unwrap();
+        assert_ne!(client.index.fact_root().unwrap(), want, "should start diverged");
+
+        // Possession agrees: the responder will answer "up to date" and ship nothing.
+        let (gen, seq) = server.index.origin_clock("server").unwrap();
+        client.index.apply_snapshot("server", gen, seq, &[]).unwrap();
+
+        // A full pull now carries no facts at all — no suffix, no snapshot, no dump.
+        client.pull_from(0).await.unwrap();
+        assert_ne!(
+            client.index.fact_root().unwrap(),
+            want,
+            "a plain pull must NOT close a fact gap — if it does, this test no longer \
+             isolates reconciliation and the regression it guards could return unnoticed"
+        );
+
+        // With the loops running, reconciliation must close it.
+        let (_tx, rx) = watch::channel(());
+        client.spawn_loops(rx);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            client.pull_from(0).await.unwrap();
+            if client.index.fact_root().unwrap() == want {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "facts never converged: the gap the journals cannot carry was not repaired"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(client.index.count_attestations(), 400);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // measurement bench: cargo test --release -- --ignored --nocapture walk_bench
+    async fn bench_walk() {
+        const TOTAL: usize = 40_000;
+        println!("[bench] === reconciliation walk, two nodes over HTTP ===");
+        for missing in [1usize, 500, 20_000, TOTAL] {
+            for legacy in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let (server, client) = pair(dir.path(), TOTAL, missing).await;
+                let root = server.index.fact_root().unwrap().to_vec();
+                let before = server.stats.sync_requests_served.load(Relaxed);
+
+                // Repeat until converged or the walk stops making progress — one pass is
+                // bounded by design, so convergence is what we are timing.
+                let t = Instant::now();
+                let mut passes = 0usize;
+                loop {
+                    let progressed = if legacy {
+                        client.reconcile_facts_legacy(0, &root).await.unwrap()
+                    } else {
+                        client.reconcile_facts(0, &root).await.unwrap()
+                    };
+                    passes += 1;
+                    if !progressed || client.index.fact_root().unwrap().to_vec() == root {
+                        break;
+                    }
+                    if passes >= 200 {
+                        break; // give up: the point is that one walk should not need this
+                    }
+                }
+                let elapsed = t.elapsed();
+                let requests = server.stats.sync_requests_served.load(Relaxed) - before;
+                let converged = client.index.fact_root().unwrap().to_vec() == root;
+                println!(
+                    "[bench]   {:7} facts behind, {:>6}: {passes:>3} pass(es), \
+                     {requests:>4} request(s), {elapsed:>10.2?}, converged={converged}",
+                    missing,
+                    if legacy { "legacy" } else { "current" },
+                );
+            }
+        }
     }
 }

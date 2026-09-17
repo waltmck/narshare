@@ -17,22 +17,23 @@ different lifetimes. v2 keeps them apart.
   response starts a PAGED dump of the responder's retained fact set (the recovery path
   re-teaches facts whose journal history was compacted); the puller loops with a resume
   cursor until the dump completes, so neither side ever holds the whole fact table in
-  memory. Retention is held-plus-grace (`cache.attestation_grace`,
-  default 90 d): a fact whose hash nobody has held for the window is reaped. Trust is enforced
+  memory. Facts are NEVER deleted — the set is exactly grow-only, which is what makes it a
+  join-semilattice and therefore reconcilable by comparing hashes (see anti-entropy below);
+  per-node deletion would let two correct nodes diverge forever. Trust is enforced
   at USE only — well-formed facts are stored and relayed regardless of the current anchor, so
   removing a trusted key makes rows inert (not deleted) and re-adding it wakes them with no
   resync; v1's anchor-change clock-voiding is gone entirely.
 
 A lookup composes the layers: attestations for the hash part → NAR hashes → current holders.
 Consequences: signatures survive holder churn (a GC'd-then-rebuilt-bit-identical path still
-verifies under the original signature, within grace); byte-level dedup falls out (any holder of
+verifies under the original signature, forever); byte-level dedup falls out (any holder of
 H serves H, whatever store path its copy is registered under); and rollout is a flag day — v1
 and v2 nodes simply do not sync (the endpoints are versioned, the index is disposable).
 
-Storage sits behind a backend trait (store/): embedded **rocksdb** by default (store-wide writer
-lock + WriteBatch atomicity), or **postgres** (`cache.postgres`; per-origin clock-row FOR UPDATE
-plus hierarchical advisory locks — global-shared + per-hash for small batches, global-exclusive
-for bulk applies — for the last-holder retention race). Durability is split by authorship: only
+Storage sits behind a backend trait (store/): embedded **rocksdb** by default (WriteBatch
+atomicity under STRIPED write locks — every composite op needs read-modify-write over one key,
+an origin's clock or a fact's identity, and those are disjoint), or **postgres**
+(`cache.postgres`; per-origin clock-row FOR UPDATE, per-fact row locks). Durability is split by authorship: only
 SELF-origin transactions commit synchronously (rocksdb WAL fsync / `SET LOCAL
 synchronous_commit = on`), because a seq a peer observed must never be reissued with different
 events and only the origin can reissue; everything else — replicas of other origins, facts,
@@ -218,6 +219,16 @@ origin's history is totally ordered, "peer P saw deletion N" collapses to "P's w
   puller's truncated loop collects them over successive rounds, so no response can outgrow the
   puller's hard caps. One origin's snapshot is never split; a single origin must stay under the
   raw cap (~600k paths — far past any real node).
+* **Facts reconcile by anti-entropy.** They have no watermark — an unordered grow-only set —
+  so divergence is found by comparing hashes. Every response carries `fact_root`, the XOR of
+  every attestation hash the responder holds, so an "are we in sync?" check rides an ordinary
+  sync round for 16 bytes; when roots differ, a FIXED depth-two 256-ary tree locates the
+  difference in two descents and the repair fetches whole SUBTREES. Attestations are keyed by
+  their own hash, so a subtree is a contiguous key range: the peer serves it as a sequential
+  scan, the receiver inserts it in key order, and the recovery dump is the same call with an
+  empty prefix. Repair memory is O(page) — measured flat from a one-fact diff to a
+  whole-table one. This is what makes divergence self-healing rather than permanent: a fact
+  whose introducing journal event was compacted away has no other route home.
 * **Catch-up is single-flight and striped.** Bodies for each origin flow from one server at a
   time (per-round claims; every other pull skips the origin and gets clock lines only), so
   catch-up bytes travel once however many peers are configured. Real backlogs go to the
@@ -705,7 +716,8 @@ the module.
   journals with watermark-ack compaction and snapshot recovery, generations, hint+pull
   propagation (transitive), inotify-triggered own-db export, /var/cache/narshare persistence,
   protobuf wire format. Local-only lookups replace the M3 fan-out. Acceptance: unit-level
-  protocol tests (LWW, orphan GC, idempotent replay, gap→snapshot, generation bump, compaction
+  protocol tests (deterministic fact merges, orphan GC, idempotent replay, gap→snapshot,
+  generation bump, compaction
   gating, departed-origin reaping, transitive relay) plus the VM suite's distributed-systems
   scenarios (partitions, restarts, cache loss, GC propagation).
 * **M7 — NixOS module + VM test.** Three-node `nixosTest`, every node running only narshare: A and B

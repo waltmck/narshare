@@ -100,11 +100,6 @@ pub struct CacheCfg {
     /// trade CPU (an O(store) diff per interval) for staleness; tests use seconds.
     #[serde(with = "humantime_serde", default = "d_reconcile_every")]
     pub reconcile_every: Duration,
-    /// How long an attestation (a store-path → content fact, with its signatures) outlives
-    /// the last holder of its content. Within this window a GC'd-then-rebuilt path still
-    /// verifies under its original signatures.
-    #[serde(with = "humantime_serde", default = "d_attestation_grace")]
-    pub attestation_grace: Duration,
 }
 
 impl Default for CacheCfg {
@@ -113,7 +108,6 @@ impl Default for CacheCfg {
             dir: d_cache_dir(),
             postgres: None,
             reconcile_every: d_reconcile_every(),
-            attestation_grace: d_attestation_grace(),
         }
     }
 }
@@ -269,9 +263,6 @@ fn d_cache_dir() -> PathBuf {
 }
 fn d_reconcile_every() -> Duration {
     Duration::from_secs(3600)
-}
-fn d_attestation_grace() -> Duration {
-    Duration::from_secs(90 * 24 * 3600)
 }
 fn d_zero_bytes() -> ByteSize {
     ByteSize(0)

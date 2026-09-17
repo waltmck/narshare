@@ -90,6 +90,38 @@ message SyncRequest {
   // protocol violation, not a version to accommodate (v1/v2 precedent: mixed versions simply
   // do not sync until upgraded — the index is disposable, so there is no migration).
   repeated RangeAsk ranges = 5;
+  // Anti-entropy over the fact set. Facts have no watermark — they are an unordered grow-only
+  // set — so divergence is found by comparing hashes: the responder's `fact_root` rides EVERY
+  // response (16 bytes, so a continuous "are we in sync?" check is free), and when it differs
+  // these asks walk a FIXED depth-two 256-ary tree to the differing leaves and fetch them.
+  // Two descents locate any difference among 65536 leaves; the depth is a protocol constant,
+  // so changing it is a flag day.
+  repeated MerkleAsk merkle = 6;
+}
+
+// Expand a tree node, and/or fetch the attestations UNDER it. Answers come back as
+// SyncResponse.merkle and SyncResponse.attests respectively.
+message MerkleAsk {
+  // The node: empty = the root (all 65536 leaves), one byte = a coarse bucket, two = a leaf.
+  bytes prefix = 1;
+  // Send this node's 256 child aggregates (meaningless at leaf depth).
+  bool expand = 2;
+  // Send the attestations under this node, paged by SyncRequest.atts_cursor and continued via
+  // SyncResponse.atts_next — the same paging the full dump uses, because the full dump IS
+  // this with an empty prefix.
+  //
+  // A SUBTREE, not a list of leaves: attestations are keyed by attestation hash, so a node's
+  // contents are a contiguous key range. One matching intermediate aggregate therefore means
+  // a whole subtree can be fetched from one peer as a sequential scan and inserted in key
+  // order — which matters most on a from-scratch sync, where the alternative is tens of
+  // thousands of scattered per-leaf fetches and random inserts.
+  bool fetch = 3;
+}
+
+message MerkleNode {
+  bytes prefix = 1;
+  // 256 aggregates of 16 bytes each, concatenated, in child order.
+  bytes children = 2;
 }
 
 // One journal-range ask: origin's events with seq in (after, until], under the responder's
@@ -150,6 +182,11 @@ message SyncResponse {
   bytes atts_next = 5;
   // Answers to SyncRequest.ranges, one per ask, in ask order (range-only responses).
   repeated RangeReply range_replies = 6;
+  // XOR of every attestation hash the responder holds — sent on EVERY response. Equal roots
+  // mean equal fact sets, so this is a complete divergence check for 16 bytes.
+  bytes fact_root = 7;
+  // Answers to SyncRequest.merkle; requested leaves' attestations ride `attests`.
+  repeated MerkleNode merkle = 8;
 }
 
 // "I have news — pull from me." Carries no data: pull is the only data path.

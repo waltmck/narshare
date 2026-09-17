@@ -114,13 +114,7 @@ async fn run(cfg: config::Config) -> Result<()> {
             })?,
         ),
     };
-    let idx = Arc::new(index::Index::open(
-        idx_store,
-        &cfg.name,
-        &peer_names,
-        trusted,
-        cfg.cache.attestation_grace,
-    )?);
+    let idx = Arc::new(index::Index::open(idx_store, &cfg.name, &peer_names, trusted)?);
 
     let peers = if cfg.peers.is_empty() {
         None

@@ -329,7 +329,7 @@ mod tests {
         keys: TrustedKeys,
     ) -> Arc<Index> {
         let store = Arc::new(crate::store::rocks::RocksStore::open(cache).unwrap());
-        Arc::new(Index::open(store, name, peer_names, keys, std::time::Duration::ZERO).unwrap())
+        Arc::new(Index::open(store, name, peer_names, keys).unwrap())
     }
 
     async fn spawn_router(router: Router) -> String {
@@ -1510,10 +1510,10 @@ mod tests {
             404,
             "a GC'd path must disappear from the mesh index"
         );
-        // The fact lost its last holder; the (paced in production, explicit here) reaper
-        // removes it under the test fixtures' zero grace.
+        // The fact lost its last holder, so it stops being served — but it is still stored:
+        // facts are grow-only, and a rebuild of this path would be servable again at once.
         client.index.compact().unwrap();
-        assert_eq!(client.index.count_attestations(), 0);
+        assert_eq!(client.index.count_attestations(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

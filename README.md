@@ -53,7 +53,6 @@ url = "http://100.64.0.2:5050"
 # optional — default is embedded rocksdb under /var/cache/narshare:
 # [cache]
 # postgres = "host=/run/postgresql dbname=narshare"
-# attestation_grace = "90d"     # how long facts outlive their last holder
 ```
 
 Every node runs both roles and lists every other node; lookups are answered from the locally
