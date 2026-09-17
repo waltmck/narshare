@@ -60,6 +60,10 @@ const ATTS_PAGE_CAP: usize = 8 << 20;
 /// Even a response already at its overall budget ships at least this much fact-dump progress,
 /// so a snapshot-stuffed exchange cannot starve the dump into a livelock.
 const ATTS_PAGE_FLOOR: usize = 256 << 10;
+/// The dump-restart sentinel cursor: one byte that sorts before every real (64-byte) att key,
+/// so a backend resuming "strictly after" it serves the FIRST page. Parked by a requester to
+/// cancel an in-flight dump and start it over; responders never restart a dump on their own.
+pub const DUMP_RESTART: &[u8] = &[0];
 /// Byte cap per journal-range reply: bounds one catch-up chunk on the wire, and with it the
 /// requester's reorder-buffer memory (window × this).
 const RANGE_BYTES_CAP: usize = 2 << 20;
@@ -98,6 +102,30 @@ pub struct Index {
     /// cache, paths filtered by allowSubstitutes=false would re-read their drv on every diff
     /// cycle forever (they never produce an attestation, so they stay "new" to the differ).
     nosub: Mutex<HashMap<String, bool>>,
+}
+
+/// Never squeeze the block cache below a quarter of its ceiling: the prefix blooms and index
+/// blocks live there, and the proxy consults them for EVERY substitution the machine attempts
+/// — past that point the memory returned starts costing per-lookup SST reads.
+const CACHE_FLOOR_SHARE: u64 = 4;
+
+/// The index's block cache: pages that re-read from the SSTs, so pressure may have them back.
+impl crate::mem::Shrinkable for Index {
+    fn name(&self) -> &'static str {
+        "index block cache"
+    }
+
+    fn ceiling(&self) -> u64 {
+        self.store.cache_ceiling()
+    }
+
+    fn floor(&self) -> u64 {
+        self.store.cache_ceiling() / CACHE_FLOOR_SHARE
+    }
+
+    fn set_budget(&self, bytes: u64) {
+        self.store.set_cache_capacity(bytes);
+    }
 }
 
 /// One lookup result: a feasible attestation and who currently holds its bytes.
@@ -301,9 +329,16 @@ impl Index {
                 continue;
             }
             // Another peer is already streaming this origin to the requester (single-flight
-            // catch-up): clock line only — visibly behind, deliberately body-less, and no
-            // fact-dump trigger. The requester's lease machinery decides who serves bodies.
+            // catch-up): clock line only — visibly behind, deliberately body-less. The
+            // requester's lease machinery decides who serves bodies.
+            //
+            // The FACT dump is not body-less in the same sense, and must not be suppressed
+            // here: fact tables differ between peers (each is shaped by its own reap history
+            // and by which dumps it happened to receive), so a requester recovering needs a
+            // dump from EVERY peer, not just whichever one won the possession lease. Skipping
+            // the dump too is what cost a restored node facts only its other peers retained.
             if req.skip_origins.contains(name) {
+                sent_snapshot |= !(their_gen == gen && their_seq >= tail);
                 origins.push(proto::OriginUpdate {
                     origin: name.clone(),
                     generation: gen,
@@ -559,6 +594,11 @@ impl Index {
         // where meta's value is re-stamped onto the clock.
         self.store.meta_put("self_generation", &g.to_string())?;
         self.store.set_generation(&self.self_name, g)?;
+        // A remint means our state came back from before the mesh's memory of us (restored
+        // backup, reverted WAL): whatever facts that copy is missing, our peers still hold.
+        // Possession will arrive as ordinary suffixes, which carry no facts — ask for the
+        // tables explicitly (see restart_all_dumps).
+        self.restart_all_dumps()?;
         Ok(g)
     }
 
@@ -998,6 +1038,29 @@ impl Index {
         Ok((c.generation, c.seq))
     }
 
+    /// The backend's resizable block-cache ceiling (0 = nothing this process can shrink).
+    pub fn cache_ceiling(&self) -> u64 {
+        self.store.cache_ceiling()
+    }
+
+    /// Schedule a full fact dump from every peer, discarding any in-flight cursors.
+    ///
+    /// Facts have no watermark — they are an unordered grow-only set — so the only way to
+    /// re-learn ones we lost is to re-read peers' tables, and a peer only volunteers its table
+    /// when it ships a snapshot. That covers the wiped-cache node (zero clocks earn snapshots)
+    /// but NOT the two recovery paths where possession arrives as ordinary suffixes: a cache
+    /// restored from a backup, and a generation remint. Such a node's clocks look merely
+    /// stale, its peers answer with suffixes, and any fact it dropped — one whose path its own
+    /// differ can no longer re-derive, because the path is gone from its store — would never
+    /// come back. Hence an explicit trigger, from EVERY peer: coverage is the union of their
+    /// tables, not whichever one answered first.
+    pub fn restart_all_dumps(&self) -> Result<()> {
+        for peer in &self.peer_names {
+            self.set_dump_cursor(peer, DUMP_RESTART)?;
+        }
+        Ok(())
+    }
+
     /// The persisted fact-dump resume cursor for pulls from `peer` — meta-backed so a dump
     /// interrupted by a process death resumes after restart instead of silently dropping the
     /// tail of the responder's fact table. (A store wipe loses it, but a wipe also bumps our
@@ -1289,8 +1352,9 @@ mod tests {
         assert!(!bundle.attests.is_empty());
 
         // Skipped (another peer holds the leases — including the responder's own origin,
-        // which would otherwise first-contact-snapshot too): clock lines stay — visibly
-        // behind — but no bodies ship and no fact dump is triggered.
+        // which would otherwise first-contact-snapshot too): clock lines stay, visibly
+        // behind, and no possession BODY ships. The fact dump is deliberately not suppressed
+        // with it — see a_skipped_origin_still_earns_the_fact_dump.
         req.skip_origins = vec!["a".into(), "c".into()];
         let bundle = a.respond(&req).unwrap();
         let up = bundle.origins.iter().find(|u| u.origin == "c").unwrap();
@@ -1299,8 +1363,53 @@ mod tests {
         assert!(!up.truncated);
         let up = bundle.origins.iter().find(|u| u.origin == "a").unwrap();
         assert!(up.body.is_none());
-        assert!(bundle.attests.is_empty(), "skipped snapshots must not dump");
-        assert_eq!(bundle.atts_next, None);
+    }
+
+    #[test]
+    fn a_skipped_origin_still_earns_the_fact_dump() {
+        // The lease case: another peer is serving this origin's bodies, so we ship a clock
+        // line only — but the requester is still behind, and fact tables differ per peer, so
+        // suppressing OUR dump would cost it every fact only we retain.
+        let dir = tempfile::tempdir().unwrap();
+        let a = idx(dir.path(), "a", &["b", "c"]);
+        a.merge_attests(&[att("p", 1)]).unwrap();
+        a.apply_snapshot("c", 1, 3, &[vec![1u8; 32]]).unwrap();
+        let bundle = a
+            .respond(&proto::SyncRequest {
+                requester: "b".into(),
+                have: vec![],
+                atts_cursor: Vec::new(),
+                skip_origins: vec!["a".into(), "c".into()],
+                ranges: vec![],
+            })
+            .unwrap();
+        assert!(
+            bundle.origins.iter().all(|u| u.body.is_none()),
+            "skipped origins ship no bodies"
+        );
+        assert_eq!(
+            bundle.attests.len(),
+            1,
+            "a requester that needs a snapshot needs facts, lease or no lease"
+        );
+    }
+
+    #[test]
+    fn a_remint_asks_every_peer_for_its_facts() {
+        // The restore case: possession comes back as ordinary SUFFIXES, which carry no facts,
+        // so without an explicit trigger a restored node never re-learns what it dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let a = idx(dir.path(), "a", &["b", "c"]);
+        a.set_dump_cursor("b", b"some-cursor").unwrap();
+        assert_eq!(a.dump_cursor("b").unwrap(), b"some-cursor");
+        a.bump_self_generation(1).unwrap();
+        for peer in ["b", "c"] {
+            assert_eq!(
+                a.dump_cursor(peer).unwrap(),
+                DUMP_RESTART,
+                "{peer}: a remint must re-request the whole fact table"
+            );
+        }
     }
 
     #[test]

@@ -70,6 +70,9 @@ pub struct RocksStore {
     db: DB,
     /// Serializes composite writes; reads are lock-free against atomic batches.
     write: Mutex<()>,
+    /// The shared block cache, kept for resizing under memory pressure (mem.rs). `Cache` is a
+    /// handle onto one refcounted rocksdb object, so this clone IS the cache the CFs use.
+    cache: Cache,
 }
 
 fn okey(origin: &str) -> Result<Vec<u8>> {
@@ -172,6 +175,7 @@ impl RocksStore {
             let store = Self {
                 db,
                 write: Mutex::new(()),
+                cache,
             };
             match store.meta_get("layout")? {
                 Some(l) if l == LAYOUT => return Ok(store),
@@ -954,6 +958,17 @@ impl SyncStore for RocksStore {
             Ok(true)
         })?;
         Ok(n)
+    }
+
+    fn cache_ceiling(&self) -> u64 {
+        BLOCK_CACHE_BYTES as u64
+    }
+
+    fn set_cache_capacity(&self, bytes: u64) {
+        // set_capacity takes &mut, but a Cache is a handle onto one refcounted rocksdb object:
+        // the clone resizes the very cache every CF was opened against. Shrinking evicts
+        // inside rocksdb immediately.
+        self.cache.clone().set_capacity(bytes as usize);
     }
 }
 

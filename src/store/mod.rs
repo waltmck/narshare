@@ -207,6 +207,15 @@ pub trait SyncStore: Send + Sync {
     fn origin_stats(&self, origin: &str) -> Result<(u64, u64)>;
     /// Number of retained attestations.
     fn count_attestations(&self) -> Result<u64>;
+
+    // ---- memory ----
+    /// The backend's in-process block-cache ceiling, or 0 when it holds no cache this process
+    /// can resize (postgres caches in the SERVER, whose memory is that server's business).
+    fn cache_ceiling(&self) -> u64 {
+        0
+    }
+    /// Resize that cache, evicting immediately when it shrinks. See mem.rs.
+    fn set_cache_capacity(&self, _bytes: u64) {}
 }
 
 /// Control-plane cost at realistic scale, run identically against every backend — the numbers

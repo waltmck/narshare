@@ -134,6 +134,7 @@ async fn status(State(ctx): State<Arc<StatusCtx>>) -> Response {
     let serve = ctx.serve.as_ref().map(|s| {
         let st = &s.stats;
         let (free_big, free_small) = s.encode_permits_free();
+        let (budget, held) = s.table_cache_status();
         serde_json::json!({
             "narinfo_requests": st.narinfo_requests.load(Relaxed),
             "nar_requests": st.nar_requests.load(Relaxed),
@@ -142,6 +143,8 @@ async fn status(State(ctx): State<Arc<StatusCtx>>) -> Response {
             "chunks_encoded": st.chunks_encoded.load(Relaxed),
             "encode_wait_us": st.encode_wait_us.load(Relaxed),
             "encode_permits_free": { "big": free_big, "small": free_small },
+            // A budget below its ceiling is the visible trace of memory pressure (mem.rs).
+            "table_cache": { "budget": budget, "held": held },
         })
     });
 
@@ -150,6 +153,7 @@ async fn status(State(ctx): State<Arc<StatusCtx>>) -> Response {
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_ms": ctx.started.elapsed().as_millis() as u64,
         "index": index_status,
+        "memory_pressure": crate::mem::pressure(),
         "proxy": proxy,
         "sync": sync,
         "serve": serve,

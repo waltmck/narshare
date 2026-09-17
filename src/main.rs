@@ -6,6 +6,7 @@ mod governor;
 mod index;
 mod io;
 mod manifest;
+mod mem;
 mod nar;
 mod narinfo;
 mod nixbase32;
@@ -190,6 +191,20 @@ async fn run(cfg: config::Config) -> Result<()> {
             .with_context(|| format!("binding proxy listener {listen}"))?;
         info!("proxying the mesh index over {n} peer(s) as a substituter on http://{listen}");
         proxy_parts = Some((listener, state));
+    }
+
+    // Caches float with memory pressure (mem.rs): everything in them is an accelerator that
+    // rebuilds on demand, so under pressure they are the first thing to give back — which is
+    // what lets a 2 GiB host run the same binary as a workstation.
+    {
+        let mut caches: Vec<Arc<dyn mem::Shrinkable>> = Vec::new();
+        if idx.cache_ceiling() > 0 {
+            caches.push(idx.clone());
+        }
+        if let Some((_, st)) = &serve_parts {
+            caches.push(st.clone());
+        }
+        mem::spawn_governor(caches, shutdown_rx.clone());
     }
 
     // The status endpoint rides BOTH listeners: loopback via the proxy, mesh-visible via

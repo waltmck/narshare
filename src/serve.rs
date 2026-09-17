@@ -44,40 +44,19 @@ const MAX_ENCODED_SPAN: u64 = 256 << 20;
 /// big enough to amortize channel and HTTP framing, small enough that the first bytes hit the
 /// wire while the rest of the span is still being read and compressed.
 const ENCODE_FLUSH_BYTES: usize = 128 * 1024;
-/// Byte budget for cached seek tables (a table is ~lits + 56B/segment; big trees reach tens of
+/// Byte CEILING for cached seek tables (a table is ~lits + 56B/segment; big trees reach tens of
 /// MB). Entry counts are the wrong unit — budget the bytes: a tenth of the memory actually
 /// available to this process (the smaller of the machine's RAM and any cgroup limit), capped —
-/// the working set that made sense on a big host must not be an eighth of a 2 GiB one.
+/// the working set that made sense on a big host must not be an eighth of a 2 GiB one. The
+/// LIVE budget floats below this ceiling under memory pressure (mem.rs).
 const TABLE_BUDGET_CAP: u64 = 256 * 1024 * 1024;
+/// Never squeeze the tables below this share of the ceiling: an evicted table is rebuilt by
+/// re-reading and re-hashing the whole NAR, so a cache too small to hold the path being
+/// streamed burns more CPU and IO than the memory it returned was worth.
+const TABLE_BUDGET_FLOOR_SHARE: u64 = 8;
 
 fn table_budget() -> u64 {
-    let meminfo_kib = || {
-        std::fs::read_to_string("/proc/meminfo")
-            .ok()?
-            .lines()
-            .find_map(|l| l.strip_prefix("MemTotal:"))?
-            .trim()
-            .trim_end_matches(" kB")
-            .parse::<u64>()
-            .ok()
-    };
-    // The unified-hierarchy limit of our own cgroup, when one is set ("max" = unlimited).
-    let cgroup_limit = || {
-        let path = std::fs::read_to_string("/proc/self/cgroup")
-            .ok()?
-            .lines()
-            .find_map(|l| l.strip_prefix("0::").map(str::to_owned))?;
-        std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.max"))
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()
-    };
-    let mem = meminfo_kib()
-        .map(|k| k * 1024)
-        .unwrap_or(u64::MAX)
-        .min(cgroup_limit().unwrap_or(u64::MAX));
-    (mem / 10).min(TABLE_BUDGET_CAP)
+    (crate::mem::available_to_us() / 10).min(TABLE_BUDGET_CAP)
 }
 /// Entry cap is a backstop only; the byte budget is the real limit.
 const TABLE_ENTRIES: usize = 4096;
@@ -143,8 +122,10 @@ const SMALL_ENCODE_SPAN: u64 = 1 << 20;
 struct NarCache {
     lru: LruCache<[u8; 32], Arc<NarEntry>>,
     table_bytes: u64,
-    /// table_budget(), sampled once at startup.
+    /// The live budget: starts at the ceiling, driven down and back by the memory governor.
     budget: u64,
+    /// table_budget(), sampled once at startup — the most this cache may ever hold.
+    ceiling: u64,
 }
 
 impl NarCache {
@@ -174,12 +155,26 @@ impl NarCache {
             _ => return,
         }
         self.table_bytes += built;
+        self.evict_to_budget();
+    }
+
+    /// Evict least-recently-used entries until within budget. The just-used entry is MRU, so
+    /// it survives even when it alone exceeds the budget — a single huge NAR must still be
+    /// servable on a squeezed host.
+    fn evict_to_budget(&mut self) {
         while self.table_bytes > self.budget && self.lru.len() > 1 {
             let Some((_, evicted)) = self.lru.pop_lru() else {
                 break;
             };
             self.forget(&evicted);
         }
+    }
+
+    /// Apply a new budget, giving memory back NOW when it shrank: waiting for the next insert
+    /// to notice would hand the memory over long after the pressure that asked for it.
+    fn set_budget(&mut self, bytes: u64) {
+        self.budget = bytes;
+        self.evict_to_budget();
     }
 }
 
@@ -216,6 +211,7 @@ impl ServeState {
                 lru: LruCache::new(NonZeroUsize::new(TABLE_ENTRIES).unwrap()),
                 table_bytes: 0,
                 budget: table_budget(),
+                ceiling: table_budget(),
             }),
             manifests: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
             building: Mutex::new(HashMap::new()),
@@ -232,6 +228,33 @@ impl ServeState {
             self.encode_sem.available_permits(),
             self.encode_sem_small.available_permits(),
         )
+    }
+
+    /// (live budget, bytes held) of the seek-table cache — for the status endpoint, where the
+    /// budget floating below its ceiling is the visible trace of memory pressure.
+    pub fn table_cache_status(&self) -> (u64, u64) {
+        let c = self.nars.lock().unwrap();
+        (c.budget, c.table_bytes)
+    }
+}
+
+/// Seek tables are the daemon's largest discretionary allocation, and the cheapest to give
+/// back: an evicted table costs one rebuild, and only if that NAR is requested again.
+impl crate::mem::Shrinkable for ServeState {
+    fn name(&self) -> &'static str {
+        "seek tables"
+    }
+
+    fn ceiling(&self) -> u64 {
+        self.nars.lock().unwrap().ceiling
+    }
+
+    fn floor(&self) -> u64 {
+        self.nars.lock().unwrap().ceiling / TABLE_BUDGET_FLOOR_SHARE
+    }
+
+    fn set_budget(&self, bytes: u64) {
+        self.nars.lock().unwrap().set_budget(bytes);
     }
 }
 
@@ -1046,6 +1069,62 @@ async fn encode_span(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cache holding three real seek tables, each with its bytes accounted.
+    fn cache_with_three_tables(budget: u64) -> (tempfile::TempDir, NarCache) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = NarCache {
+            lru: LruCache::new(NonZeroUsize::new(TABLE_ENTRIES).unwrap()),
+            table_bytes: 0,
+            budget,
+            ceiling: budget,
+        };
+        for i in 0..3u8 {
+            let root = dir.path().join(format!("p{i}"));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("data"), vec![b'x'; 4096]).unwrap();
+            let table = Arc::new(nar::build(&root).unwrap());
+            let entry = Arc::new(NarEntry {
+                info: PathInfo {
+                    path: root.to_string_lossy().into_owned(),
+                    nar_hash: [i; 32],
+                    nar_size: table.nar_size,
+                    deriver: None,
+                    sigs: vec![],
+                    ca: None,
+                    references: vec![],
+                },
+                table: tokio::sync::OnceCell::new_with(Some(table.clone())),
+                enc_stats: Mutex::new(None),
+            });
+            cache.insert([i; 32], entry.clone());
+            cache.account(&[i; 32], &entry, table.approx_bytes());
+        }
+        (dir, cache)
+    }
+
+    #[test]
+    fn shrinking_the_budget_evicts_immediately() {
+        // Roomy: all three tables stay.
+        let (_dir, mut cache) = cache_with_three_tables(1 << 30);
+        assert_eq!(cache.lru.len(), 3);
+        let held = cache.table_bytes;
+        assert!(held > 0, "tables must be accounted");
+
+        // Squeezed to a third: memory comes back NOW, not at the next insert.
+        cache.set_budget(held / 3);
+        assert!(cache.lru.len() < 3, "pressure must evict");
+        assert!(cache.table_bytes <= held / 3);
+
+        // Squeezed to nothing: the MRU entry still survives, so the NAR being streamed
+        // remains servable however hard the host is squeezed.
+        cache.set_budget(0);
+        assert_eq!(cache.lru.len(), 1);
+
+        // Growing back never evicts.
+        cache.set_budget(1 << 30);
+        assert_eq!(cache.lru.len(), 1);
+    }
 
     #[test]
     fn ranges() {

@@ -65,11 +65,7 @@ const BURST_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_CAP: usize = 1 << 20;
 /// Truncated-suffix pull rounds before giving up until the next trigger.
 const MAX_ROUNDS: usize = 64;
-/// The dump-restart sentinel cursor: one byte that sorts before every real (64-byte) att key,
-/// so both backends naturally serve the FIRST page when they resume "strictly after" it. The
-/// puller parks this to cancel an in-progress fact dump and start it over — the responder
-/// never restarts a dump on its own (a lagging puller must not lose progress to its own lag).
-const DUMP_RESTART: &[u8] = &[0];
+use crate::index::DUMP_RESTART;
 /// A lease older than this is void — its holder crashed mid-round or wedged. Above
 /// SYNC_TIMEOUT (peers.rs) so a live-but-slow round is never poached from.
 const LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(150);
@@ -521,21 +517,17 @@ impl Sync {
                     .map_err(|e| anyhow::anyhow!("attest merge task died: {e}"))??;
                 changed_any |= n > 0;
             }
-            // A possession snapshot in this response is about to FORFEIT journal events (the
-            // apply jumps our clock for that origin wholesale), and the facts those events
-            // introduced may already sit behind an in-progress dump's frontier — at this
-            // responder or any other. Snapshots only ship when an origin regenerated or when
-            // compaction genuinely overran our watermark (the min-watermark floor waits for
-            // us; only the journal backstop overrides it), so this is the rare recovery path,
-            // never ordinary lag: cancel every dump in flight and start over. The exception
-            // is a dump STARTING in this very response (no real cursor yet): its pages are
-            // read after the snapshot state inside the same respond(), so nothing it needs
-            // can be behind its frontier.
+            // A possession snapshot in this response FORFEITS journal events wholesale (the
+            // apply jumps our clock for that origin), including the Attest events those
+            // journals carried. Snapshots ship only on a regeneration or when compaction
+            // genuinely overran our watermark — the rare recovery path, never ordinary lag —
+            // so re-teach the facts from scratch, from EVERY peer: their tables differ, and
+            // whichever peer happened to serve the snapshot may not be the one holding the
+            // fact we dropped.
             let has_snapshot = resp
                 .origins
                 .iter()
                 .any(|u| matches!(u.body, Some(proto::origin_update::Body::Snapshot(_))));
-            let mid_dump = !req.atts_cursor.is_empty() && req.atts_cursor != DUMP_RESTART;
 
             // Persist the dump cursor AFTER the page merged and BEFORE applying origin
             // updates: the write is synchronous and its fsync also lands the page merge above
@@ -543,7 +535,7 @@ impl Sync {
             // and a crash between an invalidation and its snapshot apply merely re-offers the
             // snapshot, which re-invalidates. Skipped when unchanged, so the steady state (no
             // dump in flight) writes nothing.
-            let next = if has_snapshot && mid_dump {
+            let next = if has_snapshot {
                 DUMP_RESTART.to_vec()
             } else if resp.atts_truncated {
                 std::mem::take(&mut resp.atts_next)
@@ -554,27 +546,12 @@ impl Sync {
             if next != req.atts_cursor || has_snapshot {
                 let index = self.index.clone();
                 let peer = self.peers.list[idx].name.clone();
-                let others: Vec<String> = if has_snapshot {
-                    self.peers
-                        .list
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != idx)
-                        .map(|(_, p)| p.name.clone())
-                        .collect()
-                } else {
-                    Vec::new()
-                };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     if next != index.dump_cursor(&peer)? {
                         index.set_dump_cursor(&peer, &next)?;
                     }
-                    // The forfeit is global to our event streams, not to this responder:
-                    // restart the other peers' in-flight dumps too.
-                    for other in &others {
-                        if !index.dump_cursor(other)?.is_empty() {
-                            index.set_dump_cursor(other, DUMP_RESTART)?;
-                        }
+                    if has_snapshot {
+                        index.restart_all_dumps()?;
                     }
                     Ok(())
                 })
